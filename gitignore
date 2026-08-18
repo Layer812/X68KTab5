@@ -102,3 +102,4 @@ venv/
 *.core
 core
 core.*
+*.zip
