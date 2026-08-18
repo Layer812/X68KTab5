@@ -499,7 +499,9 @@ Thank you to everyone who made that possible.
 For detailed component-by-component notices and license information, see:
 
 - [**THIRD_PARTY_NOTICES.md**](THIRD_PARTY_NOTICES.md)
-- `LICENSE_SHARP_X68000.txt`
+- [**LICENSE_SHARP_X68000.txt**](LICENSE_SHARP_X68000.txt)
+- [**LICENSE_PANIC_X.txt**](LICENSE_PANIC_X.txt)
+- [**PANIC_V1.38_NOTICE.txt**](PANIC_V1.38_NOTICE.txt)
 
 ## SHARP X68000
 
@@ -524,6 +526,21 @@ Reference:
 All rights in SHARP, X68000 and related software, names and trademarks belong to SHARP Corporation and their respective rights holders.
 
 **X68K Tab is an unofficial independent personal project. It is not affiliated with, endorsed by, or sponsored by SHARP Corporation.**
+
+## PANIC / panic.x V1.38
+
+X68K Tab includes the **PANIC Player** functionality carried over from PanicPlayerTab5 and embeds the original `panic.x` V1.38 as its playback environment.
+
+PANIC was originally written by **Hideya Nagata (pako / ぱこたん / 永田英哉)**. `panic.x` V1.38 is based on pako's V1.34 and includes modifications by **Nashimi (なしみ)**. Copyright in PANIC remains with pako as stated in the original distribution documentation.
+
+The original V1.38 distribution documentation preserved with PanicPlayerTab5 states that PANIC may be **used, redistributed, modified, and used commercially**. This README is only a summary; the original distribution documentation remains authoritative for redistribution.
+
+- [**PANIC.X license / redistribution notice — LICENSE_PANIC_X.txt**](LICENSE_PANIC_X.txt)
+- [**PANIC V1.38 notice — PANIC_V1.38_NOTICE.txt**](PANIC_V1.38_NOTICE.txt)
+- [PanicPlayerTab5](https://github.com/Layer812/PanicPlayerTab5)
+- [X68000 LIBRARY - PANIC](https://retropc.net/x68000/software/movie/panic/panic/)
+
+Individual `.PAN` data files are separate works. Copyright and redistribution conditions for each `.PAN` file remain with its respective creator.
 
 ## PX68K
 
@@ -582,6 +599,8 @@ A public repository should normally keep at least:
 ```text
 LICENSE
 LICENSE_SHARP_X68000.txt
+LICENSE_PANIC_X.txt
+PANIC_V1.38_NOTICE.txt
 THIRD_PARTY_NOTICES.md
 ```
 
@@ -590,6 +609,7 @@ Suggested separation:
 - original X68K Tab code: project license in `LICENSE`
 - PX68K / WinX68k / xkeropi and other upstream code: original per-file/upstream terms
 - SHARP-released software: `LICENSE_SHARP_X68000.txt`
+- PANIC / panic.x V1.38: `LICENSE_PANIC_X.txt` / `PANIC_V1.38_NOTICE.txt`
 - Musashi / vgmM5 / other libraries: their respective licenses
 - fonts used to build CGROM data: each font's own license
 

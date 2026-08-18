@@ -379,26 +379,43 @@ endorsed by, or sponsored by SHARP Corporation.**
 
 ---
 
-## 12. PANIC / PANIC.X related material
+## 12. PANIC / PANIC.X V1.38
 
-X68K Tab grew out of the PanicPlayerTab5 project and the source tree may contain
-PANIC-related support or embedded data.
+X68K Tab grew out of the PanicPlayerTab5 project and includes PANIC playback
+support. The firmware embeds the same original `panic.x` V1.38 player payload
+used by PanicPlayerTab5.
 
-The repository contains a dedicated notice:
+The preserved PANIC V1.38 documentation identifies PANIC as originally written
+by **Hideya Nagata (pako / ぱこたん / 永田英哉)**. `panic.x` V1.38 is based on pako's
+V1.34 and includes modifications by **Nashimi (なしみ)**. Copyright in PANIC
+remains with Hideya Nagata (pako).
+
+The original V1.38 distribution documentation states that PANIC may be used,
+redistributed, modified, and used commercially. The original documentation is
+the authority for those permissions; this file is only a summary/index.
+
+Keep the following X68K Tab redistribution files with public source/binary
+releases containing PANIC.X:
 
 ```text
+LICENSE_PANIC_X.txt
 PANIC_V1.38_NOTICE.txt
 ```
 
-If PANIC.X or PANIC-derived material is present in the public source or release
-firmware, that notice must be preserved and the original author's/distributor's
-terms must be followed.
+Where practical, also retain the original PANIC V1.38 documentation distributed
+with the player.
 
 A generated C array or embedded binary representation does not change the
-copyright or distribution conditions of the original material.
+copyright or redistribution conditions of PANIC.X.
 
-PanicPlayerTab5:
-https://github.com/Layer812/PanicPlayerTab5
+Individual `.PAN` animation/data files are separate works. Their copyright and
+redistribution conditions belong to their respective creators and are not
+covered automatically by the PANIC.X permission.
+
+References:
+
+- PanicPlayerTab5: https://github.com/Layer812/PanicPlayerTab5
+- Original archive/documentation: https://retropc.net/x68000/software/movie/panic/panic/
 
 ---
 
@@ -496,7 +513,9 @@ the following:
       is distributed.
 - [ ] `human302.xdf` is **not** accidentally committed to Git; source-build users are
       told to place it locally in the repository root.
-- [ ] `PANIC_V1.38_NOTICE.txt` is included whenever PANIC material is distributed.
+- [ ] `LICENSE_PANIC_X.txt` is included whenever PANIC.X is distributed.
+- [ ] `PANIC_V1.38_NOTICE.txt` is included whenever PANIC.X is distributed.
+- [ ] Original PANIC V1.38 documentation is retained/referenced with public PANIC.X redistributions.
 - [ ] `components/px68k/fmgen/VGMM5_YM2151_NOTICE.md` remains in the source tree.
 - [ ] Original PX68K / WinX68k / xkeropi / fmgen source headers and documents
       remain intact.

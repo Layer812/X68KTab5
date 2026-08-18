@@ -499,7 +499,9 @@ X68K Tab は、長年にわたる X68000 エミュレーション技術、解析
 第三者ソフトウェアや個別ライセンスの詳細は、以下も参照してください。
 
 - [**THIRD_PARTY_NOTICES.md**](THIRD_PARTY_NOTICES.md)
-- `LICENSE_SHARP_X68000.txt`
+- [**LICENSE_SHARP_X68000.txt**](LICENSE_SHARP_X68000.txt)
+- [**LICENSE_PANIC_X.txt**](LICENSE_PANIC_X.txt)
+- [**PANIC_V1.38_NOTICE.txt**](PANIC_V1.38_NOTICE.txt)
 
 ## SHARP X68000
 
@@ -524,6 +526,21 @@ SHARP 由来ソフトウェアの使用・複製・改変・再配布条件に�
 SHARP、X68000、および関連するソフトウェア、名称、商標等の権利は、シャープ株式会社および各権利者に帰属します。
 
 **X68K Tab は個人による非公式プロジェクトであり、シャープ株式会社とは関係なく、同社による承認・協賛を受けたものではありません。**
+
+## PANIC / panic.x V1.38
+
+X68K Tab には、PanicPlayerTab5 から引き継いだ **PANIC Player** 機能があり、再生環境としてオリジナルの `panic.x` V1.38 を組み込んでいます。
+
+PANIC は **Hideya Nagata（pako / ぱこたん / 永田英哉）** 氏によって作成され、`panic.x` V1.38 は pako 氏の V1.34 をベースに **Nashimi（なしみ）** 氏による変更を含むものとして配布されています。PANIC の著作権は、オリジナル配布ドキュメントの記載どおり pako 氏に帰属します。
+
+PanicPlayerTab5 で保存しているオリジナル V1.38 配布ドキュメントでは、PANIC について **使用・再配布・改変・商用利用が許可**されています。ただし、この README は原文の代替ではありません。公開・再配布時にはオリジナル配布ドキュメントを優先してください。
+
+- [**PANIC.X ライセンス／再配布表示 — LICENSE_PANIC_X.txt**](LICENSE_PANIC_X.txt)
+- [**PANIC V1.38 notice — PANIC_V1.38_NOTICE.txt**](PANIC_V1.38_NOTICE.txt)
+- [PanicPlayerTab5](https://github.com/Layer812/PanicPlayerTab5)
+- [X68000 LIBRARY - PANIC](https://retropc.net/x68000/software/movie/panic/panic/)
+
+なお、`.PAN` データは PANIC.X 本体とは別の著作物です。個々の `.PAN` ファイルの著作権・再配布条件は、それぞれの作者に帰属します。
 
 ## PX68K
 
@@ -583,12 +600,15 @@ X68K Tab は複数の upstream ソフトウェアを含む／参照するため�
 ```text
 LICENSE
 LICENSE_SHARP_X68000.txt
+LICENSE_PANIC_X.txt
+PANIC_V1.38_NOTICE.txt
 THIRD_PARTY_NOTICES.md
 ```
 
 - X68K Tab 固有の新規コード: `LICENSE`
 - PX68K / WinX68k / xkeropi 等の upstream 由来コード: 各 upstream / 各ファイルの条件
 - SHARP 公開ソフトウェア: `LICENSE_SHARP_X68000.txt`
+- PANIC / panic.x V1.38: `LICENSE_PANIC_X.txt` / `PANIC_V1.38_NOTICE.txt`
 - Musashi / vgmM5 / その他ライブラリ: 各ライブラリのライセンス
 - CGROM 生成に使用するフォント: 各フォントのライセンス
 
