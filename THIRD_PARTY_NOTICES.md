@@ -342,6 +342,19 @@ specific permission terms.
 
 This material is **not** placed under the X68K Tab project license.
 
+For source builds of X68K Tab, `human302.xdf` is expected as a **local build
+input in the repository root**. It is intentionally excluded from Git and is
+not intended to be supplied as ordinary X68K Tab project source.
+
+```text
+X68K-Tab/
+├── human302.xdf
+└── LICENSE_SHARP_X68000.txt
+```
+
+Users must obtain and use `human302.xdf` under the applicable SHARP
+distribution/permission terms.
+
 The authoritative terms must be kept separately as:
 
 ```text
@@ -481,6 +494,8 @@ the following:
 - [ ] `THIRD_PARTY_NOTICES.md` is included.
 - [ ] `LICENSE_SHARP_X68000.txt` is included whenever applicable SHARP material
       is distributed.
+- [ ] `human302.xdf` is **not** accidentally committed to Git; source-build users are
+      told to place it locally in the repository root.
 - [ ] `PANIC_V1.38_NOTICE.txt` is included whenever PANIC material is distributed.
 - [ ] `components/px68k/fmgen/VGMM5_YM2151_NOTICE.md` remains in the source tree.
 - [ ] Original PX68K / WinX68k / xkeropi / fmgen source headers and documents

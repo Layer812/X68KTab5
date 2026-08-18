@@ -45,6 +45,12 @@ xX5zvurDW6xMacAK
 
 M5Burner の **Share Burn** から上記 Share Code を入力し、X68K Tab を選択して Tab5 へ書き込んでください。
 
+### 動作デモ
+
+実機での動作はこちらでご覧いただけます。
+
+- [**X68K Tab 動作デモ（X / @Layer812）**](https://x.com/layer812/status/2089625598687891632)
+
 > [!NOTE]
 > M5Burner の画面や操作方法は更新されることがあります。  
 > うまく見つからない場合は、上記の M5Stack 公式 M5Burner ページをご確認ください。
@@ -85,7 +91,7 @@ Tab5 の USB Host を利用して、USB キーボードや Joypad を X68000 の
 
 X68K Tab では、X68000 実機から吸い出したオリジナルの CGROM データをそのまま配布するのではなく、**再配布可能なフリーフォントから CGROM 互換データを生成する方法**を採用しています。
 
-リポジトリには、CGROM データを生成するための `build_cgrom.py` を含める予定です。
+リポジトリのルートには、CGROM データを生成するための [`build_cgrom.py`](build_cgrom.py) を置いています。
 
 これにより、文字表示に必要なデータを用意しつつ、オリジナル機の CGROM イメージそのものを配布しない構成にしています。
 
@@ -428,6 +434,27 @@ X68000 は、ソフトウェアごとにハードウェアの使い方が大き�
 ## ビルド
 
 開発環境は PlatformIO + ESP-IDF / M5Unified 系です。
+
+### ビルド前に `human302.xdf` を配置してください
+
+ソースからビルドする場合は、**リポジトリのルートに `human302.xdf` を配置してから**ビルドしてください。
+
+```text
+X68K-Tab/
+├── human302.xdf        ← ローカルに用意（GitHub には含めません）
+├── build_cgrom.py
+├── LICENSE_SHARP_X68000.txt
+├── platformio.ini
+├── src/
+└── components/
+```
+
+`human302.xdf` は GitHub リポジトリには収録せず、`.gitignore` の対象としています。  
+ビルドに使用する Human68k 関連ソフトウェアは、SHARP の公開条件・使用許諾に従って各自で用意してください。適用される条件については [`LICENSE_SHARP_X68000.txt`](LICENSE_SHARP_X68000.txt) を参照してください。
+
+CGROM については、ルートの [`build_cgrom.py`](build_cgrom.py) を使って再配布可能なフォントから生成する構成です。
+
+準備ができたら通常どおりビルドします。
 
 ```bash
 pio run -e m5stack-tab5

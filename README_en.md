@@ -45,6 +45,12 @@ xX5zvurDW6xMacAK
 
 Open **Share Burn** in M5Burner, enter the Share Code above, select X68K Tab, and burn it to your Tab5.
 
+### Demo
+
+A short video of X68K Tab running on real hardware is available here:
+
+- [**X68K Tab running on Tab5 (X / @Layer812)**](https://x.com/layer812/status/2089625598687891632)
+
 > [!NOTE]
 > M5Burner's UI may change over time. If the Share Burn workflow looks different, please refer to the official M5Stack M5Burner documentation above.
 
@@ -84,7 +90,7 @@ X68K Tab does **not** need to redistribute an original CGROM dump taken from X68
 
 Instead, the project uses a method that builds compatible CGROM data from **freely redistributable fonts**.
 
-A `build_cgrom.py` utility is intended to be included in the repository for this purpose.
+A root-level [`build_cgrom.py`](build_cgrom.py) utility is included in the repository for this purpose.
 
 This provides the character data required by the emulator while avoiding distribution of the original machine's CGROM image itself.
 
@@ -428,6 +434,27 @@ A bug that appears in only one title can still reveal an important compatibility
 ## Building from Source
 
 The development environment is based on PlatformIO + ESP-IDF / M5Unified.
+
+### Put `human302.xdf` in the repository root before building
+
+When building from source, **place `human302.xdf` in the repository root** before starting the build.
+
+```text
+X68K-Tab/
+├── human302.xdf        <- provide locally (not included in GitHub)
+├── build_cgrom.py
+├── LICENSE_SHARP_X68000.txt
+├── platformio.ini
+├── src/
+└── components/
+```
+
+`human302.xdf` is intentionally not included in the GitHub repository and is covered by `.gitignore`.  
+Please obtain and use Human68k-related software in accordance with SHARP's applicable release and permission terms. See [`LICENSE_SHARP_X68000.txt`](LICENSE_SHARP_X68000.txt) for the terms included with this repository.
+
+For CGROM, use the root-level [`build_cgrom.py`](build_cgrom.py) to generate compatible font data from redistributable fonts.
+
+Once the required local file is in place, build normally:
 
 ```bash
 pio run -e m5stack-tab5
