@@ -1,0 +1,14 @@
+{
+	"backtraceGraph" : 
+	{
+		"commands" : [],
+		"files" : [],
+		"nodes" : []
+	},
+	"installers" : [],
+	"paths" : 
+	{
+		"build" : "esp-idf/mqtt",
+		"source" : "C:/Users/fooba/.platformio/packages/framework-espidf/components/mqtt"
+	}
+}

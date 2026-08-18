@@ -1,0 +1,14 @@
+{
+	"backtraceGraph" : 
+	{
+		"commands" : [],
+		"files" : [],
+		"nodes" : []
+	},
+	"installers" : [],
+	"paths" : 
+	{
+		"build" : "esp-idf/app_trace",
+		"source" : "C:/Users/fooba/.platformio/packages/framework-espidf/components/app_trace"
+	}
+}

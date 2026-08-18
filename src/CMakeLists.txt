@@ -1,0 +1,27 @@
+idf_component_register(
+    SRCS
+        "main.c"
+        "tab5_video.cpp"
+        "tab5_ppa.c"
+        "tab5_px68k_hotmem.c"
+        "tab5_launcher.cpp"
+        "tab5_media_ui.cpp"
+        "tab5_panic.cpp"
+        "panic_x_bin.c"
+        "tab5_audio.cpp"
+        "tab5_sd.c"
+        "tab5_textview.c"
+        "tab5_guest_input.c"
+        "tab5_usb_keymap.c"
+        "tab5_usb_keyboard.c"
+        "tab5_disk_control.c"
+        "tab5_compose.c"
+    INCLUDE_DIRS
+        "."
+    REQUIRES
+        px68k
+        fatfs
+        esp_driver_sdmmc
+        sdmmc
+        usb
+)

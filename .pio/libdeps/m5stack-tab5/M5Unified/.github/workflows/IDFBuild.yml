@@ -1,0 +1,91 @@
+name: ESP-IDF Build
+
+on:
+  push:
+    paths:
+      - '**.cpp'
+      - '**.hpp'
+      - '**.h'
+      - '**.c'
+      - '**/CMakeLists.txt'
+      - '.github/workflows/IDFBuild.yml'
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.target }} (IDF ${{ matrix.idf_version }})
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:v${{ matrix.idf_version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ESP32
+          - target: esp32
+            idf_version: "5.3"
+          - target: esp32
+            idf_version: "5.1.6"
+          # ESP32-S3
+          - target: esp32s3
+            idf_version: "5.3"
+          - target: esp32s3
+            idf_version: "5.1.6"
+          # ESP32-C3
+          - target: esp32c3
+            idf_version: "5.3"
+          - target: esp32c3
+            idf_version: "5.1.6"
+          # ESP32-C6 (IDF 5.3+ only)
+          - target: esp32c6
+            idf_version: "5.3"
+          # ESP32-C61 (IDF 5.5.2+ only)
+          - target: esp32c61
+            idf_version: "5.5.2"
+          # ESP32-H2
+          - target: esp32h2
+            idf_version: "5.3"
+          - target: esp32h2
+            idf_version: "5.1.6"
+          # ESP32-P4 (IDF 5.3+ only)
+          - target: esp32p4
+            idf_version: "5.3"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine M5GFX repo and branch
+        id: m5gfx
+        shell: bash
+        run: |
+          OWNER="${{ github.repository_owner }}"
+          BRANCH="${{ github.base_ref || github.ref_name }}"
+          [ "$BRANCH" = "master" ] || BRANCH="develop"
+          # Prefer same owner's fork (e.g. ainyan03/M5GFX); fall back to upstream m5stack/M5GFX
+          if git ls-remote --heads "https://github.com/$OWNER/M5GFX.git" "$BRANCH" 2>/dev/null | grep -q .; then
+            REPO="$OWNER/M5GFX"
+          else
+            REPO="m5stack/M5GFX"
+          fi
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "repo=$REPO"     >> "$GITHUB_OUTPUT"
+          echo "Using $REPO@$BRANCH"
+
+      - name: Clone M5GFX (matched repo and branch)
+        shell: bash
+        run: |
+          git clone --depth 1 --branch "${{ steps.m5gfx.outputs.branch }}" \
+            "https://github.com/${{ steps.m5gfx.outputs.repo }}.git" \
+            "$GITHUB_WORKSPACE/_deps/m5gfx"
+
+      - name: Build
+        working-directory: examples/Test/build_test
+        shell: bash
+        env:
+          M5GFX_PATH: ${{ github.workspace }}/_deps/m5gfx
+        run: |
+          . $IDF_PATH/export.sh
+          idf.py set-target ${{ matrix.target }}
+          idf.py build

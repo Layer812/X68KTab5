@@ -1,0 +1,104 @@
+# X68K Tab - Git ignore rules
+#
+# Keep the source tree reproducible and avoid publishing local build output,
+# user-owned X68000 media/ROM images, and temporary release artifacts.
+
+# ----------------------------------------------------------------------
+# PlatformIO / ESP-IDF generated build output
+# ----------------------------------------------------------------------
+.pio/
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+build.ninja
+.ninja_deps
+.ninja_log
+
+# ESP-IDF Component Manager downloads are regenerated from dependencies.lock
+managed_components/
+
+# Generated sdkconfig files.
+# Keep sdkconfig.defaults (and target-specific defaults) in Git.
+sdkconfig
+sdkconfig.*
+!sdkconfig.defaults
+!sdkconfig.defaults.*
+
+# ----------------------------------------------------------------------
+# Compiler / linker / firmware output
+# ----------------------------------------------------------------------
+*.o
+*.obj
+*.a
+*.so
+*.dll
+*.dylib
+*.elf
+*.map
+*.bin
+*.hex
+*.uf2
+
+# ----------------------------------------------------------------------
+# X68000 user media / ROM images
+# Do not accidentally publish commercial or personally dumped software.
+# ----------------------------------------------------------------------
+*.xdf
+*.dim
+*.hds
+*.hdf
+*.hdm
+*.d88
+*.2hd
+*.img
+*.rom
+
+# Generated/local CGROM image.
+# build_cgrom.py and the applicable font license should remain trackable.
+cgrom.dat
+CGROM.DAT
+
+# ----------------------------------------------------------------------
+# Local release/test packages
+# Put public binaries in GitHub Releases / M5Burner rather than source Git.
+# ----------------------------------------------------------------------
+*.zip
+/x68t.mp4
+
+# Old/local README working copy (public files are README.md / README_en.md)
+/README(5).md
+
+# Internal development notes/checklists not required by the public source tree
+/RELEASE_TEST_CHECKLIST.txt
+/SOURCE_ANNOTATION_NOTES.txt
+
+# ----------------------------------------------------------------------
+# Editor / OS / Python temporary files
+# ----------------------------------------------------------------------
+.vscode/
+.idea/
+*.code-workspace
+.DS_Store
+Thumbs.db
+Desktop.ini
+*~
+*.swp
+*.swo
+*.tmp
+*.bak
+*.orig
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Logs / crash dumps
+*.log
+*.core
+core
+core.*

@@ -1,0 +1,13 @@
+[sections:px68k_bss]
+entries:
+    .bss+
+    .sbss+
+
+[scheme:px68k_extram]
+entries:
+    px68k_bss -> extern_ram
+
+[mapping:px68k_external_bss]
+archive: libpx68k.a
+entries:
+    * (px68k_extram)

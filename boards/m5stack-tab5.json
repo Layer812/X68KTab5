@@ -1,0 +1,44 @@
+{
+    "build":  {
+                  "arduino":  {
+                                  "ldscript":  "esp32p4_out.ld",
+                                  "partitions":  "default_16MB.csv"
+                              },
+                  "core":  "esp32p4",
+                  "extra_flags":  [
+                                      "-DBOARD_HAS_PSRAM",
+                                      "-DM5STACK_TAB5"
+                                  ],
+                  "f_cpu":  "400000000L",
+                  "f_flash":  "80000000L",
+                  "flash_mode":  "qio",
+                  "mcu":  "esp32p4",
+                  "variant":  "m5stack_tab5",
+                  "esp-idf":  {
+                                  "sdkconfig_path":  "G:/px68k-tab5/sdkconfig.m5stack-tab5"
+                              }
+              },
+    "connectivity":  [
+                         "wifi",
+                         "bluetooth"
+                     ],
+    "frameworks":  [
+                       "espidf"
+                   ],
+    "name":  "M5Stack Tab5",
+    "upload":  {
+                   "flash_size":  "16MB",
+                   "maximum_ram_size":  45219840,
+                   "maximum_size":  16777216,
+                   "require_upload_port":  true,
+                   "speed":  921600,
+                   "offset_address":  "0x20000"
+               },
+    "url":  "https://docs.m5stack.com/en/core/CoreTab5",
+    "vendor":  "M5Stack",
+    "idf":  {
+                "bootloader":  {
+                                   "extra_flags":  "-D CONFIG_ESPTOOLPY_FLASHSIZE_16MB="
+                               }
+            }
+}

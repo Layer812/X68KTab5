@@ -1,0 +1,142 @@
+name: Arduino Build
+
+on:
+  push:
+    paths:
+      - '**.ino'
+      - '**.cpp'
+      - '**.hpp'
+      - '**.h'
+      - '**.c'
+      - '.github/workflows/ArduinoBuild.yml'
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.board }} (${{ matrix.esp32_version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ===================
+          # Espressif Board Manager
+          # ===================
+          # ESP32
+          - board: esp32:esp32:esp32
+            esp32_version: 2.0.17
+            board_manager_url: https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          - board: esp32:esp32:esp32
+            esp32_version: 3.1.1
+            board_manager_url: https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          # ESP32-S3
+          - board: esp32:esp32:esp32s3
+            esp32_version: 2.0.17
+            board_manager_url: https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          - board: esp32:esp32:esp32s3
+            esp32_version: 3.1.1
+            board_manager_url: https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          # ESP32-C3
+          - board: esp32:esp32:esp32c3
+            esp32_version: 2.0.17
+            board_manager_url: https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          - board: esp32:esp32:esp32c3
+            esp32_version: 3.1.1
+            board_manager_url: https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          # ESP32-C6 (v3 only)
+          - board: esp32:esp32:esp32c6
+            esp32_version: 3.1.1
+            board_manager_url: https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          # ESP32-P4 (v3 only)
+          - board: esp32:esp32:esp32p4
+            esp32_version: 3.1.1
+            board_manager_url: https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          # ESP32-H2 (v3 only)
+          - board: esp32:esp32:esp32h2
+            esp32_version: 3.1.1
+            board_manager_url: https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          # ===================
+          # M5Stack Board Manager
+          # ===================
+          # M5Core (ESP32)
+          - board: m5stack:esp32:m5stack_core
+            esp32_version: 2.1.4
+            board_manager_url: https://static-cdn.m5stack.com/resource/arduino/package_m5stack_index.json
+          - board: m5stack:esp32:m5stack_core
+            esp32_version: 3.2.5
+            board_manager_url: https://static-cdn.m5stack.com/resource/arduino/package_m5stack_index.json
+          # M5CoreS3 (ESP32-S3, v3 only)
+          - board: m5stack:esp32:m5stack_cores3
+            esp32_version: 3.2.5
+            board_manager_url: https://static-cdn.m5stack.com/resource/arduino/package_m5stack_index.json
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine M5GFX repo and branch
+        id: m5gfx
+        run: |
+          OWNER="${{ github.repository_owner }}"
+          BRANCH="${{ github.base_ref || github.ref_name }}"
+          [ "$BRANCH" = "master" ] || BRANCH="develop"
+          # Prefer same owner's fork (e.g. ainyan03/M5GFX); fall back to upstream m5stack/M5GFX
+          if git ls-remote --heads "https://github.com/$OWNER/M5GFX.git" "$BRANCH" 2>/dev/null | grep -q .; then
+            REPO="$OWNER/M5GFX"
+          else
+            REPO="m5stack/M5GFX"
+          fi
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "repo=$REPO"     >> "$GITHUB_OUTPUT"
+          echo "Using $REPO@$BRANCH"
+
+      - name: Install arduino-cli
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh -s 1.1.1
+          echo "$PWD/bin" >> $GITHUB_PATH
+
+      - name: Configure arduino-cli
+        run: |
+          arduino-cli config init
+          # The M5Stack index is intermittently unavailable (404 as of
+          # 2026-07). Try the primary URL first and fall back to the CN
+          # mirror. Either index is then passed through a patch script that
+          # fixes stale toolsDependencies entries (the CN index renames all
+          # tools with a "-cn" suffix but older platforms still reference the
+          # pre-rename versions); the script is a no-op on a consistent index.
+          if [[ "${{ matrix.board_manager_url }}" == *package_m5stack_index*.json ]]; then
+            PRIMARY="${{ matrix.board_manager_url }}"
+            INDEX=/tmp/package_m5stack_index.json
+            for url in "$PRIMARY" "${PRIMARY%.json}_cn.json"; do
+              if curl -fsSL "$url" -o "$INDEX"; then
+                echo "Using board manager index: $url"
+                break
+              fi
+              echo "Board manager index unreachable: $url"
+            done
+            [ -s "$INDEX" ] || { echo "No reachable board manager index"; exit 1; }
+            python3 .github/scripts/fix_m5stack_package_index.py "$INDEX"
+            arduino-cli config add board_manager.additional_urls "file://$INDEX"
+          else
+            arduino-cli config add board_manager.additional_urls ${{ matrix.board_manager_url }}
+          fi
+
+      - name: Install board package
+        run: |
+          arduino-cli core update-index
+          # Extract core (package:architecture) from FQBN (package:architecture:board)
+          CORE=$(echo "${{ matrix.board }}" | cut -d: -f1,2)
+          arduino-cli core install "${CORE}@${{ matrix.esp32_version }}"
+
+      - name: Install libraries (M5Unified self + M5GFX matched branch)
+        run: |
+          mkdir -p "$HOME/Arduino/libraries"
+          ln -s "$GITHUB_WORKSPACE" "$HOME/Arduino/libraries/M5Unified"
+          git clone --depth 1 --branch "${{ steps.m5gfx.outputs.branch }}" \
+            "https://github.com/${{ steps.m5gfx.outputs.repo }}.git" \
+            "$HOME/Arduino/libraries/M5GFX"
+
+      - name: Build
+        run: |
+          arduino-cli compile --fqbn ${{ matrix.board }} examples/Test/build_test/build_test.ino

@@ -1,0 +1,72 @@
+{
+	"backtraceGraph" : 
+	{
+		"commands" : 
+		[
+			"install"
+		],
+		"files" : 
+		[
+			"C:/Users/fooba/.platformio/packages/framework-espidf/components/mbedtls/mbedtls/3rdparty/p256-m/CMakeLists.txt"
+		],
+		"nodes" : 
+		[
+			{
+				"file" : 0
+			},
+			{
+				"command" : 0,
+				"file" : 0,
+				"line" : 29,
+				"parent" : 0
+			},
+			{
+				"command" : 0,
+				"file" : 0,
+				"line" : 37,
+				"parent" : 0
+			}
+		]
+	},
+	"installers" : 
+	[
+		{
+			"backtrace" : 1,
+			"component" : "Unspecified",
+			"destination" : "include",
+			"paths" : 
+			[
+				"C:/Users/fooba/.platformio/packages/framework-espidf/components/mbedtls/mbedtls/3rdparty/p256-m/:C:/Users/fooba/.platformio/packages/framework-espidf/components/mbedtls/mbedtls/3rdparty/p256-m"
+			],
+			"type" : "directory"
+		},
+		{
+			"backtrace" : 2,
+			"component" : "Unspecified",
+			"destination" : "lib",
+			"paths" : 
+			[
+				"esp-idf/mbedtls/mbedtls/3rdparty/p256-m/libp256m.a"
+			],
+			"targetId" : "p256m::@c854ae7c6350d6f63df0",
+			"targetIndex" : 124,
+			"type" : "target"
+		},
+		{
+			"backtrace" : 2,
+			"component" : "Unspecified",
+			"cxxModuleBmiTarget" : 
+			{
+				"id" : "p256m::@c854ae7c6350d6f63df0",
+				"index" : 124
+			},
+			"destination" : "lib",
+			"type" : "cxxModuleBmi"
+		}
+	],
+	"paths" : 
+	{
+		"build" : "esp-idf/mbedtls/mbedtls/3rdparty/p256-m",
+		"source" : "C:/Users/fooba/.platformio/packages/framework-espidf/components/mbedtls/mbedtls/3rdparty/p256-m"
+	}
+}
