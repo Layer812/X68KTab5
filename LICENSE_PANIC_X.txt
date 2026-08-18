@@ -1,0 +1,77 @@
+PANIC / panic.x V1.38 - License and Redistribution Notice
+=========================================================
+
+This file accompanies the PANIC.X V1.38 player embedded in X68K Tab.
+
+IMPORTANT
+---------
+This is a redistribution/license summary for X68K Tab. It does not replace
+or rewrite the original PANIC V1.38 distribution documentation. When there
+is any difference between this summary and the original documentation, the
+original documentation is authoritative.
+
+Original work
+-------------
+PANIC was originally written by:
+
+  Hideya Nagata (pako / ぱこたん / 永田英哉)
+
+panic.x V1.38 is based on pako's panic.x V1.34 and includes modifications by:
+
+  Nashimi (なしみ)
+
+Copyright in PANIC remains with Hideya Nagata (pako), as stated in the
+original distribution documentation.
+
+Permissions stated by the original PANIC distribution documentation
+--------------------------------------------------------------------
+The original PANIC V1.38 documentation, as preserved with PanicPlayerTab5,
+states that the original author permitted PANIC to be:
+
+  - used
+  - redistributed
+  - modified
+  - used commercially
+
+These permissions apply to PANIC / panic.x under the terms and notes of the
+original distribution documentation. They do NOT automatically apply to
+third-party .PAN animation/data files.
+
+Individual .PAN data files
+--------------------------
+Each .PAN file is a separate work. Copyright and redistribution conditions
+for individual .PAN data files belong to their respective creators.
+
+X68K Tab therefore does not treat user-supplied .PAN files as part of the
+PANIC.X license.
+
+Use in X68K Tab
+---------------
+X68K Tab includes the same original panic.x V1.38 player payload previously
+used by PanicPlayerTab5 so PANIC data can be launched from the unified X68K
+Tab interface.
+
+Public redistributions containing PANIC.X should retain:
+
+  LICENSE_PANIC_X.txt
+  PANIC_V1.38_NOTICE.txt
+
+and, where possible, the original PANIC V1.38 documentation distributed with
+the player.
+
+Original archive / documentation reference
+------------------------------------------
+X68000 LIBRARY - PANIC
+https://retropc.net/x68000/software/movie/panic/panic/
+
+Related project
+---------------
+PanicPlayerTab5
+https://github.com/Layer812/PanicPlayerTab5
+
+No additional rights
+--------------------
+X68K Tab does not claim ownership of PANIC.X and does not grant rights beyond
+those granted by the original PANIC authors/distribution documentation.
+
+PANIC / panic.x copyright remains with its original copyright holder(s).
