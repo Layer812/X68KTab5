@@ -11,24 +11,6 @@
   Developed by Layer812 &nbsp;|&nbsp; Based on PX68K &nbsp;|&nbsp; 68000 core: Musashi
 </p>
 
-## 最新版 — Build 6.15 Production
-
-**Build 6.15** は、ここまでの CPU / 描画 / マルチコア高速化をまとめた Production 版です。
-
-- 68000 実行の native-loop JIT / hot-path 高速化
-- CPU1（X68000 時間軸）と CPU0（画面・音声・入出力）の役割分離
-- G + BG + TEXT の CPU0 合成
-- 大きな背景を毎フレーム作り直さない **GRP8 Scroll Cache**
-- PIE / XespV による copy / diff / blend 等の高速化
-- PSRAM 転送用 AXI-GDMA fallback
-- LCD の dirty / diff 更新と CRTC ベースの Frame Pacing
-- FM + ADPCM 最終ミックスの CPU0 化
-
-特にスクロール背景は、毎走査線ごとに GVRAM から再生成する方式から、**一度展開した背景をキャッシュし、スクロール位置だけを動かす方式**へ変更しました。  
-予定していた高速化だけでなく、開発途中で見つかった「そもそも同じ絵を何度も作らない」という思いがけない高速化も入っています。 :)
-
----
-
 ## X68K Tab とは
 
 **X68K Tab** は、M5Stack Tab5（ESP32-P4）上で SHARP X68000 環境を動作させるための、ポータブル X68000 エミュレータです。
@@ -145,8 +127,6 @@ PANIC データがなかなか集まらない中、PanicPlayer 向けの X68000 
 **いつの間にか X68000 エミュレータができていました。**
 
 それを独立したプロジェクトとして切り出したのが **X68K Tab** です。
-
-PanicPlayerTab5 も引き続き大切なプロジェクトです。
 
 もし昔の HDD、MO、CD-R、バックアップなどに `.PAN` ファイルや PANIC 関連データが残っていましたら、情報だけでも歓迎です。  
 PANIC データをいただけると、作者のモチベーションがかなり上がります。 :)
