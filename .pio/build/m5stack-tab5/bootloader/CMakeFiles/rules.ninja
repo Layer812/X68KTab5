@@ -289,7 +289,7 @@ rule C_STATIC_LIBRARY_LINKER____idf_main_
 # Rule for re-running cmake.
 
 rule RERUN_CMAKE
-  command = C:\Users\fooba\.platformio\packages\tool-cmake\bin\cmake.exe --regenerate-during-build -SC:\Users\fooba\.platformio\packages\framework-espidf\components\bootloader\subproject -BG:\px68k-tab5\.pio\build\m5stack-tab5\bootloader
+  command = C:\Users\fooba\.platformio\packages\tool-cmake\bin\cmake.exe --regenerate-during-build -SC:\Users\fooba\.platformio\packages\framework-espidf\components\bootloader\subproject -BG:\X68KTab5\.pio\build\m5stack-tab5\bootloader
   description = Re-running CMake...
   generator = 1
 

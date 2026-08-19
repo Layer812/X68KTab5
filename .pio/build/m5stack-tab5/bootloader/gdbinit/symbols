@@ -17,4 +17,4 @@ set confirm off
 set confirm on
 
 # Load application symbols
-file G:/px68k-tab5/.pio/build/m5stack-tab5/bootloader/bootloader.elf
+file G:/X68KTab5/.pio/build/m5stack-tab5/bootloader/bootloader.elf

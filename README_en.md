@@ -11,6 +11,21 @@
   Developed by Layer812 &nbsp;|&nbsp; Based on PX68K &nbsp;|&nbsp; 68000 core: Musashi
 </p>
 
+## Latest Release — Build 6.15 Production
+
+**Build 6.15** is the Production release that consolidates the CPU, rendering, and multi-core performance work completed so far.
+
+- native-loop JIT and hot-path acceleration for 68000 execution
+- CPU1 dedicated to the X68000 timing domain, with CPU0 handling display, audio, and host I/O
+- CPU0-side G + BG + TEXT composition
+- persistent **GRP8 Scroll Cache** so large scrolling backgrounds are not rebuilt every frame
+- PIE / XespV accelerated copy / diff / blend paths
+- AXI-GDMA fallback for PSRAM transfers
+- dirty / diff LCD updates plus CRTC-based frame pacing
+- CPU0-side final FM + ADPCM mixing
+
+One of the more unexpected wins came from changing the problem itself: instead of repeatedly accelerating the same background reconstruction, X68K Tab now **keeps the decoded background and moves only the scroll position whenever possible**. :)
+
 ---
 
 ## What is X68K Tab?
@@ -40,7 +55,7 @@ X68K Tab is intended to be available through **M5Burner** for users who simply w
 ### M5Burner Share Code
 
 ```text
-xX5zvurDW6xMacAK
+aFmGCMA3FSvzcW5H
 ```
 
 Open **Share Burn** in M5Burner, enter the Share Code above, select X68K Tab, and burn it to your Tab5.
@@ -148,7 +163,11 @@ Finding more PANIC data would definitely increase my motivation. :)
 - CPU1 focused on the X68000 guest timing domain
 - CPU0 handling host display, audio, input and storage
 - Asynchronous inter-CPU communication using SPM / Mailbox concepts
-- Accelerated graphics and memory paths using PIE-style processing
+- Accelerated graphics and memory paths using PIE / XespV
+- native-loop JIT and hot-path acceleration for 68000 execution
+- CPU0-side G + BG + TEXT composition
+- GRP8 Scroll Cache for large scrolling backgrounds
+- dirty / diff LCD updates with frame pacing
 - LCD DMA output
 - vgmM5-based YM2151 backend
 - ADPCM support
@@ -220,26 +239,44 @@ Video, audio, input and media-changing paths are progressively being moved towar
 
 X68K Tab focuses on changing the shape of the workload to match the ESP32-P4 rather than simply increasing clock speed.
 
-### PIE Engine
+### PIE / XespV
 
-PIE-style accelerated paths are being used for rendering and bulk data processing.
+ESP32-P4 PIE / XespV paths are used for rendering and bulk data processing.
 
-Targets include:
+Main areas actively used in 6.15 include:
 
-- 128-bit parallel pixel processing
-- vectorized palette expansion
-- branchless transparency tests
-- copy / fill / blend
-- key-color processing
+- 128-bit parallel processing
+- copy / fill
+- key-color / blend
 - diff processing
-- RGB565 composition
-- Sprite / BG composition assistance
-- memory block transfer
-- BitBLT-like operations
+- RGB565 pixel operations
+- raster snapshots
+- memory-block operations
 
-PIE is not treated as a JIT replacement for 68000 instructions. It is used as an accelerator for the data-heavy operations around emulation: rendering, conversion, comparison and memory movement.
+PIE is not used as a replacement for the 68000 CPU core. It accelerates the data-heavy work around emulation: rendering, conversion, comparison, and memory movement.
 
-Fast paths are adopted only where their output matches the reference C implementation and where they provide a real performance benefit.
+Fast paths are validated against reference behavior and fall back to C / scalar implementations when the required conditions are not met.
+
+### 68000 Native-loop JIT
+
+6.15 uses Musashi as the authoritative 68000 core, while selected hot loops and hot paths that have shown real benefit on games can be translated into ESP32-P4 RV32 native code.
+
+- 32 KiB executable arena
+- dispatch caches in TCM / internal SRAM
+- direct L0 lookup / epoch memo
+- small loop fragments
+- signature / RAM guards
+- immediate fallback to Musashi for unsupported paths
+
+The goal is not a huge all-or-nothing JIT. It is a **conservative helper JIT that native-compiles only the parts that are safe and useful**.
+
+### Render / Scroll Cache
+
+For supported 256-color modes, 6.15 can move the final G + BG + TEXT composition from CPU1 to CPU0.
+
+Large scrolling backgrounds can also use a persistent **512 x 512 palette-index Scroll Cache**. Instead of reconstructing the same GRP8 background from GVRAM every frame, only physical rows that are actually modified are rebuilt.
+
+Simple scrolling therefore reuses the existing decoded image and changes only the source position, reducing PSRAM traffic and frame-to-frame workload variation.
 
 ### LCD DMA
 
@@ -262,14 +299,9 @@ Memory is divided by access pattern.
 - SPM / Mailbox: inter-CPU notifications and shared state
 - scratch buffers: audio and conversion workspaces
 
-Further work includes:
+6.15 already uses cache-line-aware layouts, selected hot tables in SRAM, reduced CPU-to-CPU copying, and PSRAM for large persistent buffers.
 
-- cache-line alignment
-- burst access
-- DMA-friendly layouts
-- moving hot tables into SRAM
-- hierarchical caching
-- reducing CPU-to-CPU copies
+Further work will expand burst access, DMA-friendly layouts, and hierarchical caching only where real measurements show a useful gain.
 
 ---
 
@@ -352,9 +384,9 @@ As of August 2026, X68K Tab is roughly at an **RC-like development stage**.
 | Flash boot | Working / testing |
 | HostFS / SD | Working / testing |
 | Guest-only reboot / media switching | Working / regression testing |
-| Graphic VRAM | Working / optimization ongoing |
-| Text / BG / Sprite composition | Working / optimization ongoing |
-| LCD output / DMA | Working / tuning ongoing |
+| Graphic VRAM | Working / Build 6.15 accelerated paths active |
+| Text / BG / Sprite composition | Working / CPU0 G+BG+TEXT path + scroll cache active |
+| LCD output / DMA | Working / dirty-diff + frame pacing active |
 | YM2151 FM / vgmM5 | Working / optimization ongoing |
 | 32-bit DDS / native-rate FM | In progress |
 | ADPCM | Working |
@@ -362,7 +394,7 @@ As of August 2026, X68K Tab is roughly at an **RC-like development stage**.
 | USB keyboard | Working / testing |
 | USB Joypad | Working / compatibility testing |
 | Touch UI | Working / evolving |
-| PIE acceleration | Partial / expanding |
+| PIE / XespV acceleration | Working on selected validated paths |
 | Stability | Continuous regression testing |
 
 X68000 software often uses the hardware in very different ways.
@@ -373,61 +405,84 @@ A bug that appears in only one title can still reveal an important compatibility
 
 ---
 
-## Planned Performance Work
+## Performance Progress and Future Work
 
-### CPU / Bus
+With 6.15, the first major ESP32-P4-specific optimization phase is considered complete.
 
-- 68000 instruction-dispatch hot paths
-- memory-map fast paths
-- fewer ROM / RAM / VRAM access branches
-- reduced read/write callback overhead
-- lighter interrupt / event queues
-- reduced guest-timeline jitter
+### Implemented in 6.15
 
-### Graphics / PIE
+#### CPU / Bus
 
-- expand PIE acceleration coverage
-- vectorized palette conversion
-- branchless transparency
-- faster Sprite / BG overlay
-- dirty-rectangle / diff rendering
-- page / scroll access optimization
-- burst VRAM access
-- faster RGB565 composition
-- automatic reference-C / fast-path selection
+- Musashi as the authoritative 68000 core
+- instruction-dispatch hot paths
+- dispatch caches in TCM / internal SRAM
+- native-loop JIT
+- selected poll / DBcc / branch / memory fast paths
+- separation of guest timing from host-side services
+- CPU1 WDT / idle-relief tuning
 
-### Multi-core
+#### Graphics / Render
 
-- wider use of SPM / Mailbox
-- lock-free / low-lock queues
-- fewer CPU0 / CPU1 copies
+- PIE / XespV copy / fill / diff / blend paths
+- dirty-row and pixel-diff LCD updates
+- CPU0 G + BG + TEXT compositor
+- CPU0 shared-scroll GRP8 path
+- **persistent 512 x 512 Scroll Cache**
+- cache invalidation / rebuild only for modified GVRAM rows
+- AXI-GDMA fallback for PSRAM transfers
+- safe C / scalar fallback paths
+
+#### Multi-core
+
+- CPU1: 68000 / guest timing / ADPCM generation
+- CPU0: compositor / LCD / USB / FM / final audio mix
+- SPM / Mailbox notifications
 - asynchronous producer / consumer paths
-- less blocking in video and audio tasks
+- reduced LCD-side blocking of the guest CPU
 
-### Memory
+#### LCD
 
-- move frequently used tables into internal SRAM
-- PSRAM burst access
-- cache-line alignment
-- improved framebuffer / VRAM layout
-- optimized audio scratch buffers
+- 4:3 viewport
+- generation-dirty row tracking
+- PIE-DIFF suppression of pixel-identical rows
+- dirty-band updates
+- **CRTC-based frame pacing**
+- latest-frame-first presentation
 
-### Audio
+#### Audio
 
-- further vgmM5 FM optimization
-- full 32-bit fixed-point DDS
-- YM2151 native-rate generation
-- branchless matrix operations
-- optimized FM / ADPCM mixer
-- reduced resampling cost
-- lower audio latency
+- separated ADPCM generation and final output
+- CPU0 YM2151 backend
+- CPU0 final FM + ADPCM mixing
+- jitter buffer and underflow recovery
+- pitch-safe 44.1 / 22.05 kHz pressure relief
 
-### LCD
+### The Unexpected Optimization
 
-- overlap frame generation with DMA
-- optimize double buffering / frame flip
-- remove unnecessary copies
-- evaluate partial updates
+The original plan focused heavily on making GVRAM transfer and composition faster.
+
+Real-device testing of large scrolling backgrounds led to a simpler and more powerful conclusion:
+
+> **It is better not to rebuild the same picture at all than to rebuild it faster.**
+
+The 6.15 Scroll Cache keeps the background in palette-index form and changes only the source offset during ordinary scrolling.
+
+This turned out to be one of the most useful optimizations in the entire phase.
+
+### What Comes Next
+
+From this point, optimization for its own sake is no longer the priority. **Compatibility, stability, and broader software support take precedence.**
+
+Possible future performance work includes:
+
+- heavy 65K-color GRP generation
+- further CPU0 / PIE offload for Sprite / BG generation
+- vgmM5 32-bit fixed-point DDS / native-rate YM2151
+- carefully selected PPA usage that does not increase PSRAM bandwidth pressure
+- additional LCD presentation / DMA improvements
+- targeted optimization only when real software reveals a clear bottleneck
+
+**Performance changes will be kept only when they are measurable and do not compromise compatibility.**
 
 ---
 
@@ -643,6 +698,35 @@ Issues and Pull Requests are welcome.
 
 ---
 
+## Change Log
+
+### 6.15 — Production
+
+Major changes from 6.12u:
+
+- added **native-loop JIT and hot-path acceleration** for 68000 execution
+- added dispatch caches in TCM / internal SRAM
+- further separated CPU1 guest timing from CPU0 display, audio, input, and host processing
+- added a fast path that moves final G + BG + TEXT composition to CPU0
+- added a **persistent 512 x 512 GRP8 Scroll Cache** for large backgrounds
+  - unchanged backgrounds are no longer reconstructed every frame
+  - only GVRAM rows that are actually modified are rebuilt
+- expanded PIE / XespV copy / fill / diff / blend paths
+- added an AXI-GDMA path for suitable PSRAM transfers
+- improved dirty / diff LCD updates
+- added **CRTC-based frame pacing** to reduce visible scrolling unevenness
+- moved more final FM / ADPCM host-side audio work to CPU0
+- removed periodic benchmark noise and detailed research JIT logging for the Production build
+
+### 6.12u — Initial Public Release
+
+- first public X68K Tab release
+- changed PANIC / GUI / FILE / F7 / F8 transitions to use **guest-only reset** instead of restarting the entire ESP32-P4
+- established the basic architecture for switching X68000 sessions without reinitializing LCD, USB, and audio
+- public baseline integrating XDF / DIM / HDS, Human68k, HostFS, USB Keyboard / Joypad, touch UI, and PANIC Player
+
+---
+
 ## Also Looking for PANIC Data
 
 X68K Tab grew out of PanicPlayerTab5.
@@ -668,6 +752,6 @@ Finding more PANIC data would make the developer very happy — and would defini
 
 Running a computer from more than thirty years ago on a palm-sized RISC-V machine means mapping the old machine onto a completely different architecture.
 
-CPU1 protects the X68000 timing domain. CPU0 handles display, audio and I/O. PIE accelerates pixel work, DMA moves the display, and vgmM5 generates FM audio.
+CPU1 protects the X68000 timing domain. CPU0 handles display, audio and I/O. The native-loop JIT helps selected 68000 hot loops, the Scroll Cache avoids rebuilding unchanged backgrounds, PIE / XespV accelerates pixel work, DMA moves data, and vgmM5 generates FM audio.
 
 **X68K Tab is a project about both running the X68000 and enjoying the architecture required to make that happen.**

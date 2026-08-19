@@ -1,13 +1,13 @@
 # Target labels
  bootloader
 # Source files and their labels
-G:/px68k-tab5/.pio/build/m5stack-tab5/CMakeFiles/bootloader
-G:/px68k-tab5/.pio/build/m5stack-tab5/CMakeFiles/bootloader.rule
-G:/px68k-tab5/.pio/build/m5stack-tab5/CMakeFiles/bootloader-complete.rule
-G:/px68k-tab5/.pio/build/m5stack-tab5/bootloader-prefix/src/bootloader-stamp/bootloader-build.rule
-G:/px68k-tab5/.pio/build/m5stack-tab5/bootloader-prefix/src/bootloader-stamp/bootloader-configure.rule
-G:/px68k-tab5/.pio/build/m5stack-tab5/bootloader-prefix/src/bootloader-stamp/bootloader-download.rule
-G:/px68k-tab5/.pio/build/m5stack-tab5/bootloader-prefix/src/bootloader-stamp/bootloader-install.rule
-G:/px68k-tab5/.pio/build/m5stack-tab5/bootloader-prefix/src/bootloader-stamp/bootloader-mkdir.rule
-G:/px68k-tab5/.pio/build/m5stack-tab5/bootloader-prefix/src/bootloader-stamp/bootloader-patch.rule
-G:/px68k-tab5/.pio/build/m5stack-tab5/bootloader-prefix/src/bootloader-stamp/bootloader-update.rule
+G:/X68KTab5/.pio/build/m5stack-tab5/CMakeFiles/bootloader
+G:/X68KTab5/.pio/build/m5stack-tab5/CMakeFiles/bootloader.rule
+G:/X68KTab5/.pio/build/m5stack-tab5/CMakeFiles/bootloader-complete.rule
+G:/X68KTab5/.pio/build/m5stack-tab5/bootloader-prefix/src/bootloader-stamp/bootloader-build.rule
+G:/X68KTab5/.pio/build/m5stack-tab5/bootloader-prefix/src/bootloader-stamp/bootloader-configure.rule
+G:/X68KTab5/.pio/build/m5stack-tab5/bootloader-prefix/src/bootloader-stamp/bootloader-download.rule
+G:/X68KTab5/.pio/build/m5stack-tab5/bootloader-prefix/src/bootloader-stamp/bootloader-install.rule
+G:/X68KTab5/.pio/build/m5stack-tab5/bootloader-prefix/src/bootloader-stamp/bootloader-mkdir.rule
+G:/X68KTab5/.pio/build/m5stack-tab5/bootloader-prefix/src/bootloader-stamp/bootloader-patch.rule
+G:/X68KTab5/.pio/build/m5stack-tab5/bootloader-prefix/src/bootloader-stamp/bootloader-update.rule

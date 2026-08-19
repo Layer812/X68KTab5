@@ -1,4 +1,4 @@
-# Install script for directory: G:/px68k-tab5/components/px68k
+# Install script for directory: G:/X68KTab5/components/px68k
 
 # Set the install prefix
 if(NOT DEFINED CMAKE_INSTALL_PREFIX)

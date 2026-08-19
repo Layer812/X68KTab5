@@ -1,6 +1,7 @@
 idf_component_register(
     SRCS
         "main.c"
+        "tab5_dynarec_arena.c"
         "tab5_video.cpp"
         "tab5_ppa.c"
         "tab5_px68k_hotmem.c"
@@ -24,4 +25,6 @@ idf_component_register(
         esp_driver_sdmmc
         sdmmc
         usb
+        esp_hw_support
+        esp_mm
 )

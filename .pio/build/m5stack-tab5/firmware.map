@@ -2,7 +2,7 @@
 Discarded input sections
 
  .note.GNU-stack
-                0x00000000        0x0 CMakeFiles/cmTC_8a4f6.dir/src.c.obj
+                0x00000000        0x0 CMakeFiles/cmTC_40f0a.dir/src.c.obj
 
 Memory Configuration
 
@@ -11,7 +11,7 @@ Name             Origin             Length             Attributes
 
 Linker script and memory map
 
-LOAD CMakeFiles/cmTC_8a4f6.dir/src.c.obj
+LOAD CMakeFiles/cmTC_40f0a.dir/src.c.obj
 LOAD C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/rv32imafc_zicsr_zifencei/ilp32f\libgcc.a
 LOAD C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/lib/rv32imafc_zicsr_zifencei/ilp32f\libc.a
 LOAD C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/lib/rv32imafc_zicsr_zifencei/ilp32f\libnosys.a
@@ -90,7 +90,7 @@ END GROUP
  *(.text.hot .text.hot.*)
  *(SORT_BY_NAME(.text.sorted.*))
  *(.text .stub .text.* .gnu.linkonce.t.*)
- .text          0x00010094       0x14 CMakeFiles/cmTC_8a4f6.dir/src.c.obj
+ .text          0x00010094       0x14 CMakeFiles/cmTC_40f0a.dir/src.c.obj
                 0x00010094                main
  *(.gnu.warning)
 
@@ -212,7 +212,7 @@ END GROUP
 .data           0x000110a8        0x0
                 0x000110a8                        __DATA_BEGIN__ = .
  *(.data .data.* .gnu.linkonce.d.*)
- .data          0x000110a8        0x0 CMakeFiles/cmTC_8a4f6.dir/src.c.obj
+ .data          0x000110a8        0x0 CMakeFiles/cmTC_40f0a.dir/src.c.obj
 
 .data1
  *(.data1)
@@ -238,7 +238,7 @@ END GROUP
 .bss            0x000110a8        0x0
  *(.dynbss)
  *(.bss .bss.* .gnu.linkonce.b.*)
- .bss           0x000110a8        0x0 CMakeFiles/cmTC_8a4f6.dir/src.c.obj
+ .bss           0x000110a8        0x0 CMakeFiles/cmTC_40f0a.dir/src.c.obj
  *(COMMON)
                 0x000110a8                        . = ALIGN ((. != 0x0)?0x4:0x1)
                 0x000110a8                        . = ALIGN (0x4)
@@ -270,13 +270,13 @@ END GROUP
 
 .comment        0x00000000       0x2f
  *(.comment)
- .comment       0x00000000       0x2f CMakeFiles/cmTC_8a4f6.dir/src.c.obj
+ .comment       0x00000000       0x2f CMakeFiles/cmTC_40f0a.dir/src.c.obj
                                  0x30 (size before relaxing)
 
 .riscv.attributes
                 0x00000000       0x6c
  .riscv.attributes
-                0x00000000       0x6c CMakeFiles/cmTC_8a4f6.dir/src.c.obj
+                0x00000000       0x6c CMakeFiles/cmTC_40f0a.dir/src.c.obj
 
 .gnu.build.attributes
  *(.gnu.build.attributes .gnu.build.attributes.*)
@@ -369,4 +369,4 @@ END GROUP
  *(.note.GNU-stack)
  *(.gnu_debuglink)
  *(.gnu.lto_*)
-OUTPUT(cmTC_8a4f6 elf32-littleriscv)
+OUTPUT(cmTC_40f0a elf32-littleriscv)

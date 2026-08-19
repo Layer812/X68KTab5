@@ -127,6 +127,22 @@ extern int tab5_compose_submit_grp8split_bgsp_line(uint32_t y, uint32_t width,
                                                    const BG_HOST_LINE_STATE *bg_state,
                                                    int bg_on_top, uint16_t *dst,
                                                    const uint16_t *selfcheck_ref);
+extern int tab5_compose_submit_gbt_line(uint32_t y, uint32_t width,
+                                        const uint16_t *grp,
+                                        const uint16_t *bg_text,
+                                        const uint8_t *text_tr_flags,
+                                        uint8_t grp_pri, uint8_t bg_pri,
+                                        uint8_t text_pri, uint16_t *dst);
+extern int tab5_compose_submit_gbt_rawpair_line(uint32_t y, uint32_t width,
+                                                const uint8_t *gvram,
+                                                uint32_t y_lo_base, uint32_t y_hi_base,
+                                                uint32_t x_lo, uint32_t x_hi,
+                                                int bottom_page, int top_page,
+                                                const uint16_t *palette,
+                                                const uint16_t *bg_text,
+                                                const uint8_t *text_tr_flags,
+                                                uint8_t grp_pri, uint8_t bg_pri,
+                                                uint8_t text_pri, uint16_t *dst);
 extern int tab5_compose_grp8split_needs_selfcheck(void);
 extern void tab5_compose_wait_idle(void);
 
@@ -155,6 +171,20 @@ static uint32_t s_wd_perf_grp_calls = 0;
 static uint32_t s_wd_perf_text_calls = 0;
 static uint32_t s_wd_perf_bg_calls = 0;
 static uint32_t s_wd_perf_blend_calls = 0;
+/* Build 6.13b: split the large guest-render bucket into actionable targets. */
+static uint64_t s_wd613_grp_mode_us[3] = {0}; /* 16/256/65k */
+static uint32_t s_wd613_grp_mode_calls[3] = {0};
+static uint64_t s_wd613_bg_capture_us = 0, s_wd613_bg_draw_us = 0;
+static uint32_t s_wd613_bg_capture_calls = 0, s_wd613_bg_draw_calls = 0;
+static uint64_t s_wd613_blend_grp_us = 0, s_wd613_blend_bg_us = 0;
+static uint64_t s_wd613_blend_text_us = 0, s_wd613_blend_pri_us = 0;
+static uint64_t s_wd613_hostprep_us = 0, s_wd613_hostblend_us = 0;
+static uint32_t s_wd613_blend_grp_calls = 0, s_wd613_blend_bg_calls = 0;
+static uint32_t s_wd613_blend_text_calls = 0, s_wd613_blend_pri_calls = 0;
+static uint32_t s_wd613_hostprep_calls = 0, s_wd613_hostblend_calls = 0;
+static uint32_t s_wd613_layer_mask[8] = {0}; /* bit0=GRP bit1=BG/SP bit2=TEXT */
+static uint32_t s_wd613_special_lines = 0;
+static int s_gbt614a_reported = 0;
 
 /* Build 5.53a: sampled-frame reject map for the CPU0 common GRP8/BGSP path.
  * These counters are touched only while the existing one-frame PERF sample is
@@ -176,6 +206,18 @@ void WinDraw_PerfSetSample(int enabled)
         s_wd_perf_dirty_lines = 0;
         s_wd_perf_grp_calls = s_wd_perf_text_calls = 0;
         s_wd_perf_bg_calls = s_wd_perf_blend_calls = 0;
+        memset(s_wd613_grp_mode_us, 0, sizeof(s_wd613_grp_mode_us));
+        memset(s_wd613_grp_mode_calls, 0, sizeof(s_wd613_grp_mode_calls));
+        s_wd613_bg_capture_us = s_wd613_bg_draw_us = 0;
+        s_wd613_bg_capture_calls = s_wd613_bg_draw_calls = 0;
+        s_wd613_blend_grp_us = s_wd613_blend_bg_us = 0;
+        s_wd613_blend_text_us = s_wd613_blend_pri_us = 0;
+        s_wd613_hostprep_us = s_wd613_hostblend_us = 0;
+        s_wd613_blend_grp_calls = s_wd613_blend_bg_calls = 0;
+        s_wd613_blend_text_calls = s_wd613_blend_pri_calls = 0;
+        s_wd613_hostprep_calls = s_wd613_hostblend_calls = 0;
+        memset(s_wd613_layer_mask, 0, sizeof(s_wd613_layer_mask));
+        s_wd613_special_lines = 0;
         s_wd_perf_host_lines = 0;
         s_hp_mode16 = s_hp_mode256 = s_hp_mode65k = 0;
         s_hp_256_common = s_hp_async_geom = s_hp_submit = s_hp_accept = 0;
@@ -220,6 +262,26 @@ void WinDraw_PerfGetLast(uint32_t *grp_us, uint32_t *text_us, uint32_t *bg_us,
                (unsigned)s_hp_rej_tron, (unsigned)s_hp_rej_pron,
                (unsigned)s_hp_rej_queue,
                (unsigned)s_hp_rej_scrolly, (unsigned)s_hp_rej_scrollx);
+        printf("PX68K_RENDER613B: grp16=%luus/%u grp256=%luus/%u grp65k=%luus/%u text=%luus/%u "
+               "bgdraw=%luus/%u bgcap=%luus/%u blend:G/B/T/P=%lu/%lu/%lu/%luus calls=%u/%u/%u/%u "
+               "hostprep=%luus/%u hostblend=%luus/%u layers[none,g,b,gb,t,gt,bt,gbt]=%u/%u/%u/%u/%u/%u/%u/%u special=%u\n",
+               (unsigned long)s_wd613_grp_mode_us[0], (unsigned)s_wd613_grp_mode_calls[0],
+               (unsigned long)s_wd613_grp_mode_us[1], (unsigned)s_wd613_grp_mode_calls[1],
+               (unsigned long)s_wd613_grp_mode_us[2], (unsigned)s_wd613_grp_mode_calls[2],
+               (unsigned long)s_wd_perf_text_us, (unsigned)s_wd_perf_text_calls,
+               (unsigned long)s_wd613_bg_draw_us, (unsigned)s_wd613_bg_draw_calls,
+               (unsigned long)s_wd613_bg_capture_us, (unsigned)s_wd613_bg_capture_calls,
+               (unsigned long)s_wd613_blend_grp_us, (unsigned long)s_wd613_blend_bg_us,
+               (unsigned long)s_wd613_blend_text_us, (unsigned long)s_wd613_blend_pri_us,
+               (unsigned)s_wd613_blend_grp_calls, (unsigned)s_wd613_blend_bg_calls,
+               (unsigned)s_wd613_blend_text_calls, (unsigned)s_wd613_blend_pri_calls,
+               (unsigned long)s_wd613_hostprep_us, (unsigned)s_wd613_hostprep_calls,
+               (unsigned long)s_wd613_hostblend_us, (unsigned)s_wd613_hostblend_calls,
+               (unsigned)s_wd613_layer_mask[0], (unsigned)s_wd613_layer_mask[1],
+               (unsigned)s_wd613_layer_mask[2], (unsigned)s_wd613_layer_mask[3],
+               (unsigned)s_wd613_layer_mask[4], (unsigned)s_wd613_layer_mask[5],
+               (unsigned)s_wd613_layer_mask[6], (unsigned)s_wd613_layer_mask[7],
+               (unsigned)s_wd613_special_lines);
     }
 }
 
@@ -233,10 +295,38 @@ void WinDraw_PerfGetLast(uint32_t *grp_us, uint32_t *text_us, uint32_t *bg_us,
         __VA_ARGS__; \
     } \
 } while (0)
-#define WD_PERF_GRP(...)   WD_PERF_DO(s_wd_perf_grp_us,   s_wd_perf_grp_calls,   __VA_ARGS__)
+#define WD_PERF_GRP(...) do { \
+    if (WD_PERF_ACTIVE) { \
+        int64_t _wd_t0 = esp_timer_get_time(); \
+        __VA_ARGS__; \
+        uint64_t _wd_dt = (uint64_t)(esp_timer_get_time() - _wd_t0); \
+        unsigned _wd_m = (unsigned)(VCReg0[1] & 3); \
+        unsigned _wd_i = (_wd_m == 0u) ? 0u : ((_wd_m == 3u) ? 2u : 1u); \
+        s_wd_perf_grp_us += _wd_dt; ++s_wd_perf_grp_calls; \
+        s_wd613_grp_mode_us[_wd_i] += _wd_dt; ++s_wd613_grp_mode_calls[_wd_i]; \
+    } else { __VA_ARGS__; } \
+} while (0)
 #define WD_PERF_TEXT(...)  WD_PERF_DO(s_wd_perf_text_us,  s_wd_perf_text_calls,  __VA_ARGS__)
-#define WD_PERF_BG(...)    WD_PERF_DO(s_wd_perf_bg_us,    s_wd_perf_bg_calls,    __VA_ARGS__)
-#define WD_PERF_BLEND(...) WD_PERF_DO(s_wd_perf_blend_us, s_wd_perf_blend_calls, __VA_ARGS__)
+#define WD_PERF_BG(...) do { \
+    if (WD_PERF_ACTIVE) { \
+        int64_t _wd_t0 = esp_timer_get_time(); __VA_ARGS__; \
+        uint64_t _wd_dt = (uint64_t)(esp_timer_get_time() - _wd_t0); \
+        s_wd_perf_bg_us += _wd_dt; ++s_wd_perf_bg_calls; \
+        s_wd613_bg_draw_us += _wd_dt; ++s_wd613_bg_draw_calls; \
+    } else { __VA_ARGS__; } \
+} while (0)
+#define WD_PERF_BLEND_KIND(CACC, CCALLS, ...) do { \
+    if (WD_PERF_ACTIVE) { \
+        int64_t _wd_t0 = esp_timer_get_time(); __VA_ARGS__; \
+        uint64_t _wd_dt = (uint64_t)(esp_timer_get_time() - _wd_t0); \
+        s_wd_perf_blend_us += _wd_dt; ++s_wd_perf_blend_calls; \
+        (CACC) += _wd_dt; ++(CCALLS); \
+    } else { __VA_ARGS__; } \
+} while (0)
+#define WD_PERF_BLEND_GRP(...)  WD_PERF_BLEND_KIND(s_wd613_blend_grp_us,  s_wd613_blend_grp_calls,  __VA_ARGS__)
+#define WD_PERF_BLEND_BG(...)   WD_PERF_BLEND_KIND(s_wd613_blend_bg_us,   s_wd613_blend_bg_calls,   __VA_ARGS__)
+#define WD_PERF_BLEND_TEXT(...) WD_PERF_BLEND_KIND(s_wd613_blend_text_us, s_wd613_blend_text_calls, __VA_ARGS__)
+#define WD_PERF_BLEND_PRI(...)  WD_PERF_BLEND_KIND(s_wd613_blend_pri_us,  s_wd613_blend_pri_calls,  __VA_ARGS__)
 #define WD_PERF_CLEAR(...) WD_PERF_DO(s_wd_perf_clear_us, s_wd_perf_blend_calls, __VA_ARGS__)
 
 uint16_t WinDraw_Pal16B, WinDraw_Pal16R, WinDraw_Pal16G;
@@ -867,8 +957,13 @@ void WinDraw_DrawLine(void)
                 if (WD_PERF_ACTIVE) {
                     int64_t _t = esp_timer_get_time();
                     bgsp_async = BG_CaptureHostLineState(&bgsp_state, VLINEBG, 0);
-                    s_wd_perf_bg_us += (uint64_t)(esp_timer_get_time() - _t);
+                    {
+                        uint64_t _dt = (uint64_t)(esp_timer_get_time() - _t);
+                        s_wd_perf_bg_us += _dt;
+                        s_wd613_bg_capture_us += _dt;
+                    }
                     s_wd_perf_bg_calls++;
+                    s_wd613_bg_capture_calls++;
                 } else {
                     bgsp_async = BG_CaptureHostLineState(&bgsp_state, VLINEBG, 0);
                 }
@@ -894,8 +989,13 @@ void WinDraw_DrawLine(void)
                 if (WD_PERF_ACTIVE) {
                     int64_t _t = esp_timer_get_time();
                     bgsp_async = BG_CaptureHostLineState(&bgsp_state, VLINEBG, 1);
-                    s_wd_perf_bg_us += (uint64_t)(esp_timer_get_time() - _t);
+                    {
+                        uint64_t _dt = (uint64_t)(esp_timer_get_time() - _t);
+                        s_wd_perf_bg_us += _dt;
+                        s_wd613_bg_capture_us += _dt;
+                    }
                     s_wd_perf_bg_calls++;
+                    s_wd613_bg_capture_calls++;
                 } else {
                     bgsp_async = BG_CaptureHostLineState(&bgsp_state, VLINEBG, 1);
                 }
@@ -933,6 +1033,75 @@ void WinDraw_DrawLine(void)
         if (tron) ++s_hp_rej_tron;
         if (pron) ++s_hp_rej_pron;
     }
+    if (WD_PERF_ACTIVE) {
+        unsigned _mask = (gon ? 1u : 0u) | (bgon ? 2u : 0u) | (ton ? 4u : 0u);
+        ++s_wd613_layer_mask[_mask & 7u];
+        if (tron || pron) ++s_wd613_special_lines;
+    }
+
+    /* Build 6.14b2 Render Phase B2.
+     *
+     * 6.14a proved the G+BG+TEXT priority/key-zero path on real SFXVI and
+     * restored the missing background.  For the shared-scroll 256-colour
+     * pair, stop materializing Grp_LineBuf on CPU1: snapshot the two packed
+     * GVRAM lanes and let CPU0 reconstruct GRP + perform the validated G/B/T
+     * selection in one pass.  Unequal-scroll keeps the exact 6.14a path. */
+    if (gon && bgon && ton && !tron && !pron && grp8_async)
+    {
+        int accepted = 0;
+        uint16_t *dst = &ScrBuf[VLINE * FULLSCREEN_WIDTH];
+        const uint8_t grp_pri = (uint8_t)(VCReg1[0] & 3);
+        const uint8_t text_pri = (uint8_t)((VCReg1[0] >> 2) & 3);
+        const uint8_t bg_pri = (uint8_t)((VCReg1[0] >> 4) & 3);
+
+        if (!grp8_split) {
+            /* Build 6.14c: scroll is an address change, not new image data.
+             * Try the persistent decoded GRP8 row cache first. On allocation/
+             * queue failure retain the exact 6.14b2a raw-snapshot path. */
+            accepted = tab5_compose_submit_gbt_scrollcache_line(
+                VLINE, (uint32_t)TextDotX, GVRAM,
+                grp8_geom.by_lo_base, grp8_geom.by_hi_base,
+                grp8_geom.bx_lo, grp8_geom.bx_hi,
+                grp8_bottom, grp8_top, GrphPal,
+                &BG_LineBuf[16], &Text_TrFlag[16],
+                grp_pri, bg_pri, text_pri, dst);
+            if (accepted) {
+                if (!s_gbt614a_reported) {
+                    s_gbt614a_reported = 1;
+                    printf("PX68K_SCROLL614C: CPU0 persistent GRP8 scroll-cache + BG+TEXT compositor ACTIVE pri G/T/B=%u/%u/%u\n",
+                           (unsigned)grp_pri, (unsigned)text_pri, (unsigned)bg_pri);
+                }
+                return;
+            }
+            accepted = tab5_compose_submit_gbt_rawpair_line(
+                VLINE, (uint32_t)TextDotX, GVRAM,
+                grp8_geom.by_lo_base, grp8_geom.by_hi_base,
+                grp8_geom.bx_lo, grp8_geom.bx_hi,
+                grp8_bottom, grp8_top, GrphPal,
+                &BG_LineBuf[16], &Text_TrFlag[16],
+                grp_pri, bg_pri, text_pri, dst);
+            if (accepted) return;
+            WD_PERF_GRP(WinDraw_DrawGrp8PairChecked(grp8_bottom, grp8_top));
+            grp8_async = 0;
+        } else {
+            /* Phase B intentionally does not enlarge the packet for four raw
+             * split lanes. Preserve 6.14a exactly for unequal-scroll lines. */
+            WD_PERF_GRP(WinDraw_DrawGrp8PairChecked(grp8_bottom, grp8_top));
+            grp8_async = 0;
+            accepted = tab5_compose_submit_gbt_line(
+                VLINE, (uint32_t)TextDotX,
+                Grp_LineBuf, &BG_LineBuf[16], &Text_TrFlag[16],
+                grp_pri, bg_pri, text_pri, dst);
+            if (accepted) {
+                if (!s_gbt614a_reported) {
+                    s_gbt614a_reported = 1;
+                    printf("PX68K_GBT614B2: CPU0 G+BG+TEXT compositor ACTIVE; unequal-scroll uses 6.14a materialized-GRP fallback\n");
+                }
+                return;
+            }
+        }
+    }
+
 	if (gon && bgon && !ton && !tron && !pron)
 	{
         int compose_result;
@@ -992,8 +1161,13 @@ void WinDraw_DrawLine(void)
                             grp8_bottom, grp8_top, GrphPal, &BG_LineBuf[16],
                             bg_on_top, dst);
                 }
-                s_wd_perf_grp_us += (uint64_t)(esp_timer_get_time() - _t);
+                {
+                    uint64_t _dt = (uint64_t)(esp_timer_get_time() - _t);
+                    s_wd_perf_grp_us += _dt;
+                    s_wd613_hostprep_us += _dt;
+                }
                 s_wd_perf_grp_calls++;
+                s_wd613_hostprep_calls++;
                 s_wd_perf_blend_calls++;
             } else {
                 if (grp8_split) {
@@ -1057,8 +1231,13 @@ void WinDraw_DrawLine(void)
 		if (WD_PERF_ACTIVE) {
 			int64_t _t = esp_timer_get_time();
 			compose_result = WinDraw_QueueHostCommonTwoLayer();
-			s_wd_perf_blend_us += (uint64_t)(esp_timer_get_time() - _t);
+			{
+				uint64_t _dt = (uint64_t)(esp_timer_get_time() - _t);
+				s_wd_perf_blend_us += _dt;
+				s_wd613_hostblend_us += _dt;
+			}
 			s_wd_perf_blend_calls++;
+			s_wd613_hostblend_calls++;
 		} else {
 			compose_result = WinDraw_QueueHostCommonTwoLayer();
 		}
@@ -1082,12 +1261,12 @@ void WinDraw_DrawLine(void)
 	{
 		if (gon)
 		{
-			WD_PERF_BLEND(WinDraw_DrawGrpLine(opaq));
+			WD_PERF_BLEND_GRP(WinDraw_DrawGrpLine(opaq));
 			opaq = 0;
 		}
 		if (tron)
 		{
-			WD_PERF_BLEND(WinDraw_DrawGrpLineNonSP(opaq));
+			WD_PERF_BLEND_GRP(WinDraw_DrawGrpLineNonSP(opaq));
 			opaq = 0;
 		}
 	}
@@ -1097,14 +1276,14 @@ void WinDraw_DrawLine(void)
 		{
 			if ( (VCReg1[0]&3)<((VCReg1[0]>>2)&3) )
 			{
-				WD_PERF_BLEND(WinDraw_DrawBGLineTR(opaq));
+				WD_PERF_BLEND_BG(WinDraw_DrawBGLineTR(opaq));
 				tdrawed = 1;
 				opaq = 0;
 			}
 		}
 		else
 		{
-			WD_PERF_BLEND(WinDraw_DrawBGLine(opaq, /*0*/tdrawed));
+			WD_PERF_BLEND_BG(WinDraw_DrawBGLine(opaq, /*0*/tdrawed));
 			tdrawed = 1;
 			opaq = 0;
 		}
@@ -1112,9 +1291,9 @@ void WinDraw_DrawLine(void)
 	if ( (VCReg1[0]&0x08)&&(ton) )
 	{
 		if ( ((VCReg2[0]&0x5d)==0x1d)&&((VCReg1[0]&0x03)!=0x02)&&(tron) )
-			WD_PERF_BLEND(WinDraw_DrawTextLineTR(opaq));
+			WD_PERF_BLEND_TEXT(WinDraw_DrawTextLineTR(opaq));
 		else
-			WD_PERF_BLEND(WinDraw_DrawTextLine(opaq, tdrawed/*((VCReg1[0]&0x30)>=0x20)*/));
+			WD_PERF_BLEND_TEXT(WinDraw_DrawTextLine(opaq, tdrawed/*((VCReg1[0]&0x30)>=0x20)*/));
 		opaq = 0;
 		tdrawed = 1;
 	}
@@ -1122,7 +1301,7 @@ void WinDraw_DrawLine(void)
 	/* Pri = 1��2���ܡˤ����ꤵ��Ƥ�����̤�ɽ�� */
 	if ( ((VCReg1[0]&0x03)==0x01)&&(gon) )
 	{
-		WD_PERF_BLEND(WinDraw_DrawGrpLine(opaq));
+		WD_PERF_BLEND_GRP(WinDraw_DrawGrpLine(opaq));
 		opaq = 0;
 	}
 	if ( ((VCReg1[0]&0x30)==0x10)&&(bgon) )
@@ -1131,43 +1310,43 @@ void WinDraw_DrawLine(void)
 		{
 			if ( (VCReg1[0]&3)<((VCReg1[0]>>2)&3) )
 			{
-				WD_PERF_BLEND(WinDraw_DrawBGLineTR(opaq));
+				WD_PERF_BLEND_BG(WinDraw_DrawBGLineTR(opaq));
 				tdrawed = 1;
 				opaq = 0;
 			}
 		}
 		else
 		{
-			WD_PERF_BLEND(WinDraw_DrawBGLine(opaq, ((VCReg1[0]&0xc)==0x8)));
+			WD_PERF_BLEND_BG(WinDraw_DrawBGLine(opaq, ((VCReg1[0]&0xc)==0x8)));
 			tdrawed = 1;
 			opaq = 0;
 		}
 	}
 	if ( ((VCReg1[0]&0x0c)==0x04) && ((VCReg2[0]&0x5d)==0x1d) && (VCReg1[0]&0x03) && (((VCReg1[0]>>4)&3)>(VCReg1[0]&3)) && (bgon) && (tron) )
 	{
-		WD_PERF_BLEND(WinDraw_DrawBGLineTR(opaq));
+		WD_PERF_BLEND_BG(WinDraw_DrawBGLineTR(opaq));
 		tdrawed = 1;
 		opaq = 0;
 		if (tron)
 		{
-			WD_PERF_BLEND(WinDraw_DrawGrpLineNonSP(opaq));
+			WD_PERF_BLEND_GRP(WinDraw_DrawGrpLineNonSP(opaq));
 		}
 	}
 	else if ( ((VCReg1[0]&0x03)==0x01)&&(tron)&&(gon)&&(VCReg2[0]&0x10) )
 	{
-		WD_PERF_BLEND(WinDraw_DrawGrpLineNonSP(opaq));
+		WD_PERF_BLEND_GRP(WinDraw_DrawGrpLineNonSP(opaq));
 		opaq = 0;
 	}
 	if ( ((VCReg1[0]&0x0c)==0x04)&&(ton) )
 	{
 		if ( ((VCReg2[0]&0x5d)==0x1d)&&(!(VCReg1[0]&0x03))&&(tron) )
-			WD_PERF_BLEND(WinDraw_DrawTextLineTR(opaq));
+			WD_PERF_BLEND_TEXT(WinDraw_DrawTextLineTR(opaq));
 		else
 			/* FIXME: Verify corrent td param here. Games like Overdriver
 			 * expect a td value of 1 here, yet the condition
 			 * ((VCReg1[0]&0x30)>=0x10) returns 0 for this game causing
 			 * grp > text. See stage 2 of the game. */
-			WD_PERF_BLEND(WinDraw_DrawTextLine(opaq, ((VCReg1[0]&0x30)>=0x10)));
+			WD_PERF_BLEND_TEXT(WinDraw_DrawTextLine(opaq, ((VCReg1[0]&0x30)>=0x10)));
 		opaq = 0;
 		tdrawed = 1;
 	}
@@ -1175,33 +1354,33 @@ void WinDraw_DrawLine(void)
 	/* Pri = 0�ʺ�ͥ��ˤ����ꤵ��Ƥ�����̤�ɽ�� */
 	if ( (!(VCReg1[0]&0x03))&&(gon) )
 	{
-		WD_PERF_BLEND(WinDraw_DrawGrpLine(opaq));
+		WD_PERF_BLEND_GRP(WinDraw_DrawGrpLine(opaq));
 		opaq = 0;
 	}
 	if ( (!(VCReg1[0]&0x30))&&(bgon) )
 	{
-		WD_PERF_BLEND(WinDraw_DrawBGLine(opaq, /*tdrawed*/((VCReg1[0]&0xc)>=0x4)));
+		WD_PERF_BLEND_BG(WinDraw_DrawBGLine(opaq, /*tdrawed*/((VCReg1[0]&0xc)>=0x4)));
 		tdrawed = 1;
 		opaq = 0;
 	}
 	if ( (!(VCReg1[0]&0x0c)) && ((VCReg2[0]&0x5d)==0x1d) && (((VCReg1[0]>>4)&3)>(VCReg1[0]&3)) && (bgon) && (tron) )
 	{
-		WD_PERF_BLEND(WinDraw_DrawBGLineTR(opaq));
+		WD_PERF_BLEND_BG(WinDraw_DrawBGLineTR(opaq));
 		tdrawed = 1;
 		opaq = 0;
 		if (tron)
 		{
-			WD_PERF_BLEND(WinDraw_DrawGrpLineNonSP(opaq));
+			WD_PERF_BLEND_GRP(WinDraw_DrawGrpLineNonSP(opaq));
 		}
 	}
 	else if ( (!(VCReg1[0]&0x03))&&(tron)&&(VCReg2[0]&0x10) )
 	{
-		WD_PERF_BLEND(WinDraw_DrawGrpLineNonSP(opaq));
+		WD_PERF_BLEND_GRP(WinDraw_DrawGrpLineNonSP(opaq));
 		opaq = 0;
 	}
 	if ( (!(VCReg1[0]&0x0c))&&(ton) )
 	{
-		WD_PERF_BLEND(WinDraw_DrawTextLine(opaq, 1));
+		WD_PERF_BLEND_TEXT(WinDraw_DrawTextLine(opaq, 1));
 		tdrawed = 1;
 		opaq = 0;
 	}
@@ -1209,7 +1388,7 @@ void WinDraw_DrawLine(void)
 	/* �ü�ץ饤����ƥ����Υ���ե��å� */
 	if ( ((VCReg2[0]&0x5c)==0x14)&&(pron) )	/* �ü�Pri���ϡ��оݥץ졼��ӥåȤϰ�̣��̵���餷���ʤĤ���ӡ��� */
 	{
-		WD_PERF_BLEND(WinDraw_DrawPriLine());
+		WD_PERF_BLEND_PRI(WinDraw_DrawPriLine());
 	}
 	else if ( ((VCReg2[0]&0x5d)==0x1c)&&(tron) )	/* ȾƩ���������Ƥ�Ʃ���ʥɥåȤ�ϡ��ե��顼������ */
 	{						/* ��AQUALES�� */

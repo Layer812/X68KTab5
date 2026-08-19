@@ -40,11 +40,15 @@
 #include "tab5_usb_keyboard.h"
 #include "tab5_audio.h"
 #include "tab5_compose.h"
+#include "tab5_dynarec_arena.h"
 
 static const char *TAG = "PX68K_TAB5";
 extern uint32_t tab5_px68k_hotmem_bytes(void);
 extern void m68k_tab5_opcode_profile_set(int enabled);
 extern void m68k_tab5_dispatch_profile_set(int enabled);
+extern uint32_t m68k_tab5_profile_storage_bytes(void);
+extern uint32_t m68k_tab5_dispatch_tcm_bytes(void);
+extern uint32_t m68k_tab5_dispatch_l2_bytes(void);
 
 #if defined(MALLOC_CAP_SPM)
 #define TAB5_FASTMEM_CAP MALLOC_CAP_SPM
@@ -67,6 +71,9 @@ static void tab5_log_memory_550(const char *phase)
     const size_t ps_total = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
     const size_t ps_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
     const size_t ps_largest = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+    const size_t exec_total = heap_caps_get_total_size(MALLOC_CAP_EXEC);
+    const size_t exec_free = heap_caps_get_free_size(MALLOC_CAP_EXEC);
+    const size_t exec_largest = heap_caps_get_largest_free_block(MALLOC_CAP_EXEC);
 #if TAB5_FASTMEM_CAP
     const size_t fast_total = heap_caps_get_total_size(TAB5_FASTMEM_CAP);
     const size_t fast_free = heap_caps_get_free_size(TAB5_FASTMEM_CAP);
@@ -75,15 +82,25 @@ static void tab5_log_memory_550(const char *phase)
     const size_t fast_total = 0, fast_free = 0, fast_largest = 0;
 #endif
     ESP_LOGI(TAG,
-             "MEM555[%s] L2/DMA total=%u free=%u largest=%u min=%u | %s total=%u free=%u largest=%u | PSRAM total=%u free=%u largest=%u",
+             "MEM613[%s] L2/DMA total=%u free=%u largest=%u min=%u | EXEC total=%u free=%u largest=%u | %s total=%u free=%u largest=%u | PSRAM total=%u free=%u largest=%u",
              phase ? phase : "?",
              (unsigned)l2_total, (unsigned)l2_free, (unsigned)l2_largest, (unsigned)l2_min,
+             (unsigned)exec_total, (unsigned)exec_free, (unsigned)exec_largest,
              TAB5_FASTMEM_LABEL, (unsigned)fast_total, (unsigned)fast_free, (unsigned)fast_largest,
              (unsigned)ps_total, (unsigned)ps_free, (unsigned)ps_largest);
 }
 
 #ifndef PX68K_TAB5_PERF_PROFILE
 #define PX68K_TAB5_PERF_PROFILE 0
+#endif
+#ifndef PX68K_TAB5_DYNAREC
+#define PX68K_TAB5_DYNAREC 1
+#endif
+#ifndef PX68K_TAB5_DYNAREC_PROD_BENCH
+#define PX68K_TAB5_DYNAREC_PROD_BENCH 0
+#endif
+#ifndef PX68K_TAB5_DYNAREC_COST_PROFILE
+#define PX68K_TAB5_DYNAREC_COST_PROFILE PX68K_TAB5_PERF_PROFILE
 #endif
 
 static bool perf_textview_render(tab5_textview_frame_t *tv,
@@ -107,6 +124,7 @@ extern int WinX68k_VideoProbeInit(void);
 extern int WinX68k_ExecVideoProbeFrame(void);
 extern void WinX68k_SetHostRenderEnabled(int enabled);
 extern void WinX68k_PerfSetSample(int enabled);
+extern void m68k_tab5_dynarec_dump(void);
 extern void WinX68k_PerfGetLast(uint32_t *frame_us,
                                 uint32_t *cpu_us,
                                 uint32_t *compose_us,
@@ -517,6 +535,11 @@ void app_main(void)
              ctx->hds_path[0] ? ctx->hds_path : "<empty>");
 
     tab5_log_memory_550("host-preworkers");
+    const int tab5_dyn_probe_ok = tab5_dynarec_arena_probe();
+    m68k_tab5_dynarec_bind(tab5_dyn_probe_ok ? tab5_dynarec_arena_base() : NULL,
+                            tab5_dyn_probe_ok ? (unsigned int)tab5_dynarec_arena_bytes() : 0u,
+                            tab5_dyn_probe_ok ? tab5_dynarec_arena_sync : NULL);
+    tab5_log_memory_550("dynarena-static32k");
     ctx->audio_host_ready = tab5_audio_init() != 0;
     /* Build 5.53a: after M5 speaker DMA is allocated, reserve one contiguous
      * Internal L2/DMA arena before text/USB/task allocations fragment it. */
@@ -560,7 +583,7 @@ void app_main(void)
         halt_forever();
     }
 
-    ESP_LOGI(TAG, "Build 6.12u host init complete on CPU0; X68000 guest task handed to CPU1");
+    ESP_LOGI(TAG, "Build 6.15 Production host init complete on CPU0; validated scroll-cache + CRTC-paced LCD presenter");
     vTaskDelete(NULL);
 }
 
@@ -582,9 +605,9 @@ static void px68k_emulation_task(void *arg)
 
     bool direct_hdd_boot = ctx->launcher_cfg.boot_source == TAB5_LAUNCH_BOOT_HDD0;
 
-    ESP_LOGI(TAG, "Build 6.12u guest task started: X68000 time-axis pinned to CPU1");
+    ESP_LOGI(TAG, "Build 6.15 Production guest task started: X68000 time-axis pinned to CPU1; host presentation remains decoupled");
     ESP_LOGI(TAG, "=======================================");
-    ESP_LOGI(TAG, " X68K Tab - Build 6.12u No Host Restart");
+    ESP_LOGI(TAG, " X68K Tab - Build 6.15 Production");
     ESP_LOGI(TAG, " P4 video hot working-set in internal SRAM: %u bytes", (unsigned)tab5_px68k_hotmem_bytes());
     ESP_LOGI(TAG, " Build 5.91 baseline + Flash Human68k Quick Boot + HDS/SCSI 5.94c");
     ESP_LOGI(TAG, "=======================================");
@@ -594,7 +617,7 @@ static void px68k_emulation_task(void *arg)
         ESP_LOGI(TAG, "SD Human302 candidate (not auto-inserted): %s", human_path);
     else
         ESP_LOGI(TAG, "SD Human302 candidate: <none>; Flash Human68k remains bootable");
-    ESP_LOGI(TAG, "Build 6.12u runtime UI: no host restart; PANIC/GUI/FILE/F7/F8 use guest-only reset");
+    ESP_LOGI(TAG, "Build 6.15 Production: persistent GRP8 scroll cache + CRTC-paced latest-live LCD presentation");
     ESP_LOGI(TAG, "Root XDF catalog: %u image(s)",
              (unsigned)tab5_sd_xdf_count());
     ESP_LOGI(TAG, "Root boot-media catalog: %u image(s) (.XDF/.DIM)",
@@ -943,7 +966,26 @@ static void px68k_emulation_task(void *arg)
     ESP_LOGI(TAG, "JoyPAD: standard USB HID generic -> X68000 JOY1 CPSF/MD (X/Y or Hat + learned B1..B6,L,R; 2-button compatible)");
 #endif
 #if PX68K_TAB5_PERF_PROFILE
-    ESP_LOGI(TAG, "Performance: Build 6.00 = production behavior frozen; release profiling/trial traces compiled out");
+    ESP_LOGI(TAG, "CPU613C: profiler ACTIVE; timing sample=1/600 frames, opcode+hot-PC/back-edge sample=1/1200 frames");
+#elif PX68K_TAB5_DYNAREC_PROD_BENCH
+    ESP_LOGI(TAG, "CPU613C14R: production benchmark mode: heavyweight CPU/opcode/render profiler OFF");
+#else
+    ESP_LOGI(TAG, "CPU613C14R: production runtime; periodic CPU/render benchmark telemetry OFF");
+#endif
+#if PX68K_TAB5_DYNAREC
+    ESP_LOGI(TAG, "CPU613C14R: native-loop JIT v2.2R: c14 target gate OFF; c13 specialized-first direct L0 + epoch memo; <=96/48/32 fragments; 32KB IRAM");
+    ESP_LOGI(TAG, "CPU613C14R: dispatch=%luB TCM + %luB internal DRAM dynarena=%luB dyntables=%luB costprobe=%s",
+             (unsigned long)m68k_tab5_dispatch_tcm_bytes(),
+             (unsigned long)m68k_tab5_dispatch_l2_bytes(),
+             (unsigned long)tab5_dynarec_arena_bytes(),
+             (unsigned long)m68k_tab5_dynarec_metadata_bytes(),
+#if PX68K_TAB5_DYNAREC_COST_PROFILE
+             "ON");
+#else
+             "OFF");
+#endif
+#endif
+#if PX68K_TAB5_PERF_PROFILE
     ESP_LOGI(TAG, "Raster: fixed PIE-128 for validated aligned >=64B GVRAM snapshots; unaligned/small runs use memcpy");
     ESP_LOGI(TAG, "Fetch/data: main opcode + extension/immediate + ordinary RAM/IPL operands inline; post-op stream/poll/DBF classification fused into dispatch metadata; device regions use authoritative wrappers");
     ESP_LOGI(TAG, "Polling: stable ordinary-RAM MOVE/AND, BTST, CMPI.W back-edge loops fast-forward only to the current scheduler boundary");
@@ -960,6 +1002,10 @@ static void px68k_emulation_task(void *arg)
 
     int64_t perf_prev_end_us = 0;
     uint32_t perf_prev_frame = 0;
+#if PX68K_TAB5_DYNAREC_PROD_BENCH
+    int64_t dynprod_prev_end_us = 0;
+    uint32_t dynprod_prev_frame = 0;
+#endif
     tab5_budget_stats_t budget = {0};
     budget.mode = TAB5_BUDGET_NORMAL;
 
@@ -974,16 +1020,16 @@ static void px68k_emulation_task(void *arg)
     uint32_t audio_rate_prev_under = 0;
     int64_t audio_rate_prev_us = esp_timer_get_time();
 
-    /* Build 5.63: WDT/IDLE service is itself a scheduled deadline.  The old
-     * every-4-frame vTaskDelay(1) measured roughly 10-14 ms on this target and
-     * imposed an ~18% wall-clock tax.  Prefer to let IDLE1 run only when the
-     * audio reserve is healthy; nevertheless enforce a hard deadline well
-     * inside the configured Task-WDT timeout. */
+    /* Build 6.13c14r2: WDT/IDLE service remains deadline driven.  c11 recorded
+     * one IDLE1 Task-WDT warning with the previous timeout/2 hard interval.
+     * Use timeout/3 so a missed one-tick relief still leaves another full
+     * opportunity before the watchdog deadline; this is far cheaper than the
+     * retired every-4-frame delay and does not alter guest timing. */
     int64_t idle_relief_prev_us = esp_timer_get_time();
 #ifdef CONFIG_ESP_TASK_WDT_TIMEOUT_S
-    int64_t idle_relief_hard_us = ((int64_t)CONFIG_ESP_TASK_WDT_TIMEOUT_S * 1000000LL) / 2LL;
+    int64_t idle_relief_hard_us = ((int64_t)CONFIG_ESP_TASK_WDT_TIMEOUT_S * 1000000LL) / 3LL;
 #else
-    int64_t idle_relief_hard_us = 2000000LL;
+    int64_t idle_relief_hard_us = 1500000LL;
 #endif
     if (idle_relief_hard_us < 500000LL)
         idle_relief_hard_us = 500000LL;
@@ -2245,6 +2291,79 @@ static void px68k_emulation_task(void *arg)
             }
         }
 
+#if PX68K_TAB5_DYNAREC_PROD_BENCH
+        /* c13 clean wall benchmark: two esp_timer reads per 600-frame window,
+         * no per-frame CPU/opcode/render instrumentation.  Use the same f=300,
+         * 900, 1500... cadence as the research PERF logs.  Reset the window
+         * after printing so UART output is excluded from the next average. */
+        if ((frame % 600u) == 300u)
+        {
+            const int64_t dynprod_now_us = esp_timer_get_time();
+            uint32_t avg_wall_us = 0u, speed_pct = 0u, fps_x10 = 0u;
+            const uint32_t target_us = (CRTC_Regs[0x29] & 0x10) ? 18031u : 16271u;
+            if (dynprod_prev_end_us != 0 && frame > dynprod_prev_frame)
+            {
+                const int64_t dt = dynprod_now_us - dynprod_prev_end_us;
+                if (dt > 0)
+                {
+                    avg_wall_us = (uint32_t)(dt / (int64_t)(frame - dynprod_prev_frame));
+                    if (avg_wall_us)
+                    {
+                        speed_pct = (target_us * 100u) / avg_wall_us;
+                        fps_x10 = 10000000u / avg_wall_us;
+                    }
+                }
+            }
+            ESP_LOGI(TAG,
+                     "CPU613C14R PROD f=%lu avg=%luus/f fps=%lu.%lu speed=%lu%% JIT=%s profiler=OFF costprobe=OFF",
+                     (unsigned long)frame,(unsigned long)avg_wall_us,
+                     (unsigned long)(fps_x10/10u),(unsigned long)(fps_x10%10u),
+                     (unsigned long)speed_pct, PX68K_TAB5_DYNAREC ? "ON" : "OFF");
+            /* c13: keep the targeted f=2100 dump so the SFXVI $368760 block
+             * is captured before its later observed signature invalidation.
+             * The timestamp is reset after the dump, so UART time is excluded
+             * from the next wall window. */
+            if (frame == 2100u || (frame >= 1500u && ((frame - 300u) % 1200u) == 0u)) {
+                tab5_compose_stats_t rs = {0};
+                tab5_video_async_stats_t vs = {0};
+                m68k_tab5_dynarec_dump();
+                tab5_compose_get_stats(&rs);
+                tab5_video_get_async_stats(&vs);
+                ESP_LOGI(TAG,
+                         "RENDER615 f=%lu gbt=%lu/%lu cache=%lu/%lu hit=%lu miss=%lu rebuild=%lu build=%luus cache-render=%luus raw=%lu/%lu gdmaL=%lu fail=%lu barrier=%lu/%lu/%luus qfull=%lu pmax=%lu pace=%lu/%luus last=%luus coal=%lu skip=%lu int=%luus vq=%lu vdrop=%lu",
+                         (unsigned long)frame,
+                         (unsigned long)rs.gbt_submitted_lines,
+                         (unsigned long)rs.gbt_completed_lines,
+                         (unsigned long)rs.scroll_cache_submitted_lines,
+                         (unsigned long)rs.scroll_cache_completed_lines,
+                         (unsigned long)rs.scroll_cache_hits,
+                         (unsigned long)rs.scroll_cache_misses,
+                         (unsigned long)rs.scroll_cache_rebuilds,
+                         (unsigned long)rs.last_scroll_cache_build_us,
+                         (unsigned long)rs.last_scroll_cache_render_us,
+                         (unsigned long)rs.gbt_raw_submitted_lines,
+                         (unsigned long)rs.gbt_raw_completed_lines,
+                         (unsigned long)rs.gbt_raw_dma_lines,
+                         (unsigned long)rs.gbt_raw_dma_submit_fail,
+                         (unsigned long)rs.gvram_barrier_calls,
+                         (unsigned long)rs.gvram_barrier_waits,
+                         (unsigned long)rs.gvram_barrier_us,
+                         (unsigned long)rs.queue_full,
+                         (unsigned long)rs.max_pending,
+                         (unsigned long)vs.pace_waits,
+                         (unsigned long)vs.pace_wait_us,
+                         (unsigned long)vs.pace_last_wait_us,
+                         (unsigned long)vs.pace_coalesced_frames,
+                         (unsigned long)vs.pace_skipped_slots,
+                         (unsigned long)vs.pace_last_interval_us,
+                         (unsigned long)vs.queued_frames,
+                         (unsigned long)vs.dropped_frames);
+            }
+            dynprod_prev_end_us = esp_timer_get_time();
+            dynprod_prev_frame = frame;
+        }
+#endif
+
 #if PX68K_TAB5_PERF_PROFILE
         if (perf_sample)
         {
@@ -2488,6 +2607,49 @@ static void px68k_emulation_task(void *arg)
                      (unsigned long)audio_play_hz,
                      (unsigned long)audio_gen_pct,
                      (unsigned long)audio_under_delta);
+
+            {
+                const uint32_t m68k_share_x10 = core_us ? (cpu_us * 1000u) / core_us : 0u;
+                const uint32_t dev_share_x10 = core_us ? (dev_us * 1000u) / core_us : 0u;
+                const uint32_t render_us = compose_us + finalize_us;
+                const uint32_t render_share_x10 = core_us ? (render_us * 1000u) / core_us : 0u;
+                const size_t bench_exec_free = heap_caps_get_free_size(MALLOC_CAP_EXEC);
+                const size_t bench_exec_largest = heap_caps_get_largest_free_block(MALLOC_CAP_EXEC);
+                const size_t bench_l2_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT | MALLOC_CAP_DMA);
+                const size_t bench_l2_largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT | MALLOC_CAP_DMA);
+                const size_t bench_ps_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+                ESP_LOGI(TAG,
+                         "CPU613C NATIVEJIT f=%lu wall=%luus fps=%lu.%lu speed=%lu%% | CPU1sample core=%luus m68k=%luus(%lu.%lu%%) dev=%luus(%lu.%lu%%) render=%luus(%lu.%lu%%) adpcmflush=%luus | MEM exec_free=%u largest=%u l2dma_free=%u largest=%u psram_free=%u | ACCEL dispatch=%lu+%luB hotmem=%luB profiler=%luB dynarena=%luB dyntables=%luB dynexec=%d dynprobe=%d",
+                         (unsigned long)frame,
+                         (unsigned long)avg_wall_us,
+                         (unsigned long)(fps_x10 / 10u),
+                         (unsigned long)(fps_x10 % 10u),
+                         (unsigned long)speed_pct,
+                         (unsigned long)core_us,
+                         (unsigned long)cpu_us,
+                         (unsigned long)(m68k_share_x10 / 10u),
+                         (unsigned long)(m68k_share_x10 % 10u),
+                         (unsigned long)dev_us,
+                         (unsigned long)(dev_share_x10 / 10u),
+                         (unsigned long)(dev_share_x10 % 10u),
+                         (unsigned long)render_us,
+                         (unsigned long)(render_share_x10 / 10u),
+                         (unsigned long)(render_share_x10 % 10u),
+                         (unsigned long)soundmix_us,
+                         (unsigned)bench_exec_free,
+                         (unsigned)bench_exec_largest,
+                         (unsigned)bench_l2_free,
+                         (unsigned)bench_l2_largest,
+                         (unsigned)bench_ps_free,
+                         (unsigned long)m68k_tab5_dispatch_tcm_bytes(),
+                         (unsigned long)m68k_tab5_dispatch_l2_bytes(),
+                         (unsigned long)tab5_px68k_hotmem_bytes(),
+                         (unsigned long)m68k_tab5_profile_storage_bytes(),
+                         (unsigned long)tab5_dynarec_arena_bytes(),
+                         (unsigned long)m68k_tab5_dynarec_metadata_bytes(),
+                         tab5_dynarec_arena_is_executable(),
+                         tab5_dynarec_arena_probe_ok());
+            }
 
             ESP_LOGI(TAG,
                      "P4BLEND3 f=%lu host-common calls C/PIE=%lu/%lu pixels=%lu/%lu alignfb=%lu fail=%lu backend[b0/b1/b2]=%lu/%lu/%lu",

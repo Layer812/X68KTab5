@@ -139,6 +139,20 @@ static uint32_t s_live_presented_frames = 0;
 static uint32_t s_live_row_retries = 0;
 static uint32_t s_live_unstable_rows = 0;
 
+/* Build 6.14d: presentation pacing is host-only.  Quantize normal live-FB
+ * presentation onto the X68000 CRTC cadence while keeping the newest queued
+ * live frame.  This never stalls CPU1; it only schedules CPU0 LCD work. */
+static esp_timer_handle_t s_pace_timer = nullptr;
+static int64_t s_pace_next_us = 0;
+static int64_t s_pace_last_present_us = 0;
+static uint32_t s_pace_waits = 0;
+static uint32_t s_pace_wait_us = 0;
+static uint32_t s_pace_last_wait_us = 0;
+static uint32_t s_pace_coalesced_frames = 0;
+static uint32_t s_pace_skipped_slots = 0;
+static uint32_t s_pace_last_interval_us = 0;
+static bool s_pace_active_logged = false;
+
 /* Build 5.98: libretro advertises PX68K output at a fixed 4:3 display
  * aspect even when the raw CRTC raster is e.g. 512x240.  The standalone
  * Tab5 frontend used to push those raw pixels 1:1, which made 240-line game
@@ -1640,6 +1654,113 @@ static void push_live_frame(const present_request_t &req,
     if (unstable_count) *unstable_count = unstable_total;
 }
 
+static inline uint32_t video_pace_period_us(void)
+{
+    /* Same guest cadence used by the production speed meter in main.c. */
+    return (CRTC_Regs[0x29] & 0x10u) ? 18031u : 16271u;
+}
+
+static void video_pace_timer_cb(void *)
+{
+    TaskHandle_t task = s_present_task;
+    if (task)
+        xTaskNotifyGive(task);
+}
+
+static inline void video_pace_reset(void)
+{
+    s_pace_next_us = 0;
+    s_pace_last_present_us = 0;
+}
+
+static void video_pace_keep_latest_live(present_request_t *req)
+{
+    if (!req || req->mode != PRESENT_LIVE_FB || !s_ready_requests)
+        return;
+
+    present_request_t newer = {};
+    while (xQueueReceive(s_ready_requests, &newer, 0) == pdTRUE)
+    {
+        if (newer.mode != PRESENT_LIVE_FB)
+        {
+            /* Preserve mode/UI transition ordering; this queue is only two
+             * deep, so returning the non-live request to the front is safe. */
+            (void)xQueueSendToFront(s_ready_requests, &newer, 0);
+            break;
+        }
+        *req = newer;
+        portENTER_CRITICAL(&s_stats_mux);
+        ++s_pace_coalesced_frames;
+        portEXIT_CRITICAL(&s_stats_mux);
+    }
+}
+
+static void video_pace_wait_live(const present_request_t &req)
+{
+    if (req.mode != PRESENT_LIVE_FB || s_panic_compat_enabled || !s_pace_timer)
+    {
+        video_pace_reset();
+        return;
+    }
+
+    const uint32_t period = video_pace_period_us();
+    if (!s_pace_active_logged)
+    {
+        ESP_LOGI(TAG,
+                 "PX68K_PACE614D: CRTC-paced live presenter ACTIVE target=%uus; CPU1 remains unblocked",
+                 (unsigned)period);
+        s_pace_active_logged = true;
+    }
+    int64_t now = esp_timer_get_time();
+
+    /* Re-lock phase after launcher/UI pauses, long stalls, or mode changes. */
+    if (s_pace_next_us == 0 || now > s_pace_next_us + (int64_t)period * 4 ||
+        s_pace_next_us > now + (int64_t)period * 4)
+    {
+        s_pace_next_us = now;
+    }
+
+    int64_t deadline = s_pace_next_us;
+    uint32_t skipped = 0;
+    while (now > deadline + (int64_t)(period / 2u))
+    {
+        deadline += period;
+        ++skipped;
+    }
+
+    uint32_t waited = 0;
+    if (now < deadline)
+    {
+        const uint64_t delay_us = (uint64_t)(deadline - now);
+        /* Clear a stale notification defensively; this task has no other
+         * direct-notification user. */
+        (void)ulTaskNotifyTake(pdTRUE, 0);
+        if (esp_timer_start_once(s_pace_timer, delay_us) == ESP_OK)
+        {
+            (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+            const int64_t after = esp_timer_get_time();
+            waited = (after > now) ? (uint32_t)(after - now) : 0u;
+            now = after;
+        }
+    }
+
+    const uint32_t interval = (s_pace_last_present_us > 0 && now > s_pace_last_present_us)
+        ? (uint32_t)(now - s_pace_last_present_us) : 0u;
+    s_pace_last_present_us = now;
+    s_pace_next_us = deadline + period;
+
+    portENTER_CRITICAL(&s_stats_mux);
+    if (waited)
+    {
+        ++s_pace_waits;
+        s_pace_wait_us += waited;
+    }
+    s_pace_last_wait_us = waited;
+    s_pace_skipped_slots += skipped;
+    s_pace_last_interval_us = interval;
+    portEXIT_CRITICAL(&s_stats_mux);
+}
+
 static void video_present_task(void *)
 {
     present_request_t req = {};
@@ -1689,6 +1810,15 @@ static void video_present_task(void *)
 
         if (!have_req)
             continue;
+
+        /* Build 6.14d: when LCD work falls behind, discard only stale LIVE
+         * requests and present the newest completed framebuffer.  Then align
+         * CPU0 LCD work to the guest cadence; CPU1 is never delayed here. */
+        video_pace_keep_latest_live(&req);
+        video_pace_wait_live(req);
+        /* A newer live request may arrive while the pace timer sleeps.  Keep
+         * that one instead of presenting a stale queue token. */
+        video_pace_keep_latest_live(&req);
 
         const int64_t t0 = esp_timer_get_time();
         uint32_t live_retries = 0;
@@ -1810,6 +1940,14 @@ static bool init_async_present(void)
     {
         ESP_LOGW(TAG, "Build 5.98g9b LCD PIE-DIFF scratch unavailable; generation-dirty fallback retained");
     }
+
+    esp_timer_create_args_t pace_args = {};
+    pace_args.callback = &video_pace_timer_cb;
+    pace_args.name = "px68k_vpace";
+    if (esp_timer_create(&pace_args, &s_pace_timer) == ESP_OK)
+        ESP_LOGI(TAG, "PX68K_PACE614D: host LCD cadence timer ready; latest-live-frame pacing armed");
+    else
+        ESP_LOGW(TAG, "PX68K_PACE614D: cadence timer unavailable; immediate presentation retained");
 
 #if portNUM_PROCESSORS > 1
     const BaseType_t ok = xTaskCreatePinnedToCore(
@@ -2237,6 +2375,12 @@ void tab5_video_get_async_stats(tab5_video_async_stats_t *out)
     out->live_presented_frames = s_live_presented_frames;
     out->live_row_retries = s_live_row_retries;
     out->live_unstable_rows = s_live_unstable_rows;
+    out->pace_waits = s_pace_waits;
+    out->pace_wait_us = s_pace_wait_us;
+    out->pace_last_wait_us = s_pace_last_wait_us;
+    out->pace_coalesced_frames = s_pace_coalesced_frames;
+    out->pace_skipped_slots = s_pace_skipped_slots;
+    out->pace_last_interval_us = s_pace_last_interval_us;
     portEXIT_CRITICAL(&s_stats_mux);
     out->queued_frames = s_ready_requests ? (uint32_t)uxQueueMessagesWaiting(s_ready_requests) : 0u;
 }

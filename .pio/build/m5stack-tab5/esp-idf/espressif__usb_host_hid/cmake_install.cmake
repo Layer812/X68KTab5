@@ -1,4 +1,4 @@
-# Install script for directory: G:/px68k-tab5/managed_components/espressif__usb_host_hid
+# Install script for directory: G:/X68KTab5/managed_components/espressif__usb_host_hid
 
 # Set the install prefix
 if(NOT DEFINED CMAKE_INSTALL_PREFIX)

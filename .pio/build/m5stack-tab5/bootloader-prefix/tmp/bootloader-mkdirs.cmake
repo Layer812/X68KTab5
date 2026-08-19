@@ -10,18 +10,18 @@ if(NOT EXISTS "C:/Users/fooba/.platformio/packages/framework-espidf/components/b
   file(MAKE_DIRECTORY "C:/Users/fooba/.platformio/packages/framework-espidf/components/bootloader/subproject")
 endif()
 file(MAKE_DIRECTORY
-  "G:/px68k-tab5/.pio/build/m5stack-tab5/bootloader"
-  "G:/px68k-tab5/.pio/build/m5stack-tab5/bootloader-prefix"
-  "G:/px68k-tab5/.pio/build/m5stack-tab5/bootloader-prefix/tmp"
-  "G:/px68k-tab5/.pio/build/m5stack-tab5/bootloader-prefix/src/bootloader-stamp"
-  "G:/px68k-tab5/.pio/build/m5stack-tab5/bootloader-prefix/src"
-  "G:/px68k-tab5/.pio/build/m5stack-tab5/bootloader-prefix/src/bootloader-stamp"
+  "G:/X68KTab5/.pio/build/m5stack-tab5/bootloader"
+  "G:/X68KTab5/.pio/build/m5stack-tab5/bootloader-prefix"
+  "G:/X68KTab5/.pio/build/m5stack-tab5/bootloader-prefix/tmp"
+  "G:/X68KTab5/.pio/build/m5stack-tab5/bootloader-prefix/src/bootloader-stamp"
+  "G:/X68KTab5/.pio/build/m5stack-tab5/bootloader-prefix/src"
+  "G:/X68KTab5/.pio/build/m5stack-tab5/bootloader-prefix/src/bootloader-stamp"
 )
 
 set(configSubDirs )
 foreach(subDir IN LISTS configSubDirs)
-    file(MAKE_DIRECTORY "G:/px68k-tab5/.pio/build/m5stack-tab5/bootloader-prefix/src/bootloader-stamp/${subDir}")
+    file(MAKE_DIRECTORY "G:/X68KTab5/.pio/build/m5stack-tab5/bootloader-prefix/src/bootloader-stamp/${subDir}")
 endforeach()
 if(cfgdir)
-  file(MAKE_DIRECTORY "G:/px68k-tab5/.pio/build/m5stack-tab5/bootloader-prefix/src/bootloader-stamp${cfgdir}") # cfgdir has leading slash
+  file(MAKE_DIRECTORY "G:/X68KTab5/.pio/build/m5stack-tab5/bootloader-prefix/src/bootloader-stamp${cfgdir}") # cfgdir has leading slash
 endif()

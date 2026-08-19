@@ -13,8 +13,8 @@ end
 
 # Load bootloader symbols
 set confirm off
-    add-symbol-file G:/px68k-tab5/.pio/build/m5stack-tab5/bootloader/bootloader.elf
+    add-symbol-file G:/X68KTab5/.pio/build/m5stack-tab5/bootloader/bootloader.elf
 set confirm on
 
 # Load application symbols
-file G:/px68k-tab5/.pio/build/m5stack-tab5/px68k_tab5.elf
+file G:/X68KTab5/.pio/build/m5stack-tab5/px68k_tab5.elf

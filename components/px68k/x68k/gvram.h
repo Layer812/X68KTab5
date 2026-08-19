@@ -10,6 +10,9 @@
 #include "common.h"
 
 extern	uint8_t	GVRAM[0x80000];
+/* Build 6.14c: physical 512-row generation counters for the host scroll cache. */
+extern volatile uint32_t GVRAM_RowGeneration[512];
+uint32_t GVRAM_RowGenerationGet(uint32_t row);
 extern	uint16_t	Grp_LineBuf[1024];
 extern	uint16_t	Grp_LineBufSP[1024];
 extern	uint16_t	Grp_LineBufSP2[1024];

@@ -39,11 +39,11 @@ endif()
 
 if(NOT CMAKE_INSTALL_LOCAL_ONLY)
   # Include the install script for the subdirectory.
-  include("G:/px68k-tab5/.pio/build/m5stack-tab5/bootloader/esp-idf/esp_hw_support/port/esp32p4/cmake_install.cmake")
+  include("G:/X68KTab5/.pio/build/m5stack-tab5/bootloader/esp-idf/esp_hw_support/port/esp32p4/cmake_install.cmake")
 endif()
 
 if(NOT CMAKE_INSTALL_LOCAL_ONLY)
   # Include the install script for the subdirectory.
-  include("G:/px68k-tab5/.pio/build/m5stack-tab5/bootloader/esp-idf/esp_hw_support/lowpower/cmake_install.cmake")
+  include("G:/X68KTab5/.pio/build/m5stack-tab5/bootloader/esp-idf/esp_hw_support/lowpower/cmake_install.cmake")
 endif()
 

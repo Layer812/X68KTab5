@@ -1,4 +1,4 @@
-# Install script for directory: G:/px68k-tab5
+# Install script for directory: G:/X68KTab5
 
 # Set the install prefix
 if(NOT DEFINED CMAKE_INSTALL_PREFIX)
@@ -39,7 +39,7 @@ endif()
 
 if(NOT CMAKE_INSTALL_LOCAL_ONLY)
   # Include the install script for the subdirectory.
-  include("G:/px68k-tab5/.pio/build/m5stack-tab5/esp-idf/cmake_install.cmake")
+  include("G:/X68KTab5/.pio/build/m5stack-tab5/esp-idf/cmake_install.cmake")
 endif()
 
 if(CMAKE_INSTALL_COMPONENT)
@@ -57,6 +57,6 @@ endif()
 if(NOT CMAKE_INSTALL_LOCAL_ONLY)
   string(REPLACE ";" "\n" CMAKE_INSTALL_MANIFEST_CONTENT
        "${CMAKE_INSTALL_MANIFEST_FILES}")
-  file(WRITE "G:/px68k-tab5/.pio/build/m5stack-tab5/${CMAKE_INSTALL_MANIFEST}"
+  file(WRITE "G:/X68KTab5/.pio/build/m5stack-tab5/${CMAKE_INSTALL_MANIFEST}"
      "${CMAKE_INSTALL_MANIFEST_CONTENT}")
 endif()

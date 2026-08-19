@@ -11,6 +11,22 @@
   Developed by Layer812 &nbsp;|&nbsp; Based on PX68K &nbsp;|&nbsp; 68000 core: Musashi
 </p>
 
+## 最新版 — Build 6.15 Production
+
+**Build 6.15** は、ここまでの CPU / 描画 / マルチコア高速化をまとめた Production 版です。
+
+- 68000 実行の native-loop JIT / hot-path 高速化
+- CPU1（X68000 時間軸）と CPU0（画面・音声・入出力）の役割分離
+- G + BG + TEXT の CPU0 合成
+- 大きな背景を毎フレーム作り直さない **GRP8 Scroll Cache**
+- PIE / XespV による copy / diff / blend 等の高速化
+- PSRAM 転送用 AXI-GDMA fallback
+- LCD の dirty / diff 更新と CRTC ベースの Frame Pacing
+- FM + ADPCM 最終ミックスの CPU0 化
+
+特にスクロール背景は、毎走査線ごとに GVRAM から再生成する方式から、**一度展開した背景をキャッシュし、スクロール位置だけを動かす方式**へ変更しました。  
+予定していた高速化だけでなく、開発途中で見つかった「そもそも同じ絵を何度も作らない」という思いがけない高速化も入っています。 :)
+
 ---
 
 ## X68K Tab とは
@@ -40,7 +56,7 @@ X68000 側の時間を進める処理と、画面・音声・入力・ストレ�
 ### M5Burner Share Code
 
 ```text
-xX5zvurDW6xMacAK
+aFmGCMA3FSvzcW5H
 ```
 
 M5Burner の **Share Burn** から上記 Share Code を入力し、X68K Tab を選択して Tab5 へ書き込んでください。
@@ -146,7 +162,11 @@ PANIC データをいただけると、作者のモチベーションがかな�
 - CPU1: X68000 のゲスト時間軸を優先
 - CPU0: 画面、音声、入力、ストレージなどのホスト処理
 - CPU 間は SPM / Mailbox を意識した非同期通信
-- PIE 系高速処理を利用した描画・メモリ処理の高速化
+- PIE / XespV を利用した描画・メモリ処理の高速化
+- 68000 native-loop JIT / hot-path 高速化
+- G + BG + TEXT の CPU0 合成
+- GRP8 Scroll Cache による背景スクロール高速化
+- dirty / diff + Frame Pacing を使った LCD 表示
 - LCD DMA による画面転送
 - vgmM5 系 YM2151 バックエンド
 - ADPCM
@@ -218,26 +238,44 @@ CPU0 と CPU1 の間では、大きな同期ロックをできるだけ避け、
 
 X68K Tab では「クロックを上げる」だけではなく、処理の形そのものを ESP32-P4 に合わせることを重視しています。
 
-### PIE エンジン
+### PIE / XespV
 
-描画や大量データ処理で、PIE 系の高速処理を活用します。
+描画や大量データ処理では、ESP32-P4 の PIE / XespV 系高速処理を利用しています。
 
-主な対象:
+6.15 で実際に使用している主な対象:
 
-- 128-bit 並列ピクセル処理
-- ベクトル演算によるパレット展開
-- ブランチレス透過判定
-- copy / fill / blend
-- key-color
+- 128-bit 並列処理
+- copy / fill
+- key-color / blend
 - diff
-- RGB565 合成
-- Sprite / BG 合成支援
-- メモリブロック転送
-- BitBLT 的処理
+- RGB565 系ピクセル処理
+- raster snapshot
+- メモリブロック処理
 
-PIE は 68000 命令を直接置き換える JIT として扱うのではなく、描画、変換、比較、メモリ処理など、**エミュレーション周辺の大量データ処理を高速化するアクセラレータ**として使う方針です。
+PIE は 68000 命令そのものを置き換える用途ではなく、描画・変換・比較・メモリ処理など、**エミュレーション周辺の大量データ処理を高速化するアクセラレータ**として使用しています。
 
-高速経路は、C 実装と結果が一致し、実際に速度向上が得られる処理から段階的に採用します。
+高速経路は起動時 self-check や reference path との比較を行い、結果が一致するものを採用し、条件に合わない場合は C / scalar 実装へ fallback します。
+
+### 68000 native-loop JIT
+
+6.15 では Musashi の通常実行を基準として、実ゲーム中で効果が確認できた小さなループや hot path を ESP32-P4 の RV32 native code へ変換する方式を採用しています。
+
+- 32 KiB executable arena
+- TCM / internal SRAM の dispatch cache
+- direct L0 lookup / epoch memo
+- 小規模 loop fragment
+- signature / RAM guard
+- unsupported path は即座に Musashi へ fallback
+
+互換性を優先し、巨大な全面 JIT ではなく **安全に効く部分だけを native 化する補助 JIT** という位置付けです。
+
+### Render / Scroll Cache
+
+6.15 では、Graphics / BG / TEXT を CPU1 だけで最終合成する方式から、対応する 256 色モードで CPU0 に最終 G + BG + TEXT 合成を渡す経路を追加しています。
+
+さらに、大きな一枚絵をスクロールさせるような画面では、GRP8 を毎フレーム GVRAM から作り直すのではなく、**512 x 512 の palette-index Scroll Cache** を保持します。
+
+GVRAM が実際に書き換えられた行だけを再構築し、単なるスクロールでは既存キャッシュを再利用するため、PSRAM 転送量とフレームごとの処理量の揺れを大きく減らせます。
 
 ### LCD DMA
 
@@ -260,16 +298,9 @@ Tab5 のメモリは用途ごとに使い分けます。
 - SPM / Mailbox: CPU 間の通知・共有情報
 - scratch buffer: 音声や変換処理の一時領域
 
-今後さらに、
+6.15 では、cache-line alignment、hot table の SRAM 配置、CPU 間コピー削減、PSRAM の大容量バッファ利用などをすでに複数の経路で採用しています。
 
-- cache-line alignment
-- burst access
-- I/O DMA 向け配置
-- hot table の SRAM 化
-- 階層化キャッシュ
-- CPU 間コピー削減
-
-を進めます。
+今後は、効果が実測できる箇所に絞って burst access、DMA-friendly layout、階層化キャッシュの適用範囲を広げます。
 
 ---
 
@@ -352,9 +383,9 @@ Flash 側の起動環境と SD 側のユーザーデータを分離し、ポー�
 | Flash boot | Working / testing |
 | HostFS / SD | Working / testing |
 | Guest-only reboot / media switching | Working / regression testing |
-| Graphic VRAM | Working / optimization ongoing |
-| Text / BG / Sprite composition | Working / optimization ongoing |
-| LCD output / DMA | Working / tuning ongoing |
+| Graphic VRAM | Working / Build 6.15 accelerated paths active |
+| Text / BG / Sprite composition | Working / CPU0 G+BG+TEXT path + scroll cache active |
+| LCD output / DMA | Working / dirty-diff + frame pacing active |
 | YM2151 FM / vgmM5 | Working / optimization ongoing |
 | 32-bit DDS / native-rate FM | In progress |
 | ADPCM | Working |
@@ -362,7 +393,7 @@ Flash 側の起動環境と SD 側のユーザーデータを分離し、ポー�
 | USB keyboard | Working / testing |
 | USB Joypad | Working / compatibility testing |
 | Touch UI | Working / evolving |
-| PIE acceleration | Partial / expanding |
+| PIE / XespV acceleration | Working on selected validated paths |
 | Stability | Continuous regression testing |
 
 X68000 は、ソフトウェアごとにハードウェアの使い方が大きく違います。
@@ -373,61 +404,85 @@ X68000 は、ソフトウェアごとにハードウェアの使い方が大き�
 
 ---
 
-## 今後の高速化予定
+## 高速化の進捗と今後
 
-### CPU / Bus
+6.15 で、当初予定していた「ESP32-P4 向けの大きな高速化フェーズ」はいったん完了としています。
 
-- 68000 instruction dispatch hot-path
-- memory-map fast-path
-- ROM / RAM / VRAM access 分岐削減
-- read / write callback overhead 削減
-- interrupt / event queue 軽量化
-- guest timeline jitter 削減
+### 6.15 までに実装したもの
 
-### Graphics / PIE
+#### CPU / Bus
 
-- PIE 対象処理拡大
-- palette conversion vector 化
-- branchless transparency
-- Sprite / BG overlay 高速化
-- dirty rectangle / diff rendering
-- page / scroll access 最適化
-- VRAM burst access
-- RGB565 compose 高速化
-- C fallback と高速経路の自動選択
+- Musashi を基準とした 68000 実行
+- instruction dispatch hot-path
+- TCM / internal SRAM dispatch cache
+- native-loop JIT
+- poll / DBcc / branch / memory operation の限定 fast-path
+- guest timing と host 処理の分離
+- CPU1 の WDT / idle relief 調整
 
-### Multi-core
+#### Graphics / Render
 
-- SPM / Mailbox 活用範囲の拡大
-- lock-free / low-lock queue
-- CPU0 / CPU1 間コピー削減
-- asynchronous producer / consumer
-- video / audio blocking 削減
+- PIE / XespV の copy / fill / diff / blend
+- dirty row / pixel-diff LCD 更新
+- CPU0 G + BG + TEXT compositor
+- GRP8 shared-scroll path の CPU0 化
+- **512 x 512 persistent Scroll Cache**
+- GVRAM 更新行だけの cache invalidation / rebuild
+- AXI-GDMA による PSRAM transfer fallback
+- C / scalar fallback を残した安全な高速経路
 
-### Memory
+#### Multi-core
 
-- frequently-used tables の internal SRAM 化
-- PSRAM burst access
-- cache-line alignment
-- framebuffer / VRAM layout 改善
-- audio scratch buffer 最適化
+- CPU1: 68000 / guest timing / ADPCM generation
+- CPU0: compositor / LCD / USB / FM / final audio mix
+- SPM / Mailbox を使った通知
+- producer / consumer 型の非同期処理
+- CPU1 を LCD 転送からできるだけ独立
 
-### Audio
+#### LCD
 
-- vgmM5 FM engine のさらなる軽量化
-- full 32-bit fixed-point DDS
-- YM2151 native-rate generation
-- branchless matrix operation
-- FM / ADPCM mixer 最適化
-- resampling cost 削減
-- audio latency 削減
+- 4:3 viewport
+- generation-dirty row tracking
+- PIE-DIFF による pixel-identical row suppression
+- dirty band 更新
+- **CRTC ベース Frame Pacing**
+- 最新フレーム優先の表示
 
-### LCD
+#### Audio
 
-- frame generation と DMA の並列化
-- double buffer / frame flip 最適化
-- unnecessary copy 削減
-- partial update の評価
+- ADPCM generation と final output の分離
+- YM2151 の CPU0 backend
+- FM + ADPCM final mix の CPU0 化
+- jitter buffer / underflow recovery
+- pitch-safe 44.1 / 22.05 kHz pressure relief
+
+### 思いがけず効いた高速化
+
+当初は「GVRAM の転送や合成をもっと速くする」方向を中心に考えていました。
+
+しかし実機で大きな背景スクロールを追いかけた結果、
+
+> **同じ背景を速く作り直すより、そもそも作り直さない方が速い**
+
+という当たり前だけれど強力な結論にたどり着きました。
+
+6.15 の Scroll Cache は、背景を palette-index のまま保持し、スクロール時には source offset だけを変更します。  
+これは今回の高速化フェーズで特に効果の大きかった変更のひとつです。
+
+### 今後
+
+以後は「高速化のための高速化」はいったん止め、**互換性・安定性・対応ソフトの拡大を優先**します。
+
+性能面で今後検討する候補は次のとおりです。
+
+- 65K color mode の重い GRP generation
+- Sprite / BG generation のさらなる CPU0 / PIE 化
+- vgmM5 の 32-bit fixed-point DDS / native-rate YM2151
+- PSRAM bandwidth を増やさない範囲での PPA 利用
+- LCD presentation / DMA の追加改善
+- 実ゲームで明確なボトルネックが見つかった場合の targeted optimization
+
+**効果が測れない高速化は採用せず、互換性を壊さないことを最優先にします。**
 
 ---
 
@@ -642,6 +697,35 @@ Issues / Pull Requests も歓迎します。
 
 ---
 
+## 更新履歴
+
+### 6.15 — Production
+
+6.12u からの主な変更:
+
+- 68000 実行に **native-loop JIT / hot-path 高速化**を追加
+- TCM / internal SRAM を使った dispatch cache を導入
+- CPU1 を X68000 の guest timing、CPU0 を画面・音声・入力などの host processing にさらに明確に分離
+- G + BG + TEXT の最終合成を CPU0 へ移す高速経路を追加
+- 大きな背景用の **512 x 512 GRP8 Scroll Cache** を追加
+  - 同じ背景を毎フレーム再生成せず、スクロール位置だけを変更
+  - GVRAM が実際に変更された行だけ再構築
+- PIE / XespV の copy / fill / diff / blend 高速経路を拡大
+- PSRAM 転送に AXI-GDMA を利用できる経路を追加
+- LCD の dirty / diff 更新を改善
+- **CRTC ベースの Frame Pacing** を追加し、スクロール表示のカクつきを低減
+- FM / ADPCM の最終ミックスなど、ホスト側音声処理の CPU0 化を拡大
+- 開発用の周期ベンチ／詳細 JIT ログを整理し、Production 構成へ移行
+
+### 6.12u — Initial Public Release
+
+- X68K Tab の最初の公開版
+- PANIC / GUI / FILE / F7 / F8 などの切り替えを **ESP32-P4 全体の再起動ではなく guest-only reset** で行う構成へ変更
+- LCD / USB / audio などを再初期化せずに X68000 環境を切り替える基本構成を確立
+- XDF / DIM / HDS、Human68k、HostFS、USB Keyboard / Joypad、タッチ UI、PANIC Player を統合した公開ベースライン
+
+---
+
 ## PANIC データも探しています
 
 X68K Tab は PanicPlayerTab5 から生まれたプロジェクトです。
@@ -669,6 +753,6 @@ PANIC データが見つかると、開発者のモチベーションが上が�
 
 30 年以上前の X68000 を、手のひらサイズの RISC-V マシン上で、当時とはまったく異なるアーキテクチャを使ってもう一度動かす。
 
-CPU1 は X68000 の時間を守り、CPU0 は画面・音・入出力を引き受け、PIE がピクセル処理を助け、DMA が表示を運び、vgmM5 が FM 音源を生成する。
+CPU1 は X68000 の時間を守り、CPU0 は画面・音・入出力を引き受け、native-loop JIT が 68000 の hot loop を助け、Scroll Cache が同じ背景の再生成を避け、PIE / XespV がピクセル処理を支援し、DMA がデータを運び、vgmM5 が FM 音源を生成する。
 
 **X68K Tab は、X68000 を動かすことと、そのための新しいアーキテクチャを考えることの両方を楽しむプロジェクトです。**

@@ -61,6 +61,7 @@ extern void m68ki_build_opcode_table(void);
 #include <stdio.h>
 #include <string.h>
 #include "esp_attr.h"
+#include "esp_cpu.h"
 #include <stddef.h>
 #include <stdlib.h>
 #include "../../x68k/x68kmemory.h"
@@ -68,6 +69,12 @@ extern void m68ki_build_opcode_table(void);
 
 #ifndef PX68K_TAB5_PERF_PROFILE
 #define PX68K_TAB5_PERF_PROFILE 0
+#endif
+#ifndef PX68K_TAB5_DYNAREC
+#define PX68K_TAB5_DYNAREC 1
+#endif
+#ifndef PX68K_TAB5_DYNAREC_COST_PROFILE
+#define PX68K_TAB5_DYNAREC_COST_PROFILE PX68K_TAB5_PERF_PROFILE
 #endif
 #if PX68K_TAB5_PERF_PROFILE
 #define TAB5_PROF(...) do { __VA_ARGS__; } while (0)
@@ -164,6 +171,1657 @@ static void tab5_xespv_snapshot_selfcheck(void)
 static uint32_t s_tab5_opcode_counts[0x10000];
 static uint32_t s_tab5_opcode_total = 0;
 static DRAM_ATTR int s_tab5_opcode_profile_enabled = 0;
+
+#ifndef PX68K_TAB5_DYNAREC_LOG
+#define PX68K_TAB5_DYNAREC_LOG 1
+#endif
+
+/* Build 6.13b: sparse hot-PC + short back-edge profiler for the Dynarec decision.  This table
+ * lives beside the large diagnostic opcode histogram (external component BSS
+ * in the Tab5 linker layout), and is touched only during the one diagnostic
+ * frame every 1200 guest frames.  Eight probes keep the update path bounded;
+ * misses are counted so the log tells us when the table should be enlarged. */
+#define TAB5_HOTPC613_SLOTS 8192u
+#define TAB5_HOTPC613_MASK  (TAB5_HOTPC613_SLOTS - 1u)
+typedef struct {
+    uint32_t pc;
+    uint32_t count;
+    uint16_t op;
+    uint16_t reserved;
+} tab5_hotpc613_entry_t;
+static tab5_hotpc613_entry_t s_tab5_hotpc613[TAB5_HOTPC613_SLOTS];
+static uint32_t s_tab5_hotpc613_total = 0;
+static uint32_t s_tab5_hotpc613_dropped = 0;
+
+static inline __attribute__((always_inline))
+void tab5_hotpc613_observe(uint32_t pc, uint16_t op)
+{
+    pc &= 0x00ffffffu;
+    unsigned base = (unsigned)(((pc >> 1) ^ (pc >> 9) ^ (pc >> 17)) & TAB5_HOTPC613_MASK);
+    ++s_tab5_hotpc613_total;
+    for (unsigned probe = 0; probe < 8u; ++probe) {
+        tab5_hotpc613_entry_t * const e = &s_tab5_hotpc613[(base + probe) & TAB5_HOTPC613_MASK];
+        if (e->count == 0u) {
+            e->pc = pc;
+            e->op = op;
+            e->count = 1u;
+            return;
+        }
+        if (e->pc == pc) {
+            ++e->count;
+            e->op = op;
+            return;
+        }
+    }
+    ++s_tab5_hotpc613_dropped;
+}
+
+static void tab5_hotpc613_reset(void)
+{
+    memset(s_tab5_hotpc613, 0, sizeof(s_tab5_hotpc613));
+    s_tab5_hotpc613_total = 0;
+    s_tab5_hotpc613_dropped = 0;
+}
+
+/* Build 6.13b: count taken short backward control-flow edges.  A hot back-edge
+ * is a direct signal that a tiny basic block/loop is worth translating.  The
+ * profiler is diagnostic-only and active for one sparse sample frame. */
+#define TAB5_BACKEDGE613_SLOTS 2048u
+#define TAB5_BACKEDGE613_MASK  (TAB5_BACKEDGE613_SLOTS - 1u)
+typedef struct {
+    uint32_t from_pc;
+    uint32_t to_pc;
+    uint32_t count;
+    uint16_t span;
+    uint16_t reserved;
+} tab5_backedge613_entry_t;
+static tab5_backedge613_entry_t s_tab5_backedge613[TAB5_BACKEDGE613_SLOTS];
+static uint32_t s_tab5_backedge613_total = 0;
+static uint32_t s_tab5_backedge613_dropped = 0;
+static uint32_t s_tab5_prev_pc613 = 0;
+static uint8_t s_tab5_prev_pc613_valid = 0;
+
+static inline __attribute__((always_inline))
+void tab5_backedge613_observe(uint32_t pc)
+{
+    pc &= 0x00ffffffu;
+    if (s_tab5_prev_pc613_valid) {
+        const uint32_t from = s_tab5_prev_pc613;
+        if (pc <= from) {
+            const uint32_t span32 = from - pc;
+            if (span32 <= 64u) {
+                unsigned base = (unsigned)(((from >> 1) ^ (pc >> 3) ^ (from >> 11)) & TAB5_BACKEDGE613_MASK);
+                ++s_tab5_backedge613_total;
+                for (unsigned probe = 0; probe < 8u; ++probe) {
+                    tab5_backedge613_entry_t * const e = &s_tab5_backedge613[(base + probe) & TAB5_BACKEDGE613_MASK];
+                    if (e->count == 0u) {
+                        e->from_pc = from;
+                        e->to_pc = pc;
+                        e->span = (uint16_t)span32;
+                        e->count = 1u;
+                        goto done;
+                    }
+                    if (e->from_pc == from && e->to_pc == pc) {
+                        ++e->count;
+                        goto done;
+                    }
+                }
+                ++s_tab5_backedge613_dropped;
+            }
+        }
+    }
+done:
+    s_tab5_prev_pc613 = pc;
+    s_tab5_prev_pc613_valid = 1;
+}
+
+static void tab5_backedge613_reset(void)
+{
+    memset(s_tab5_backedge613, 0, sizeof(s_tab5_backedge613));
+    s_tab5_backedge613_total = 0;
+    s_tab5_backedge613_dropped = 0;
+    s_tab5_prev_pc613 = 0;
+    s_tab5_prev_pc613_valid = 0;
+}
+
+static void tab5_backedge613_dump(void)
+{
+    enum { TOPN = 16 };
+    uint32_t top_count[TOPN] = {0};
+    uint32_t top_from[TOPN] = {0};
+    uint32_t top_to[TOPN] = {0};
+    uint16_t top_span[TOPN] = {0};
+    const uint32_t accepted = s_tab5_backedge613_total - s_tab5_backedge613_dropped;
+
+    for (unsigned n = 0; n < TAB5_BACKEDGE613_SLOTS; ++n) {
+        const tab5_backedge613_entry_t * const e = &s_tab5_backedge613[n];
+        if (!e->count || e->count <= top_count[TOPN - 1]) continue;
+        for (unsigned i = 0; i < TOPN; ++i) {
+            if (e->count > top_count[i]) {
+                for (unsigned j = TOPN - 1; j > i; --j) {
+                    top_count[j] = top_count[j - 1];
+                    top_from[j] = top_from[j - 1];
+                    top_to[j] = top_to[j - 1];
+                    top_span[j] = top_span[j - 1];
+                }
+                top_count[i] = e->count;
+                top_from[i] = e->from_pc;
+                top_to[i] = e->to_pc;
+                top_span[i] = e->span;
+                break;
+            }
+        }
+    }
+
+    printf("PX68K_DYN613B: BACKEDGE total=%lu accepted=%lu dropped=%lu table=%u storage=%uB maxspan=64B\n",
+           (unsigned long)s_tab5_backedge613_total,
+           (unsigned long)accepted,
+           (unsigned long)s_tab5_backedge613_dropped,
+           (unsigned)TAB5_BACKEDGE613_SLOTS,
+           (unsigned)sizeof(s_tab5_backedge613));
+    for (unsigned i = 0; i < TOPN && top_count[i]; ++i) {
+        const uint32_t pct_x100 = accepted
+            ? (uint32_t)(((uint64_t)top_count[i] * 10000ULL) / accepted) : 0u;
+        printf("PX68K_DYN613B: BE%02u $%06lX->$%06lX span=%u count=%lu pct=%lu.%02lu\n",
+               i + 1u, (unsigned long)top_from[i], (unsigned long)top_to[i],
+               (unsigned)top_span[i], (unsigned long)top_count[i],
+               (unsigned long)(pct_x100 / 100u),
+               (unsigned long)(pct_x100 % 100u));
+    }
+}
+
+static void tab5_hotpc613_dump(void)
+{
+    enum { TOPN = 20 };
+    uint32_t top_count[TOPN] = {0};
+    uint32_t top_pc[TOPN] = {0};
+    uint16_t top_op[TOPN] = {0};
+    uint32_t accepted = s_tab5_hotpc613_total - s_tab5_hotpc613_dropped;
+
+    for (unsigned n = 0; n < TAB5_HOTPC613_SLOTS; ++n) {
+        const tab5_hotpc613_entry_t * const e = &s_tab5_hotpc613[n];
+        if (!e->count || e->count <= top_count[TOPN - 1]) continue;
+        for (unsigned i = 0; i < TOPN; ++i) {
+            if (e->count > top_count[i]) {
+                for (unsigned j = TOPN - 1; j > i; --j) {
+                    top_count[j] = top_count[j - 1];
+                    top_pc[j] = top_pc[j - 1];
+                    top_op[j] = top_op[j - 1];
+                }
+                top_count[i] = e->count;
+                top_pc[i] = e->pc;
+                top_op[i] = e->op;
+                break;
+            }
+        }
+    }
+
+    printf("PX68K_DYN613B: HOTPC total=%lu accepted=%lu dropped=%lu table=%u slots storage=%uB\n",
+           (unsigned long)s_tab5_hotpc613_total,
+           (unsigned long)accepted,
+           (unsigned long)s_tab5_hotpc613_dropped,
+           (unsigned)TAB5_HOTPC613_SLOTS,
+           (unsigned)sizeof(s_tab5_hotpc613));
+    for (unsigned i = 0; i < TOPN && top_count[i]; ++i) {
+        const uint32_t pct_x100 = accepted ?
+            (uint32_t)(((uint64_t)top_count[i] * 10000ULL) / accepted) : 0u;
+        printf("PX68K_DYN613B: PC%02u $%06lX op=$%04X count=%lu pct=%lu.%02lu\n",
+               i + 1u, (unsigned long)top_pc[i], (unsigned)top_op[i],
+               (unsigned long)top_count[i],
+               (unsigned long)(pct_x100 / 100u),
+               (unsigned long)(pct_x100 % 100u));
+    }
+}
+
+uint32_t m68k_tab5_profile_storage_bytes(void)
+{
+    return (uint32_t)(sizeof(s_tab5_opcode_counts) + sizeof(s_tab5_hotpc613) + sizeof(s_tab5_backedge613));
+}
+
+/* Build 6.13c11: production-benchmark MC68000 -> ESP32-P4 RV32 runtime translator.
+ * c6 proved the valuable SFXVI $368760 arithmetic prefix executes natively.
+ * c7 moved the exact guest-code signature into generated RV32 and cut the
+ * measured guarded entry from about 1287 to about 708 P4 cycles.  c8 then
+ * moved the exact RAM preflight into generated RV32 as well; the same hot
+ * block measured about 513 cycles total (front + native call) while retaining
+ * ~21.5k native executions and zero memory failures.
+ *
+ * The dominant remaining loss is now scheduler fit, not guard cost.  In c8 the
+ * 94-cycle $368760 primary fragment entered 54,587 times, but 33,078 entries
+ * had fewer than 94 guest cycles left in the current Musashi slice and fell
+ * back to the interpreter.  c9 therefore emits an additional short prefix
+ * variant (<=48 guest cycles) from the SAME guest PC when a long fragment has
+ * enough useful instructions.  Runtime selection is purely by the remaining
+ * scheduler budget: prefer the 96-cycle-class primary, otherwise use the short
+ * variant, otherwise fall back.  Both variants keep independent exact native
+ * signature and RAM guards and return precise PC/PPC/IR/cycle state.
+ *
+ * This remains a conservative loop JIT rather than a replacement CPU core.
+ * A taken short backward Bcc is observed in the normal Musashi path.  After
+ * the edge becomes hot, a straight-line body is decoded once and emitted into
+ * the 32 KiB executable arena proven by 6.13b2.
+ *
+ * Safety rules for this native build:
+ *   - guest code and all direct data operands must be ordinary 12 MiB RAM;
+ *   - no internal branches/calls/exceptions; only the final Bcc is translated;
+ *   - memory operands are only (An), (An)+, or compile-time absolute .L RAM;
+ *   - each generated variant compares every guest code byte/word it will
+ *     execute before any guest side effect; self-modifying code invalidates
+ *     the complete block before execution;
+ *   - each generated variant performs exact An alignment/range/write-overlap
+ *     guards before any guest side effect; transient RAM misses fall back;
+ *   - short loops may execute one complete iteration per native call; long
+ *     loops compile a <=96-cycle primary prefix and, where profitable,
+ *     <=48-cycle short plus <=32-cycle tiny prefixes from the same start PC.
+ *     The scheduler remains
+ *     authoritative and existing poll/DBF/bulk-clear accelerators remain so.
+ *
+ * c10 proved the third <=32-cycle tier is worthwhile, and c11 proved the
+ * production configuration runs the real JIT with the heavyweight research
+ * profiler/cost probe disabled.  The c11 wall benchmark also exposed the next
+ * dominant tax: once any block is active, the main Musashi loop performed a
+ * 4-probe translated-PC lookup before every ordinary guest instruction.
+ *
+ * c12 removed the global per-instruction lookup.  c13 finishes that dispatch
+ * cleanup: discovery itself is deferred until the existing poll/DBF/clear/stream
+ * accelerators have had first refusal, compiled start PCs use a tiny direct L0,
+ * and rejected/saturated discovery edges are memoized for the current candidate
+ * epoch.  This keeps the proven 96/48/32 fragments and exact native guards while
+ * avoiding repeated 4-probe block lookup and 16-probe candidate walks on hot
+ * backward branches that cannot produce useful generic JIT work.
+ *
+ * v1 still keeps guest D/A registers in the Musashi context.  Register caching
+ * remains the optional next CPU pass after the low-overhead dispatch A/B. */
+
+#define TAB5_DYN613C_ARENA_HEAD       64u
+#define TAB5_DYN613C_BLOCK_SLOTS      64u
+#define TAB5_DYN613C_CAND_SLOTS       256u
+#define TAB5_DYN613C_CAND_PROBES      16u
+#define TAB5_DYN613C_CAND_EPOCH_MISSES 65536u
+#define TAB5_DYN613C_BLOCK_L0_SLOTS     64u
+#define TAB5_DYN613C_EDGE_MEMO_SLOTS   128u
+#define TAB5_DYN613C_HOT_THRESHOLD    16u
+#define TAB5_DYN613C_MAX_GUEST_BYTES  192u
+#define TAB5_DYN613C_MAX_INSNS        72u
+#define TAB5_DYN613C_MAX_NATIVE_WORDS 1024u
+#define TAB5_DYN613C_MIN_INSNS        6u
+#define TAB5_DYN613C_FRAG_CYCLE_CAP   96u
+#define TAB5_DYN613C_FRAG_MIN_INSNS   6u
+#define TAB5_DYN613C_SHORT_CYCLE_CAP  48u
+#define TAB5_DYN613C_SHORT_MIN_INSNS   4u
+#define TAB5_DYN613C_TINY_CYCLE_CAP    32u
+#define TAB5_DYN613C_TINY_MIN_INSNS     3u
+
+typedef int (*tab5_dyn613c_native_fn_t)(m68ki_cpu_core *cpu, uint8_t *mem);
+typedef int (*tab5_dyn613c_sync_fn_t)(void *addr, unsigned int bytes);
+
+#define TAB5_DYN613C_SIG_MISMATCH (-1)
+#define TAB5_DYN613C_MEM_MISMATCH (-2)
+
+typedef enum {
+    D613_NONE = 0,
+    D613_MOVE_W_RR,
+    D613_MOVE_L_RR,
+    D613_MOVEA_W_RR,
+    D613_MOVEA_L_RR,
+    D613_MOVEQ,
+    D613_ADD_W_RR,
+    D613_ADD_L_RR,
+    D613_ADDA_W_RR,
+    D613_ADDA_L_RR,
+    D613_AND_W_RR,
+    D613_OR_W_RR,
+    D613_CMP_W_RR,
+    D613_CMP_L_RR,
+    D613_CMPA_L_AA,
+    D613_AND_W_IMM,
+    D613_AND_L_IMM,
+    D613_ANDI_W,
+    D613_ANDI_L,
+    D613_ADDQ_W,
+    D613_SUBQ_W,
+    D613_ADDQ_A,
+    D613_ASR_W,
+    D613_ASR_L,
+    D613_EXT_L,
+    D613_SWAP,
+    D613_TST_W_D,
+    D613_TST_W_A,
+    D613_TST_W_ABSL,
+    D613_MOVE_W_PI_D,
+    D613_MOVE_L_PI_D,
+    D613_MOVE_W_D_PI,
+    D613_MOVE_L_D_PI,
+    D613_MOVE_L_PI_PI,
+    D613_CLR_W_PI,
+    D613_CLR_L_PI,
+    D613_BCC_FINAL
+} tab5_dyn613c_kind_t;
+
+typedef struct {
+    uint32_t pc;
+    uint32_t imm;
+    uint16_t op;
+    uint8_t kind;
+    uint8_t len;
+} tab5_dyn613c_dec_t;
+
+typedef struct {
+    uint32_t start_pc;
+    uint32_t branch_pc;
+    uint32_t fall_pc;
+    uint32_t code_hash;
+    uint16_t branch_op;
+    uint16_t guest_bytes;
+    uint16_t guest_insns;
+    uint16_t native_bytes;
+    uint16_t cycles_taken;
+    uint16_t cycles_not;
+    uint8_t mem_span[8];
+    uint8_t mem_write_mask;
+    uint8_t valid;
+    uint8_t fragment;
+    uint8_t sig_words;
+    uint8_t ram_guard_words;
+    uint8_t short_valid;
+    uint16_t short_guest_bytes;
+    uint16_t short_guest_insns;
+    uint16_t short_native_bytes;
+    uint16_t short_cycles;
+    uint8_t short_sig_words;
+    uint8_t short_ram_guard_words;
+    uint8_t tiny_valid;
+    uint16_t tiny_guest_bytes;
+    uint16_t tiny_guest_insns;
+    uint16_t tiny_native_bytes;
+    uint16_t tiny_cycles;
+    uint8_t tiny_sig_words;
+    uint8_t tiny_ram_guard_words;
+    /* c4-c10 diagnostics: sampled only, never guest-visible. */
+    uint32_t enter_count;
+    uint32_t exec_count;
+    uint32_t mem_fail_count;
+    uint32_t cycle_fail_count;
+    uint32_t sample_count;
+    uint32_t sample_hash_cc;
+    uint32_t sample_preflight_cc;
+    uint32_t sample_native_cc;
+    uint32_t short_select_count;
+    uint32_t short_exec_count;
+    uint32_t short_mem_fail_count;
+    uint32_t short_sample_count;
+    uint32_t short_sample_front_cc;
+    uint32_t short_sample_native_cc;
+    uint32_t tiny_select_count;
+    uint32_t tiny_exec_count;
+    uint32_t tiny_mem_fail_count;
+    uint32_t tiny_sample_count;
+    uint32_t tiny_sample_front_cc;
+    uint32_t tiny_sample_native_cc;
+    tab5_dyn613c_native_fn_t fn;
+    tab5_dyn613c_native_fn_t short_fn;
+    tab5_dyn613c_native_fn_t tiny_fn;
+} tab5_dyn613c_block_t;
+
+typedef struct {
+    uint32_t from_pc;
+    uint32_t to_pc;
+    uint16_t op;
+    uint16_t count;
+    uint8_t attempted;
+    uint8_t epoch;
+    uint8_t reserved[2];
+} tab5_dyn613c_candidate_t;
+
+/* c13 L0/memo tables are performance hints only.  Every L0 hit revalidates the
+ * authoritative block slot, and memo entries expire automatically when the
+ * candidate epoch rotates.  Losing an entry to a direct-map collision can only
+ * reduce acceleration; it cannot change guest-visible execution. */
+typedef struct {
+    uint32_t pc;
+    uint8_t block_plus1;
+    uint8_t reserved[3];
+} tab5_dyn613c_block_l0_t;
+
+typedef struct {
+    uint32_t from_pc;
+    uint32_t to_pc;
+    uint16_t op;
+    uint8_t epoch;
+    uint8_t state;
+} tab5_dyn613c_edge_memo_t;
+
+enum { TAB5_DYN613C_MEMO_REJECT=1u, TAB5_DYN613C_MEMO_MISS=2u };
+
+static DRAM_ATTR uint8_t *s_dyn613c_arena = NULL;
+static DRAM_ATTR uint32_t s_dyn613c_arena_bytes = 0;
+static DRAM_ATTR uint32_t s_dyn613c_arena_used = TAB5_DYN613C_ARENA_HEAD;
+static DRAM_ATTR tab5_dyn613c_sync_fn_t s_dyn613c_sync = NULL;
+static DRAM_ATTR tab5_dyn613c_block_t s_dyn613c_blocks[TAB5_DYN613C_BLOCK_SLOTS];
+static DRAM_ATTR tab5_dyn613c_candidate_t s_dyn613c_cands[TAB5_DYN613C_CAND_SLOTS];
+static DRAM_ATTR tab5_dyn613c_block_l0_t s_dyn613c_block_l0[TAB5_DYN613C_BLOCK_L0_SLOTS];
+static DRAM_ATTR tab5_dyn613c_edge_memo_t s_dyn613c_edge_memo[TAB5_DYN613C_EDGE_MEMO_SLOTS];
+static DRAM_ATTR uint32_t s_dyn613c_active = 0;
+static DRAM_ATTR uint32_t s_dyn613c_compile_ok = 0;
+static DRAM_ATTR uint32_t s_dyn613c_compile_reject = 0;
+static DRAM_ATTR uint32_t s_dyn613c_reject_decode = 0;
+static DRAM_ATTR uint32_t s_dyn613c_reject_poll = 0;
+static DRAM_ATTR uint32_t s_dyn613c_reject_mem = 0;
+static DRAM_ATTR uint32_t s_dyn613c_reject_cache = 0;
+static DRAM_ATTR uint32_t s_dyn613c_exec = 0;
+static DRAM_ATTR uint32_t s_dyn613c_fallback = 0;
+static DRAM_ATTR uint32_t s_dyn613c_hash_fail = 0;
+static DRAM_ATTR uint32_t s_dyn613c_mem_fail = 0;
+static DRAM_ATTR uint32_t s_dyn613c_cycle_fail = 0;
+static DRAM_ATTR uint32_t s_dyn613c_fragment_ok = 0;
+static DRAM_ATTR uint32_t s_dyn613c_short_ok = 0;
+static DRAM_ATTR uint32_t s_dyn613c_short_select = 0;
+static DRAM_ATTR uint32_t s_dyn613c_short_exec = 0;
+static DRAM_ATTR uint32_t s_dyn613c_tiny_ok = 0;
+static DRAM_ATTR uint32_t s_dyn613c_tiny_select = 0;
+static DRAM_ATTR uint32_t s_dyn613c_tiny_exec = 0;
+static DRAM_ATTR uint32_t s_dyn613c_perf_reject = 0;
+static DRAM_ATTR uint32_t s_dyn613c_flush = 0;
+static DRAM_ATTR uint64_t s_dyn613c_guest_instr = 0;
+static DRAM_ATTR uint64_t s_dyn613c_cycles = 0;
+static DRAM_ATTR uint64_t s_dyn613c_native_bytes_total = 0;
+static DRAM_ATTR uint32_t s_dyn613c_last_bad_pc = 0xffffffffu;
+static DRAM_ATTR uint16_t s_dyn613c_last_bad_op = 0xffffu;
+static DRAM_ATTR uint32_t s_dyn613c_reject_diag_printed = 0;
+static DRAM_ATTR uint32_t s_dyn613c_cand_insert_miss = 0;
+static DRAM_ATTR uint32_t s_dyn613c_cand_miss_run = 0;
+static DRAM_ATTR uint32_t s_dyn613c_cand_rotations = 0;
+static DRAM_ATTR uint8_t s_dyn613c_cand_epoch = 1u;
+static DRAM_ATTR uint32_t s_dyn613c_l0_hits = 0;
+static DRAM_ATTR uint32_t s_dyn613c_l0_misses = 0;
+static DRAM_ATTR uint32_t s_dyn613c_memo_reject_hits = 0;
+static DRAM_ATTR uint32_t s_dyn613c_memo_miss_hits = 0;
+
+unsigned int m68k_tab5_dynarec_metadata_bytes(void)
+{
+    /* Persistent JIT tables only.  The 4 KiB emitter and decode array are
+     * transient CPU1 stack objects used only when a hot block is compiled. */
+    return (uint32_t)(sizeof(s_dyn613c_blocks) + sizeof(s_dyn613c_cands) +
+                      sizeof(s_dyn613c_block_l0) + sizeof(s_dyn613c_edge_memo));
+}
+
+/* RV32 register numbers.  Keep a0/a1 as the C ABI cpu/MEM arguments and use
+ * only caller-saved registers so generated functions need no stack frame. */
+enum {
+    R_ZERO=0, R_RA=1,
+    R_T0=5, R_T1=6, R_T2=7,
+    R_A0=10, R_A1=11, R_A2=12, R_A3=13, R_A4=14, R_A5=15,
+    R_A6=16, R_A7=17
+};
+
+typedef struct {
+    uint32_t w[TAB5_DYN613C_MAX_NATIVE_WORDS];
+    unsigned n;
+    int failed;
+} tab5_rv613c_emit_t;
+
+static inline uint32_t rv613_i(unsigned opcode, unsigned rd, unsigned f3,
+                               unsigned rs1, int imm)
+{
+    return ((uint32_t)imm & 0xfffu) << 20 |
+           (rs1 & 31u) << 15 | (f3 & 7u) << 12 |
+           (rd & 31u) << 7 | (opcode & 0x7fu);
+}
+static inline uint32_t rv613_r(unsigned rd, unsigned f3, unsigned rs1,
+                               unsigned rs2, unsigned f7)
+{
+    return (f7 & 0x7fu) << 25 | (rs2 & 31u) << 20 | (rs1 & 31u) << 15 |
+           (f3 & 7u) << 12 | (rd & 31u) << 7 | 0x33u;
+}
+static inline uint32_t rv613_s(unsigned f3, unsigned rs1, unsigned rs2, int imm)
+{
+    const uint32_t u = (uint32_t)imm & 0xfffu;
+    return ((u >> 5) & 0x7fu) << 25 | (rs2 & 31u) << 20 |
+           (rs1 & 31u) << 15 | (f3 & 7u) << 12 |
+           (u & 0x1fu) << 7 | 0x23u;
+}
+static inline uint32_t rv613_b(unsigned f3, unsigned rs1, unsigned rs2, int off)
+{
+    const uint32_t u = (uint32_t)off & 0x1fffu;
+    return ((u >> 12) & 1u) << 31 | ((u >> 5) & 0x3fu) << 25 |
+           (rs2 & 31u) << 20 | (rs1 & 31u) << 15 | (f3 & 7u) << 12 |
+           ((u >> 1) & 0x0fu) << 8 | ((u >> 11) & 1u) << 7 | 0x63u;
+}
+static inline void rv613_emit(tab5_rv613c_emit_t *e, uint32_t w)
+{
+    if (e->n >= TAB5_DYN613C_MAX_NATIVE_WORDS) { e->failed = 1; return; }
+    e->w[e->n++] = w;
+}
+static inline void rv613_add(tab5_rv613c_emit_t *e, unsigned rd, unsigned a, unsigned b)
+{ rv613_emit(e, rv613_r(rd,0,a,b,0)); }
+static inline void rv613_sub(tab5_rv613c_emit_t *e, unsigned rd, unsigned a, unsigned b)
+{ rv613_emit(e, rv613_r(rd,0,a,b,0x20)); }
+static inline void rv613_and(tab5_rv613c_emit_t *e, unsigned rd, unsigned a, unsigned b)
+{ rv613_emit(e, rv613_r(rd,7,a,b,0)); }
+static inline void rv613_or(tab5_rv613c_emit_t *e, unsigned rd, unsigned a, unsigned b)
+{ rv613_emit(e, rv613_r(rd,6,a,b,0)); }
+static inline void rv613_xor(tab5_rv613c_emit_t *e, unsigned rd, unsigned a, unsigned b)
+{ rv613_emit(e, rv613_r(rd,4,a,b,0)); }
+static inline void rv613_sltu(tab5_rv613c_emit_t *e, unsigned rd, unsigned a, unsigned b)
+{ rv613_emit(e, rv613_r(rd,3,a,b,0)); }
+static inline void rv613_addi(tab5_rv613c_emit_t *e, unsigned rd, unsigned rs, int imm)
+{ rv613_emit(e, rv613_i(0x13,rd,0,rs,imm)); }
+static inline void rv613_andi(tab5_rv613c_emit_t *e, unsigned rd, unsigned rs, int imm)
+{ rv613_emit(e, rv613_i(0x13,rd,7,rs,imm)); }
+static inline void rv613_slli(tab5_rv613c_emit_t *e, unsigned rd, unsigned rs, unsigned sh)
+{ rv613_emit(e, rv613_i(0x13,rd,1,rs,(int)(sh & 31u))); }
+static inline void rv613_srli(tab5_rv613c_emit_t *e, unsigned rd, unsigned rs, unsigned sh)
+{ rv613_emit(e, rv613_i(0x13,rd,5,rs,(int)(sh & 31u))); }
+static inline void rv613_srai(tab5_rv613c_emit_t *e, unsigned rd, unsigned rs, unsigned sh)
+{ rv613_emit(e, rv613_i(0x13,rd,5,rs,(int)(0x400u | (sh & 31u)))); }
+static inline void rv613_lw(tab5_rv613c_emit_t *e, unsigned rd, unsigned rs, int off)
+{ rv613_emit(e, rv613_i(0x03,rd,2,rs,off)); }
+static inline void rv613_lhu(tab5_rv613c_emit_t *e, unsigned rd, unsigned rs, int off)
+{ rv613_emit(e, rv613_i(0x03,rd,5,rs,off)); }
+static inline void rv613_sw(tab5_rv613c_emit_t *e, unsigned rs2, unsigned rs1, int off)
+{ rv613_emit(e, rv613_s(2,rs1,rs2,off)); }
+static inline void rv613_sh(tab5_rv613c_emit_t *e, unsigned rs2, unsigned rs1, int off)
+{ rv613_emit(e, rv613_s(1,rs1,rs2,off)); }
+static inline void rv613_lui(tab5_rv613c_emit_t *e, unsigned rd, uint32_t imm20)
+{ rv613_emit(e, (imm20 & 0xfffffu) << 12 | (rd & 31u) << 7 | 0x37u); }
+static inline void rv613_li(tab5_rv613c_emit_t *e, unsigned rd, uint32_t value)
+{
+    const int32_t sv = (int32_t)value;
+    if (sv >= -2048 && sv <= 2047) {
+        rv613_addi(e, rd, R_ZERO, sv);
+    } else {
+        const int32_t hi = (int32_t)(((int64_t)sv + 0x800) >> 12);
+        const int32_t lo = (int32_t)((int64_t)sv - ((int64_t)hi * 4096));
+        rv613_lui(e, rd, (uint32_t)hi);
+        rv613_addi(e, rd, rd, lo);
+    }
+}
+static inline unsigned rv613_branch_placeholder(tab5_rv613c_emit_t *e,
+                                                  unsigned f3, unsigned rs1, unsigned rs2)
+{
+    const unsigned at = e->n;
+    rv613_emit(e, rv613_b(f3,rs1,rs2,0));
+    return at;
+}
+static inline void rv613_patch_branch(tab5_rv613c_emit_t *e, unsigned at,
+                                      unsigned f3, unsigned rs1, unsigned rs2,
+                                      unsigned target_word)
+{
+    const int off = ((int)target_word - (int)at) * 4;
+    if (at >= e->n || off < -4096 || off > 4094 || (off & 1)) {
+        e->failed = 1; return;
+    }
+    e->w[at] = rv613_b(f3,rs1,rs2,off);
+}
+static inline void rv613_ret(tab5_rv613c_emit_t *e)
+{ rv613_emit(e, 0x00008067u); }
+
+#define D613_OFF_DA(n) ((int)(offsetof(m68ki_cpu_core, dar) + 4u*(n)))
+#define D613_OFF_PPC   ((int)offsetof(m68ki_cpu_core, ppc))
+#define D613_OFF_PC    ((int)offsetof(m68ki_cpu_core, pc))
+#define D613_OFF_IR    ((int)offsetof(m68ki_cpu_core, ir))
+#define D613_OFF_X     ((int)offsetof(m68ki_cpu_core, x_flag))
+#define D613_OFF_N     ((int)offsetof(m68ki_cpu_core, n_flag))
+#define D613_OFF_Z     ((int)offsetof(m68ki_cpu_core, not_z_flag))
+#define D613_OFF_V     ((int)offsetof(m68ki_cpu_core, v_flag))
+#define D613_OFF_C     ((int)offsetof(m68ki_cpu_core, c_flag))
+
+static inline void rv613_load_da(tab5_rv613c_emit_t *e, unsigned rd, unsigned idx)
+{ rv613_lw(e,rd,R_A0,D613_OFF_DA(idx)); }
+static inline void rv613_store_da(tab5_rv613c_emit_t *e, unsigned rs, unsigned idx)
+{ rv613_sw(e,rs,R_A0,D613_OFF_DA(idx)); }
+static inline void rv613_mask16(tab5_rv613c_emit_t *e, unsigned rd, unsigned rs)
+{ rv613_slli(e,rd,rs,16); rv613_srli(e,rd,rd,16); }
+static inline void rv613_upper16(tab5_rv613c_emit_t *e, unsigned rd, unsigned rs)
+{ rv613_srli(e,rd,rs,16); rv613_slli(e,rd,rd,16); }
+static inline void rv613_store_nzvc16_move(tab5_rv613c_emit_t *e, unsigned value)
+{
+    rv613_srli(e,R_A2,value,8);
+    rv613_sw(e,R_A2,R_A0,D613_OFF_N);
+    rv613_sw(e,value,R_A0,D613_OFF_Z);
+    rv613_sw(e,R_ZERO,R_A0,D613_OFF_V);
+    rv613_sw(e,R_ZERO,R_A0,D613_OFF_C);
+}
+static inline void rv613_store_nzvc32_move(tab5_rv613c_emit_t *e, unsigned value)
+{
+    rv613_srli(e,R_A2,value,24);
+    rv613_sw(e,R_A2,R_A0,D613_OFF_N);
+    rv613_sw(e,value,R_A0,D613_OFF_Z);
+    rv613_sw(e,R_ZERO,R_A0,D613_OFF_V);
+    rv613_sw(e,R_ZERO,R_A0,D613_OFF_C);
+}
+
+static inline uint16_t tab5_dyn613c_fetch16(uint32_t pc)
+{
+    uint16_t v = 0;
+    if ((pc & 1u) || pc > 0x00bffffeu) return 0xffffu;
+    __builtin_memcpy(&v, MEM + pc, sizeof(v));
+    return v;
+}
+static inline uint32_t tab5_dyn613c_fetch32(uint32_t pc)
+{
+    return ((uint32_t)tab5_dyn613c_fetch16(pc) << 16) |
+           (uint32_t)tab5_dyn613c_fetch16(pc + 2u);
+}
+static uint32_t tab5_dyn613c_hash(uint32_t pc, uint32_t bytes)
+{
+    uint32_t h = 2166136261u;
+    for (uint32_t off = 0; off < bytes; off += 2u) {
+        const uint16_t w = tab5_dyn613c_fetch16(pc + off);
+        h ^= (uint8_t)(w >> 8); h *= 16777619u;
+        h ^= (uint8_t)w;      h *= 16777619u;
+    }
+    return h;
+}
+
+static void tab5_dyn613c_cache_reset(int count_flush)
+{
+    memset(s_dyn613c_blocks, 0, sizeof(s_dyn613c_blocks));
+    memset(s_dyn613c_cands, 0, sizeof(s_dyn613c_cands));
+    memset(s_dyn613c_block_l0, 0, sizeof(s_dyn613c_block_l0));
+    memset(s_dyn613c_edge_memo, 0, sizeof(s_dyn613c_edge_memo));
+    s_dyn613c_cand_epoch = 1u;
+    s_dyn613c_cand_miss_run = 0u;
+    s_dyn613c_active = 0;
+    s_dyn613c_arena_used = TAB5_DYN613C_ARENA_HEAD;
+    if (count_flush) ++s_dyn613c_flush;
+}
+
+void m68k_tab5_dynarec_bind(void *arena, unsigned int bytes,
+                            int (*sync_fn)(void *addr, unsigned int bytes))
+{
+    s_dyn613c_arena = (uint8_t *)arena;
+    s_dyn613c_arena_bytes = bytes;
+    s_dyn613c_sync = (tab5_dyn613c_sync_fn_t)sync_fn;
+    tab5_dyn613c_cache_reset(0);
+    printf("PX68K_DYN613C: native-loop JIT bound arena=%p bytes=%u head=%u sync=%s\n",
+           arena, bytes, (unsigned)TAB5_DYN613C_ARENA_HEAD,
+           sync_fn ? "READY" : "NONE");
+}
+
+static int tab5_dyn613c_decode(uint32_t pc, tab5_dyn613c_dec_t *d)
+{
+    const uint16_t op = tab5_dyn613c_fetch16(pc);
+    memset(d,0,sizeof(*d)); d->pc=pc; d->op=op; d->len=2;
+
+    if ((op & 0xf1f8u) == 0x3000u) d->kind=D613_MOVE_W_RR;
+    else if ((op & 0xf1f8u) == 0x2000u) d->kind=D613_MOVE_L_RR;
+    else if ((op & 0xf1f8u) == 0x3040u) d->kind=D613_MOVEA_W_RR;
+    else if ((op & 0xf1f8u) == 0x2040u) d->kind=D613_MOVEA_L_RR;
+    else if ((op & 0xf100u) == 0x7000u) d->kind=D613_MOVEQ;
+    else if ((op & 0xf1f8u) == 0xd040u) d->kind=D613_ADD_W_RR;
+    else if ((op & 0xf1f8u) == 0xd080u) d->kind=D613_ADD_L_RR;
+    else if ((op & 0xf1f8u) == 0xd0c0u) d->kind=D613_ADDA_W_RR;
+    else if ((op & 0xf1f8u) == 0xd1c0u) d->kind=D613_ADDA_L_RR;
+    else if ((op & 0xf1f8u) == 0xc040u) d->kind=D613_AND_W_RR;
+    else if ((op & 0xf1f8u) == 0x8040u) d->kind=D613_OR_W_RR;
+    else if ((op & 0xf1f8u) == 0xb040u) d->kind=D613_CMP_W_RR;
+    else if ((op & 0xf1f8u) == 0xb080u) d->kind=D613_CMP_L_RR;
+    else if ((op & 0xf1f8u) == 0xb1c8u) d->kind=D613_CMPA_L_AA;
+    else if ((op & 0xf1ffu) == 0xc07cu) { d->kind=D613_AND_W_IMM; d->len=4; d->imm=tab5_dyn613c_fetch16(pc+2); }
+    else if ((op & 0xf1ffu) == 0xc0bcu) { d->kind=D613_AND_L_IMM; d->len=6; d->imm=tab5_dyn613c_fetch32(pc+2); }
+    else if ((op & 0xfff8u) == 0x0240u) { d->kind=D613_ANDI_W; d->len=4; d->imm=tab5_dyn613c_fetch16(pc+2); }
+    else if ((op & 0xfff8u) == 0x0280u) { d->kind=D613_ANDI_L; d->len=6; d->imm=tab5_dyn613c_fetch32(pc+2); }
+    else if ((op & 0xf1f8u) == 0x5040u) d->kind=D613_ADDQ_W;
+    else if ((op & 0xf1f8u) == 0x5140u) d->kind=D613_SUBQ_W;
+    else if ((op & 0xf1f8u) == 0x5048u || (op & 0xf1f8u) == 0x5088u) d->kind=D613_ADDQ_A;
+    else if ((op & 0xf1f8u) == 0xe040u) d->kind=D613_ASR_W;
+    else if ((op & 0xf1f8u) == 0xe080u) d->kind=D613_ASR_L;
+    else if ((op & 0xfff8u) == 0x48c0u) d->kind=D613_EXT_L;
+    else if ((op & 0xfff8u) == 0x4840u) d->kind=D613_SWAP;
+    else if ((op & 0xfff8u) == 0x4a40u) d->kind=D613_TST_W_D;
+    else if ((op & 0xfff8u) == 0x4a50u) d->kind=D613_TST_W_A;
+    else if (op == 0x4a79u) { d->kind=D613_TST_W_ABSL; d->len=6; d->imm=tab5_dyn613c_fetch32(pc+2)&0x00ffffffu; }
+    else if ((op & 0xf1f8u) == 0x3018u) d->kind=D613_MOVE_W_PI_D;
+    else if ((op & 0xf1f8u) == 0x2018u) d->kind=D613_MOVE_L_PI_D;
+    else if ((op & 0xf1f8u) == 0x30c0u) d->kind=D613_MOVE_W_D_PI;
+    else if ((op & 0xf1f8u) == 0x20c0u) d->kind=D613_MOVE_L_D_PI;
+    else if ((op & 0xf1f8u) == 0x20d8u) d->kind=D613_MOVE_L_PI_PI;
+    else if ((op & 0xfff8u) == 0x4258u) d->kind=D613_CLR_W_PI;
+    else if ((op & 0xfff8u) == 0x4298u) d->kind=D613_CLR_L_PI;
+    else if ((op & 0xf000u) == 0x6000u) {
+        const unsigned cc=(op>>8)&15u; const uint8_t lo=(uint8_t)op;
+        if (!(cc==6u || cc==7u || cc==10u || cc==11u)) {
+            s_dyn613c_last_bad_pc=pc; s_dyn613c_last_bad_op=op; return 0;
+        }
+        d->kind=D613_BCC_FINAL;
+        if (lo==0u) { d->len=4; d->imm=(uint32_t)(int32_t)(int16_t)tab5_dyn613c_fetch16(pc+2); }
+        else if (lo==0xffu) { s_dyn613c_last_bad_pc=pc; s_dyn613c_last_bad_op=op; return 0; }
+        else d->imm=(uint32_t)(int32_t)(int8_t)lo;
+    } else { s_dyn613c_last_bad_pc=pc; s_dyn613c_last_bad_op=op; return 0; }
+    return d->kind != D613_NONE;
+}
+
+static inline unsigned d613_src_d(uint16_t op) { return op & 7u; }
+static inline unsigned d613_dst_d(uint16_t op) { return (op >> 9) & 7u; }
+static inline unsigned d613_src_a(uint16_t op) { return op & 7u; }
+static inline unsigned d613_dst_a(uint16_t op) { return (op >> 9) & 7u; }
+static inline unsigned d613_quick(uint16_t op) { return (((op>>9)-1u)&7u)+1u; }
+
+static inline uint32_t tab5_dyn613c_dec_cycles(const tab5_dyn613c_dec_t *d)
+{
+    uint32_t c=CYC_INSTRUCTION[d->op];
+    if (d->kind==D613_ASR_W || d->kind==D613_ASR_L)
+        c += (d613_quick(d->op) << CYC_SHIFT);
+    return c;
+}
+
+
+/* c7/c8 exact native code signature.  Guest RAM stores each 68000 word in the
+ * host halfword layout already used by the generated data paths.  Keep all
+ * loads naturally aligned: if start is +2 mod 4, compare one halfword first,
+ * then use 32-bit pairs, then a final halfword if needed.  XOR/OR accumulates
+ * all differences so the hot path has only one branch. */
+static void rv613_emit_signature_guard(tab5_rv613c_emit_t *e,
+                                       uint32_t start, uint32_t bytes)
+{
+    uint32_t off=0u;
+    rv613_li(e,R_A6,start);
+    rv613_add(e,R_A6,R_A1,R_A6);
+    rv613_addi(e,R_A7,R_ZERO,0);
+
+    if ((start & 2u) && bytes >= 2u) {
+        const uint32_t expect=(uint32_t)tab5_dyn613c_fetch16(start);
+        rv613_lhu(e,R_T0,R_A6,0);
+        rv613_li(e,R_T1,expect);
+        rv613_xor(e,R_T0,R_T0,R_T1);
+        rv613_or(e,R_A7,R_A7,R_T0);
+        off=2u;
+    }
+    while (off+4u <= bytes) {
+        const uint32_t expect=(uint32_t)tab5_dyn613c_fetch16(start+off) |
+                              ((uint32_t)tab5_dyn613c_fetch16(start+off+2u) << 16);
+        rv613_lw(e,R_T0,R_A6,(int)off);
+        rv613_li(e,R_T1,expect);
+        rv613_xor(e,R_T0,R_T0,R_T1);
+        rv613_or(e,R_A7,R_A7,R_T0);
+        off+=4u;
+    }
+    if (off+2u <= bytes) {
+        const uint32_t expect=(uint32_t)tab5_dyn613c_fetch16(start+off);
+        rv613_lhu(e,R_T0,R_A6,(int)off);
+        rv613_li(e,R_T1,expect);
+        rv613_xor(e,R_T0,R_T0,R_T1);
+        rv613_or(e,R_A7,R_A7,R_T0);
+    }
+
+    /* Equal -> skip the private mismatch return and enter the translated body. */
+    const unsigned ok=rv613_branch_placeholder(e,0,R_A7,R_ZERO); /* BEQ */
+    rv613_li(e,R_A0,0xffffffffu); /* TAB5_DYN613C_SIG_MISMATCH */
+    rv613_ret(e);
+    rv613_patch_branch(e,ok,0,R_A7,R_ZERO,e->n);
+}
+
+/* c8 native RAM preflight: emit the exact c6/c7 C predicate before any guest
+ * side effect.  Used An values must be even, 24-bit, and keep the complete
+ * access span inside 12 MiB guest RAM.  Write spans must not overlap this
+ * block's guest-code bytes.  All failures return private sentinel -2. */
+static void rv613_emit_ram_guard(tab5_rv613c_emit_t *e,
+                                 const uint8_t mem_span[8], uint8_t write_mask,
+                                 uint32_t code_start, uint32_t code_end)
+{
+    unsigned fail[24];
+    unsigned nf=0u;
+    for (unsigned a=0;a<8u;++a) {
+        const unsigned span=mem_span[a];
+        if (!span) continue;
+        rv613_load_da(e,R_T0,a+8u);
+        rv613_li(e,R_T1,0xff000001u);
+        rv613_and(e,R_T2,R_T0,R_T1);
+        if (nf >= sizeof(fail)/sizeof(fail[0])) { e->failed=1; return; }
+        fail[nf++]=rv613_branch_placeholder(e,1,R_T2,R_ZERO); /* BNE */
+        rv613_li(e,R_T1,0x00c00000u-span);
+        rv613_sltu(e,R_T2,R_T1,R_T0); /* limit < v */
+        if (nf >= sizeof(fail)/sizeof(fail[0])) { e->failed=1; return; }
+        fail[nf++]=rv613_branch_placeholder(e,1,R_T2,R_ZERO); /* BNE */
+        if (write_mask&(1u<<a)) {
+            rv613_li(e,R_T1,code_end);
+            rv613_sltu(e,R_T2,R_T0,R_T1); /* v < code_end */
+            const unsigned safe_hi=rv613_branch_placeholder(e,0,R_T2,R_ZERO); /* BEQ */
+            rv613_addi(e,R_A2,R_T0,(int)span);
+            rv613_li(e,R_T1,code_start);
+            rv613_sltu(e,R_T2,R_T1,R_A2); /* code_start < end */
+            if (nf >= sizeof(fail)/sizeof(fail[0])) { e->failed=1; return; }
+            fail[nf++]=rv613_branch_placeholder(e,1,R_T2,R_ZERO); /* BNE */
+            rv613_patch_branch(e,safe_hi,0,R_T2,R_ZERO,e->n);
+        }
+    }
+    const unsigned pass=rv613_branch_placeholder(e,0,R_ZERO,R_ZERO); /* always */
+    const unsigned fail_at=e->n;
+    rv613_li(e,R_A0,0xfffffffeu);
+    rv613_ret(e);
+    const unsigned body_at=e->n;
+    rv613_patch_branch(e,pass,0,R_ZERO,R_ZERO,body_at);
+    for (unsigned i=0;i<nf;++i)
+        rv613_patch_branch(e,fail[i],1,R_T2,R_ZERO,fail_at);
+}
+
+static void rv613_write_pc_exit(tab5_rv613c_emit_t *e, uint32_t ppc, uint16_t ir,
+                                uint32_t pc, uint32_t cycles)
+{
+    rv613_li(e,R_T0,ppc); rv613_sw(e,R_T0,R_A0,D613_OFF_PPC);
+    rv613_li(e,R_T0,(uint32_t)ir); rv613_sw(e,R_T0,R_A0,D613_OFF_IR);
+    rv613_li(e,R_T0,pc); rv613_sw(e,R_T0,R_A0,D613_OFF_PC);
+    rv613_li(e,R_A0,cycles); rv613_ret(e);
+}
+
+static void rv613_emit_nzvc_sub32(tab5_rv613c_emit_t *e, unsigned src, unsigned dst, unsigned res)
+{
+    /* N = R>>24; Z = R; V=((S^D)&(R^D))>>24; C=((S&R)|(~D&(S|R)))>>23 */
+    rv613_srli(e,R_A2,res,24); rv613_sw(e,R_A2,R_A0,D613_OFF_N);
+    rv613_sw(e,res,R_A0,D613_OFF_Z);
+    rv613_xor(e,R_A2,src,dst); rv613_xor(e,R_A3,res,dst);
+    rv613_and(e,R_A2,R_A2,R_A3); rv613_srli(e,R_A2,R_A2,24); rv613_sw(e,R_A2,R_A0,D613_OFF_V);
+    rv613_and(e,R_A2,src,res); rv613_or(e,R_A3,src,res);
+    rv613_emit(e, rv613_i(0x13,R_A4,4,R_ZERO,-1)); /* xori a4,zero,-1 -> all ones */
+    rv613_xor(e,R_A4,dst,R_A4); rv613_and(e,R_A3,R_A4,R_A3);
+    rv613_or(e,R_A2,R_A2,R_A3); rv613_srli(e,R_A2,R_A2,23); rv613_sw(e,R_A2,R_A0,D613_OFF_C);
+}
+
+static int tab5_dyn613c_emit_insn(tab5_rv613c_emit_t *e, const tab5_dyn613c_dec_t *d)
+{
+    const uint16_t op=d->op; unsigned s,t,q,sh;
+    switch ((tab5_dyn613c_kind_t)d->kind) {
+    case D613_MOVE_W_RR:
+        s=d613_src_d(op); t=d613_dst_d(op);
+        rv613_load_da(e,R_T0,s); rv613_mask16(e,R_T1,R_T0);
+        rv613_load_da(e,R_T0,t); rv613_upper16(e,R_T0,R_T0); rv613_or(e,R_T0,R_T0,R_T1); rv613_store_da(e,R_T0,t);
+        rv613_store_nzvc16_move(e,R_T1); return 1;
+    case D613_MOVE_L_RR:
+        s=d613_src_d(op); t=d613_dst_d(op); rv613_load_da(e,R_T0,s); rv613_store_da(e,R_T0,t); rv613_store_nzvc32_move(e,R_T0); return 1;
+    case D613_MOVEA_W_RR:
+        s=d613_src_d(op); t=d613_dst_a(op)+8u; rv613_load_da(e,R_T0,s); rv613_slli(e,R_T0,R_T0,16); rv613_srai(e,R_T0,R_T0,16); rv613_store_da(e,R_T0,t); return 1;
+    case D613_MOVEA_L_RR:
+        s=d613_src_d(op); t=d613_dst_a(op)+8u; rv613_load_da(e,R_T0,s); rv613_store_da(e,R_T0,t); return 1;
+    case D613_MOVEQ:
+        t=d613_dst_d(op); rv613_li(e,R_T0,(uint32_t)(int32_t)(int8_t)op); rv613_store_da(e,R_T0,t); rv613_store_nzvc32_move(e,R_T0); return 1;
+    case D613_ADD_W_RR:
+    case D613_ADD_L_RR:
+        s=d613_src_d(op); t=d613_dst_d(op); rv613_load_da(e,R_T0,s); rv613_load_da(e,R_T1,t);
+        if (d->kind==D613_ADD_L_RR) {
+            rv613_add(e,R_T2,R_T0,R_T1); rv613_store_da(e,R_T2,t);
+            rv613_srli(e,R_A2,R_T2,24); rv613_sw(e,R_A2,R_A0,D613_OFF_N); rv613_sw(e,R_T2,R_A0,D613_OFF_Z);
+            rv613_xor(e,R_A2,R_T0,R_T2); rv613_xor(e,R_A3,R_T1,R_T2); rv613_and(e,R_A2,R_A2,R_A3); rv613_srli(e,R_A2,R_A2,24); rv613_sw(e,R_A2,R_A0,D613_OFF_V);
+            /* Exact Musashi CFLAG_ADD_32: ((S&D)|(~R&(S|D)))>>23. */
+            rv613_and(e,R_A2,R_T0,R_T1); rv613_or(e,R_A3,R_T0,R_T1);
+            rv613_li(e,R_A4,0xffffffffu); rv613_xor(e,R_A4,R_T2,R_A4);
+            rv613_and(e,R_A3,R_A3,R_A4); rv613_or(e,R_A2,R_A2,R_A3);
+            rv613_srli(e,R_A2,R_A2,23);
+            rv613_sw(e,R_A2,R_A0,D613_OFF_C); rv613_sw(e,R_A2,R_A0,D613_OFF_X); return 1;
+        }
+        rv613_mask16(e,R_T0,R_T0); rv613_mask16(e,R_A4,R_T1); rv613_add(e,R_T2,R_T0,R_A4);
+        rv613_mask16(e,R_A2,R_T2); rv613_upper16(e,R_T1,R_T1); rv613_or(e,R_T1,R_T1,R_A2); rv613_store_da(e,R_T1,t);
+        rv613_srli(e,R_A3,R_T2,8); rv613_sw(e,R_A3,R_A0,D613_OFF_N); rv613_sw(e,R_A2,R_A0,D613_OFF_Z);
+        rv613_xor(e,R_A3,R_T0,R_T2); rv613_xor(e,R_A4,R_A4,R_T2); rv613_and(e,R_A3,R_A3,R_A4); rv613_srli(e,R_A3,R_A3,8); rv613_sw(e,R_A3,R_A0,D613_OFF_V);
+        rv613_srli(e,R_A3,R_T2,8); rv613_sw(e,R_A3,R_A0,D613_OFF_C); rv613_sw(e,R_A3,R_A0,D613_OFF_X); return 1;
+    case D613_ADDA_W_RR:
+    case D613_ADDA_L_RR:
+        s=d613_src_d(op); t=d613_dst_a(op)+8u; rv613_load_da(e,R_T0,s); rv613_load_da(e,R_T1,t);
+        if (d->kind==D613_ADDA_W_RR) { rv613_slli(e,R_T0,R_T0,16); rv613_srai(e,R_T0,R_T0,16); }
+        rv613_add(e,R_T1,R_T1,R_T0); rv613_store_da(e,R_T1,t); return 1;
+    case D613_AND_W_RR:
+    case D613_OR_W_RR:
+        s=d613_src_d(op); t=d613_dst_d(op); rv613_load_da(e,R_T0,s); rv613_load_da(e,R_T1,t); rv613_mask16(e,R_T0,R_T0); rv613_mask16(e,R_T2,R_T1);
+        if (d->kind==D613_AND_W_RR) rv613_and(e,R_T2,R_T2,R_T0); else rv613_or(e,R_T2,R_T2,R_T0);
+        rv613_upper16(e,R_T1,R_T1); rv613_or(e,R_T1,R_T1,R_T2); rv613_store_da(e,R_T1,t); rv613_store_nzvc16_move(e,R_T2); return 1;
+    case D613_CMP_W_RR:
+    case D613_CMP_L_RR:
+        s=d613_src_d(op); t=d613_dst_d(op); rv613_load_da(e,R_T0,s); rv613_load_da(e,R_T1,t);
+        if (d->kind==D613_CMP_W_RR) {
+            rv613_mask16(e,R_T0,R_T0); rv613_mask16(e,R_T1,R_T1); rv613_sub(e,R_T2,R_T1,R_T0); rv613_mask16(e,R_A2,R_T2);
+            rv613_srli(e,R_A3,R_T2,8); rv613_sw(e,R_A3,R_A0,D613_OFF_N); rv613_sw(e,R_A2,R_A0,D613_OFF_Z);
+            rv613_xor(e,R_A3,R_T0,R_T1); rv613_xor(e,R_A4,R_T2,R_T1); rv613_and(e,R_A3,R_A3,R_A4); rv613_srli(e,R_A3,R_A3,8); rv613_sw(e,R_A3,R_A0,D613_OFF_V);
+            rv613_srli(e,R_A3,R_T2,8); /* exact CFLAG_16(res) */ rv613_sw(e,R_A3,R_A0,D613_OFF_C); return 1;
+        }
+        rv613_sub(e,R_T2,R_T1,R_T0); rv613_emit_nzvc_sub32(e,R_T0,R_T1,R_T2); return 1;
+    case D613_CMPA_L_AA:
+        s=d613_src_a(op)+8u; t=d613_dst_a(op)+8u; rv613_load_da(e,R_T0,s); rv613_load_da(e,R_T1,t); rv613_sub(e,R_T2,R_T1,R_T0); rv613_emit_nzvc_sub32(e,R_T0,R_T1,R_T2); return 1;
+    case D613_AND_W_IMM:
+    case D613_ANDI_W:
+        t=(d->kind==D613_AND_W_IMM)?d613_dst_d(op):d613_src_d(op); rv613_load_da(e,R_T0,t); rv613_mask16(e,R_T1,R_T0); rv613_li(e,R_T2,d->imm&0xffffu); rv613_and(e,R_T1,R_T1,R_T2); rv613_upper16(e,R_T0,R_T0); rv613_or(e,R_T0,R_T0,R_T1); rv613_store_da(e,R_T0,t); rv613_store_nzvc16_move(e,R_T1); return 1;
+    case D613_AND_L_IMM:
+    case D613_ANDI_L:
+        t=(d->kind==D613_AND_L_IMM)?d613_dst_d(op):d613_src_d(op); rv613_load_da(e,R_T0,t); rv613_li(e,R_T1,d->imm); rv613_and(e,R_T0,R_T0,R_T1); rv613_store_da(e,R_T0,t); rv613_store_nzvc32_move(e,R_T0); return 1;
+    case D613_ADDQ_W:
+    case D613_SUBQ_W:
+        t=d613_src_d(op); q=d613_quick(op); rv613_load_da(e,R_T0,t); rv613_mask16(e,R_T1,R_T0); rv613_li(e,R_T2,q);
+        if (d->kind==D613_ADDQ_W) rv613_add(e,R_A2,R_T1,R_T2); else rv613_sub(e,R_A2,R_T1,R_T2);
+        rv613_mask16(e,R_A3,R_A2); rv613_upper16(e,R_T0,R_T0); rv613_or(e,R_T0,R_T0,R_A3); rv613_store_da(e,R_T0,t);
+        rv613_srli(e,R_A4,R_A2,8); rv613_sw(e,R_A4,R_A0,D613_OFF_N); rv613_sw(e,R_A3,R_A0,D613_OFF_Z);
+        if (d->kind==D613_ADDQ_W) {
+            rv613_xor(e,R_A4,R_T2,R_A2); rv613_xor(e,R_A5,R_T1,R_A2); rv613_and(e,R_A4,R_A4,R_A5); rv613_srli(e,R_A4,R_A4,8); rv613_sw(e,R_A4,R_A0,D613_OFF_V);
+            rv613_srli(e,R_A4,R_A2,8); rv613_sw(e,R_A4,R_A0,D613_OFF_C); rv613_sw(e,R_A4,R_A0,D613_OFF_X);
+        } else {
+            rv613_xor(e,R_A4,R_T2,R_T1); rv613_xor(e,R_A5,R_A2,R_T1); rv613_and(e,R_A4,R_A4,R_A5); rv613_srli(e,R_A4,R_A4,8); rv613_sw(e,R_A4,R_A0,D613_OFF_V);
+            rv613_srli(e,R_A4,R_A2,8); /* exact CFLAG_16(res) */ rv613_sw(e,R_A4,R_A0,D613_OFF_C); rv613_sw(e,R_A4,R_A0,D613_OFF_X);
+        } return 1;
+    case D613_ADDQ_A:
+        t=d613_src_a(op)+8u; q=d613_quick(op); rv613_load_da(e,R_T0,t); rv613_addi(e,R_T0,R_T0,(int)q); rv613_store_da(e,R_T0,t); return 1;
+    case D613_ASR_W:
+    case D613_ASR_L:
+        t=d613_src_d(op); sh=d613_quick(op); rv613_load_da(e,R_T0,t);
+        if (d->kind==D613_ASR_L) {
+            rv613_srai(e,R_T1,R_T0,sh); rv613_store_da(e,R_T1,t); rv613_store_nzvc32_move(e,R_T1);
+            rv613_slli(e,R_T2,R_T0,9u-sh); rv613_sw(e,R_T2,R_A0,D613_OFF_C); rv613_sw(e,R_T2,R_A0,D613_OFF_X); return 1;
+        }
+        rv613_mask16(e,R_T1,R_T0); rv613_slli(e,R_T2,R_T1,16); rv613_srai(e,R_T2,R_T2,16); rv613_srai(e,R_T2,R_T2,sh); rv613_mask16(e,R_A2,R_T2);
+        rv613_upper16(e,R_T0,R_T0); rv613_or(e,R_T0,R_T0,R_A2); rv613_store_da(e,R_T0,t); rv613_store_nzvc16_move(e,R_A2);
+        rv613_slli(e,R_T1,R_T1,9u-sh); rv613_sw(e,R_T1,R_A0,D613_OFF_C); rv613_sw(e,R_T1,R_A0,D613_OFF_X); return 1;
+    case D613_EXT_L:
+        t=d613_src_d(op); rv613_load_da(e,R_T0,t); rv613_slli(e,R_T0,R_T0,16); rv613_srai(e,R_T0,R_T0,16); rv613_store_da(e,R_T0,t); rv613_store_nzvc32_move(e,R_T0); return 1;
+    case D613_SWAP:
+        t=d613_src_d(op); rv613_load_da(e,R_T0,t); rv613_slli(e,R_T1,R_T0,16); rv613_srli(e,R_T0,R_T0,16); rv613_or(e,R_T0,R_T0,R_T1); rv613_store_da(e,R_T0,t); rv613_store_nzvc32_move(e,R_T0); return 1;
+    case D613_TST_W_D:
+        t=d613_src_d(op); rv613_load_da(e,R_T0,t); rv613_mask16(e,R_T0,R_T0); rv613_store_nzvc16_move(e,R_T0); return 1;
+    case D613_TST_W_A:
+        t=d613_src_a(op)+8u; rv613_load_da(e,R_T0,t); rv613_add(e,R_T1,R_A1,R_T0); rv613_lhu(e,R_T0,R_T1,0); rv613_store_nzvc16_move(e,R_T0); return 1;
+    case D613_TST_W_ABSL:
+        rv613_li(e,R_T0,d->imm); rv613_add(e,R_T1,R_A1,R_T0); rv613_lhu(e,R_T0,R_T1,0); rv613_store_nzvc16_move(e,R_T0); return 1;
+    case D613_MOVE_W_PI_D:
+    case D613_MOVE_L_PI_D: {
+        const unsigned ar=d613_src_a(op)+8u, dr=d613_dst_d(op); rv613_load_da(e,R_T0,ar); rv613_add(e,R_T1,R_A1,R_T0);
+        if (d->kind==D613_MOVE_W_PI_D) {
+            rv613_lhu(e,R_T2,R_T1,0); rv613_addi(e,R_T0,R_T0,2); rv613_store_da(e,R_T0,ar); rv613_load_da(e,R_A2,dr); rv613_upper16(e,R_A2,R_A2); rv613_or(e,R_A2,R_A2,R_T2); rv613_store_da(e,R_A2,dr); rv613_store_nzvc16_move(e,R_T2);
+        } else {
+            rv613_lhu(e,R_T2,R_T1,0); rv613_lhu(e,R_A2,R_T1,2); rv613_slli(e,R_T2,R_T2,16); rv613_or(e,R_T2,R_T2,R_A2); rv613_addi(e,R_T0,R_T0,4); rv613_store_da(e,R_T0,ar); rv613_store_da(e,R_T2,dr); rv613_store_nzvc32_move(e,R_T2);
+        } return 1; }
+    case D613_MOVE_W_D_PI:
+    case D613_MOVE_L_D_PI: {
+        const unsigned dr=d613_src_d(op), ar=d613_dst_a(op)+8u; rv613_load_da(e,R_T0,ar); rv613_add(e,R_T1,R_A1,R_T0); rv613_load_da(e,R_T2,dr);
+        if (d->kind==D613_MOVE_W_D_PI) { rv613_sh(e,R_T2,R_T1,0); rv613_addi(e,R_T0,R_T0,2); rv613_store_da(e,R_T0,ar); rv613_mask16(e,R_T2,R_T2); rv613_store_nzvc16_move(e,R_T2); }
+        else { rv613_srli(e,R_A2,R_T2,16); rv613_sh(e,R_A2,R_T1,0); rv613_sh(e,R_T2,R_T1,2); rv613_addi(e,R_T0,R_T0,4); rv613_store_da(e,R_T0,ar); rv613_store_nzvc32_move(e,R_T2); }
+        return 1; }
+    case D613_MOVE_L_PI_PI: {
+        const unsigned sa=d613_src_a(op)+8u, da=d613_dst_a(op)+8u; if (sa==da) return 0;
+        rv613_load_da(e,R_T0,sa); rv613_add(e,R_T1,R_A1,R_T0); rv613_lhu(e,R_T2,R_T1,0); rv613_lhu(e,R_A2,R_T1,2); rv613_slli(e,R_T2,R_T2,16); rv613_or(e,R_T2,R_T2,R_A2); rv613_addi(e,R_T0,R_T0,4); rv613_store_da(e,R_T0,sa);
+        rv613_load_da(e,R_T0,da); rv613_add(e,R_T1,R_A1,R_T0); rv613_srli(e,R_A2,R_T2,16); rv613_sh(e,R_A2,R_T1,0); rv613_sh(e,R_T2,R_T1,2); rv613_addi(e,R_T0,R_T0,4); rv613_store_da(e,R_T0,da); rv613_store_nzvc32_move(e,R_T2); return 1; }
+    case D613_CLR_W_PI:
+    case D613_CLR_L_PI: {
+        const unsigned ar=d613_src_a(op)+8u; rv613_load_da(e,R_T0,ar); rv613_add(e,R_T1,R_A1,R_T0); rv613_sh(e,R_ZERO,R_T1,0);
+        if (d->kind==D613_CLR_L_PI) rv613_sh(e,R_ZERO,R_T1,2);
+        rv613_addi(e,R_T0,R_T0,d->kind==D613_CLR_L_PI?4:2); rv613_store_da(e,R_T0,ar); rv613_sw(e,R_ZERO,R_A0,D613_OFF_N); rv613_sw(e,R_ZERO,R_A0,D613_OFF_V); rv613_sw(e,R_ZERO,R_A0,D613_OFF_C); rv613_li(e,R_T0,0); rv613_sw(e,R_T0,R_A0,D613_OFF_Z); return 1; }
+    default: return 0;
+    }
+}
+
+static int tab5_dyn613c_scan(uint32_t start, uint32_t branch_pc, uint16_t branch_op,
+                             tab5_dyn613c_dec_t *out, unsigned *out_n,
+                             uint8_t mem_span[8], uint8_t *write_mask,
+                             uint32_t *cycles_taken, uint32_t *cycles_not)
+{
+    uint32_t pc=start, cyc=0; unsigned n=0; uint8_t mem_used=0, a_other_mod=0;
+    memset(mem_span,0,8); *write_mask=0;
+    if ((start|branch_pc)&1u || start>=0x00c00000u || branch_pc>=0x00c00000u || branch_pc<start || branch_pc-start>TAB5_DYN613C_MAX_GUEST_BYTES) return 0;
+    while (pc <= branch_pc && n<TAB5_DYN613C_MAX_INSNS) {
+        tab5_dyn613c_dec_t d; if (!tab5_dyn613c_decode(pc,&d)) return 0;
+        if (pc==branch_pc) {
+            if (d.kind!=D613_BCC_FINAL || d.op!=branch_op) return 0;
+            const uint32_t target=((pc+2u)+(int32_t)d.imm)&0x00ffffffu;
+            if (target!=start) return 0;
+            out[n++]=d; cyc += CYC_INSTRUCTION[d.op];
+            *cycles_taken=cyc; *cycles_not=cyc + ((d.len==2)?CYC_BCC_NOTAKE_B:CYC_BCC_NOTAKE_W); *out_n=n;
+            /* Tiny TST/poll loops already have scheduler fast-forward that is much
+             * stronger than one-iteration JIT; never steal those hot paths. */
+            if (n==2u && (out[0].kind==D613_TST_W_A || out[0].kind==D613_TST_W_ABSL)) return -2;
+            if (n==3u && out[0].kind==D613_CLR_L_PI && out[1].kind==D613_CMPA_L_AA && ((d.op>>8)&15u)==6u) return -2;
+            if (n==5u && out[0].kind==D613_CLR_W_PI && out[1].kind==D613_CLR_W_PI && out[2].kind==D613_SUBQ_W && out[3].kind==D613_ADDQ_A && ((d.op>>8)&15u)==10u) return -2;
+            return n>=TAB5_DYN613C_MIN_INSNS ? 1 : 0;
+        }
+        if (d.kind==D613_BCC_FINAL) return 0; /* internal branch */
+        out[n++]=d; cyc += tab5_dyn613c_dec_cycles(&d);
+        unsigned ar=99, bytes=0; int wr=0, othermod=0;
+        switch ((tab5_dyn613c_kind_t)d.kind) {
+        case D613_TST_W_A: ar=d613_src_a(d.op); bytes=2; break;
+        case D613_TST_W_ABSL: if ((d.imm&1u)||d.imm>0x00bffffeu) return -3; break;
+        case D613_MOVE_W_PI_D: ar=d613_src_a(d.op); bytes=2; break;
+        case D613_MOVE_L_PI_D: ar=d613_src_a(d.op); bytes=4; break;
+        case D613_MOVE_W_D_PI: ar=d613_dst_a(d.op); bytes=2; wr=1; break;
+        case D613_MOVE_L_D_PI: ar=d613_dst_a(d.op); bytes=4; wr=1; break;
+        case D613_CLR_W_PI: ar=d613_src_a(d.op); bytes=2; wr=1; break;
+        case D613_CLR_L_PI: ar=d613_src_a(d.op); bytes=4; wr=1; break;
+        case D613_MOVE_L_PI_PI: {
+            unsigned sa=d613_src_a(d.op), da=d613_dst_a(d.op); if (sa==da) return -3;
+            if ((a_other_mod&(1u<<sa))||(a_other_mod&(1u<<da))) return -3;
+            if ((unsigned)mem_span[sa]+4u>255u || (unsigned)mem_span[da]+4u>255u) return -3;
+            mem_span[sa]+=4; mem_span[da]+=4; mem_used|=(1u<<sa)|(1u<<da); *write_mask|=1u<<da; break; }
+        case D613_MOVEA_W_RR: case D613_MOVEA_L_RR: case D613_ADDA_W_RR: case D613_ADDA_L_RR: ar=d613_dst_a(d.op); othermod=1; break;
+        case D613_ADDQ_A: ar=d613_src_a(d.op); othermod=1; break;
+        default: break;
+        }
+        if (ar<8u) {
+            if (othermod) { if (mem_used&(1u<<ar)) return -3; a_other_mod|=1u<<ar; }
+            else if (bytes) { if (a_other_mod&(1u<<ar)) return -3; if ((unsigned)mem_span[ar]+bytes>255u) return -3; mem_span[ar]+=(uint8_t)bytes; mem_used|=1u<<ar; if(wr)*write_mask|=1u<<ar; }
+        }
+        pc += d.len; if (pc>branch_pc && pc!=branch_pc) return 0;
+    }
+    return 0;
+}
+
+/* c6: rebuild RAM guard metadata from exactly the instructions that will
+ * execute natively. c5 fragments inherited the full source-loop spans. */
+static int tab5_dyn613c_mem_meta_exact(const tab5_dyn613c_dec_t *d, unsigned n,
+                                       uint8_t mem_span[8], uint8_t *write_mask)
+{
+    uint8_t mem_used=0, a_other_mod=0;
+    memset(mem_span,0,8); *write_mask=0;
+    for (unsigned i=0; i<n; ++i) {
+        unsigned ar=99, bytes=0; int wr=0, othermod=0;
+        switch ((tab5_dyn613c_kind_t)d[i].kind) {
+        case D613_TST_W_A: ar=d613_src_a(d[i].op); bytes=2; break;
+        case D613_TST_W_ABSL:
+            if ((d[i].imm&1u) || d[i].imm>0x00bffffeu) return 0;
+            break;
+        case D613_MOVE_W_PI_D: ar=d613_src_a(d[i].op); bytes=2; break;
+        case D613_MOVE_L_PI_D: ar=d613_src_a(d[i].op); bytes=4; break;
+        case D613_MOVE_W_D_PI: ar=d613_dst_a(d[i].op); bytes=2; wr=1; break;
+        case D613_MOVE_L_D_PI: ar=d613_dst_a(d[i].op); bytes=4; wr=1; break;
+        case D613_CLR_W_PI: ar=d613_src_a(d[i].op); bytes=2; wr=1; break;
+        case D613_CLR_L_PI: ar=d613_src_a(d[i].op); bytes=4; wr=1; break;
+        case D613_MOVE_L_PI_PI: {
+            const unsigned sa=d613_src_a(d[i].op), da=d613_dst_a(d[i].op);
+            if (sa==da) return 0;
+            if ((a_other_mod&(1u<<sa)) || (a_other_mod&(1u<<da))) return 0;
+            if ((unsigned)mem_span[sa]+4u>255u || (unsigned)mem_span[da]+4u>255u) return 0;
+            mem_span[sa]+=4; mem_span[da]+=4;
+            mem_used|=(1u<<sa)|(1u<<da); *write_mask|=1u<<da;
+            break;
+        }
+        case D613_MOVEA_W_RR: case D613_MOVEA_L_RR:
+        case D613_ADDA_W_RR: case D613_ADDA_L_RR:
+            ar=d613_dst_a(d[i].op); othermod=1; break;
+        case D613_ADDQ_A:
+            ar=d613_src_a(d[i].op); othermod=1; break;
+        default: break;
+        }
+        if (ar<8u) {
+            if (othermod) {
+                if (mem_used&(1u<<ar)) return 0;
+                a_other_mod|=1u<<ar;
+            } else if (bytes) {
+                if (a_other_mod&(1u<<ar)) return 0;
+                if ((unsigned)mem_span[ar]+bytes>255u) return 0;
+                mem_span[ar]+=(uint8_t)bytes; mem_used|=1u<<ar;
+                if (wr) *write_mask|=1u<<ar;
+            }
+        }
+    }
+    return 1;
+}
+
+static int tab5_dyn613c_preflight(const tab5_dyn613c_block_t *b)
+{
+    for (unsigned a=0;a<8u;++a) if (b->mem_span[a]) {
+        const uint32_t v=REG_A[a]; const uint32_t span=b->mem_span[a];
+        if ((v&0xff000001u) || v>0x00c00000u-span) return 0;
+        if (b->mem_write_mask&(1u<<a)) {
+            const uint32_t e=v+span, cs=b->start_pc, ce=b->fall_pc;
+            if (!(e<=cs || v>=ce)) return 0;
+        }
+    }
+    return 1;
+}
+
+static inline unsigned tab5_dyn613c_block_l0_index(uint32_t pc)
+{
+    return ((pc >> 1) ^ (pc >> 7) ^ (pc >> 13)) & (TAB5_DYN613C_BLOCK_L0_SLOTS - 1u);
+}
+
+static inline void tab5_dyn613c_block_l0_fill(tab5_dyn613c_block_t *b)
+{
+    if (!b) return;
+    const unsigned bi=(unsigned)(b-s_dyn613c_blocks);
+    if (bi>=TAB5_DYN613C_BLOCK_SLOTS) return;
+    tab5_dyn613c_block_l0_t * const e=&s_dyn613c_block_l0[tab5_dyn613c_block_l0_index(b->start_pc)];
+    e->pc=b->start_pc;
+    e->block_plus1=(uint8_t)(bi+1u);
+}
+
+static tab5_dyn613c_block_t *tab5_dyn613c_find(uint32_t pc)
+{
+    if (!s_dyn613c_active) return NULL;
+    tab5_dyn613c_block_l0_t * const l0=&s_dyn613c_block_l0[tab5_dyn613c_block_l0_index(pc)];
+    if (l0->block_plus1 && l0->pc==pc) {
+        const unsigned bi=(unsigned)l0->block_plus1-1u;
+        if (bi<TAB5_DYN613C_BLOCK_SLOTS) {
+            tab5_dyn613c_block_t * const b=&s_dyn613c_blocks[bi];
+            if (b->valid && b->start_pc==pc) { ++s_dyn613c_l0_hits; return b; }
+        }
+        l0->block_plus1=0u;
+    }
+    ++s_dyn613c_l0_misses;
+    const unsigned base=((pc>>1)^(pc>>7))&(TAB5_DYN613C_BLOCK_SLOTS-1u);
+    for (unsigned p=0;p<4u;++p) {
+        tab5_dyn613c_block_t *b=&s_dyn613c_blocks[(base+p)&(TAB5_DYN613C_BLOCK_SLOTS-1u)];
+        if (b->valid && b->start_pc==pc) { tab5_dyn613c_block_l0_fill(b); return b; }
+    }
+    return NULL;
+}
+
+static inline void tab5_dyn613c_candidate_epoch_advance(void);
+
+static inline unsigned tab5_dyn613c_edge_memo_index(uint32_t from, uint32_t to, uint16_t op)
+{
+    return ((from>>1) ^ (from>>9) ^ (to>>3) ^ (to>>11) ^ (uint32_t)op) &
+           (TAB5_DYN613C_EDGE_MEMO_SLOTS-1u);
+}
+
+static inline void tab5_dyn613c_edge_memo_store(uint32_t from, uint32_t to, uint16_t op, uint8_t state)
+{
+    tab5_dyn613c_edge_memo_t * const m=&s_dyn613c_edge_memo[tab5_dyn613c_edge_memo_index(from,to,op)];
+    m->from_pc=from; m->to_pc=to; m->op=op; m->epoch=s_dyn613c_cand_epoch; m->state=state;
+}
+
+/* Return non-zero when the current epoch already knows this edge is not worth
+ * walking the heavyweight candidate table.  Saturation misses still advance
+ * the original miss-run counter, so candidate turnover timing is preserved
+ * without repeating sixteen DRAM probes on every occurrence. */
+static inline int tab5_dyn613c_edge_memo_skip(uint32_t from, uint32_t to, uint16_t op)
+{
+    tab5_dyn613c_edge_memo_t * const m=&s_dyn613c_edge_memo[tab5_dyn613c_edge_memo_index(from,to,op)];
+    if (m->epoch!=s_dyn613c_cand_epoch || m->state==0u ||
+        m->from_pc!=from || m->to_pc!=to || m->op!=op) return 0;
+    if (m->state==TAB5_DYN613C_MEMO_REJECT) { ++s_dyn613c_memo_reject_hits; return 1; }
+    if (m->state==TAB5_DYN613C_MEMO_MISS) {
+        ++s_dyn613c_memo_miss_hits;
+        ++s_dyn613c_cand_insert_miss;
+        if (++s_dyn613c_cand_miss_run < TAB5_DYN613C_CAND_EPOCH_MISSES) return 1;
+        tab5_dyn613c_candidate_epoch_advance();
+        return 0;
+    }
+    return 0;
+}
+
+static int tab5_dyn613c_try_execute_block(tab5_dyn613c_block_t *b)
+{
+    if (!b || !b->valid) return 0;
+    ++b->enter_count;
+#if PX68K_TAB5_DYNAREC_COST_PROFILE
+    const uint32_t ent=b->enter_count;
+    const int sample=(ent<=4u || (ent&63u)==0u);
+    uint32_t cc0=0,cc1=0,cc3=0;
+    if (sample) cc0=(uint32_t)esp_cpu_get_cycle_count();
+#endif
+    if (FLAG_T1||FLAG_T0 || CPU_TYPE!=CPU_TYPE_000) { ++s_dyn613c_fallback; return 0; }
+
+    const int primary_need=(b->cycles_taken>b->cycles_not)?b->cycles_taken:b->cycles_not;
+    const int remain=GET_CYCLES();
+    int variant=0; /* 0=primary, 1=short, 2=tiny */
+    int need=primary_need;
+    tab5_dyn613c_native_fn_t fn=b->fn;
+    if (remain < primary_need) {
+        if (b->short_valid && remain >= (int)b->short_cycles) {
+            variant=1;
+            need=(int)b->short_cycles;
+            fn=b->short_fn;
+            ++s_dyn613c_short_select;
+            ++b->short_select_count;
+        } else if (b->tiny_valid && remain >= (int)b->tiny_cycles) {
+            variant=2;
+            need=(int)b->tiny_cycles;
+            fn=b->tiny_fn;
+            ++s_dyn613c_tiny_select;
+            ++b->tiny_select_count;
+        } else {
+            ++s_dyn613c_cycle_fail; ++b->cycle_fail_count; ++s_dyn613c_fallback;
+            return 0;
+        }
+    }
+#if PX68K_TAB5_DYNAREC_COST_PROFILE
+    if (sample) cc1=(uint32_t)esp_cpu_get_cycle_count();
+#endif
+
+    /* c11: selected primary/short/tiny variant owns both exact native guards. */
+    BusErrFlag = 0;
+    const int used=fn(&m68ki_cpu,MEM);
+#if PX68K_TAB5_DYNAREC_COST_PROFILE
+    if (sample) cc3=(uint32_t)esp_cpu_get_cycle_count();
+#endif
+    if (used==TAB5_DYN613C_SIG_MISMATCH) {
+        ++s_dyn613c_hash_fail;
+#if PX68K_TAB5_DYNAREC_LOG
+        const unsigned guest_bytes=(variant==2)?b->tiny_guest_bytes:(variant==1?b->short_guest_bytes:b->guest_bytes);
+        const char *vname=(variant==2)?"TINY":(variant==1?"SHORT":"PRIMARY");
+        printf("PX68K_DYN613C14R: INVALIDATE pc=$%06lX guest=%uB variant=%s exec=%lu reason=native-signature\n",
+               (unsigned long)b->start_pc,guest_bytes,vname,(unsigned long)b->exec_count);
+#endif
+        b->valid=0; if(s_dyn613c_active)--s_dyn613c_active;
+        ++s_dyn613c_fallback;
+        return 0;
+    }
+    if (used==TAB5_DYN613C_MEM_MISMATCH) {
+        ++s_dyn613c_mem_fail; ++b->mem_fail_count;
+        if (variant==1) ++b->short_mem_fail_count;
+        else if (variant==2) ++b->tiny_mem_fail_count;
+        return 0;
+    }
+    if (used<=0 || used>need) { ++s_dyn613c_fallback; return 0; }
+    USE_CYCLES(used); ++s_dyn613c_exec; ++b->exec_count;
+    if (variant==1) {
+        ++s_dyn613c_short_exec; ++b->short_exec_count;
+        s_dyn613c_guest_instr+=b->short_guest_insns;
+    } else if (variant==2) {
+        ++s_dyn613c_tiny_exec; ++b->tiny_exec_count;
+        s_dyn613c_guest_instr+=b->tiny_guest_insns;
+    } else {
+        s_dyn613c_guest_instr+=b->guest_insns;
+    }
+    s_dyn613c_cycles+=(uint32_t)used;
+#if PX68K_TAB5_DYNAREC_COST_PROFILE
+    if (sample) {
+        if (variant==1) {
+            ++b->short_sample_count;
+            b->short_sample_front_cc += (uint32_t)(cc1-cc0);
+            b->short_sample_native_cc += (uint32_t)(cc3-cc1);
+        } else if (variant==2) {
+            ++b->tiny_sample_count;
+            b->tiny_sample_front_cc += (uint32_t)(cc1-cc0);
+            b->tiny_sample_native_cc += (uint32_t)(cc3-cc1);
+        } else {
+            ++b->sample_count;
+            b->sample_hash_cc += (uint32_t)(cc1-cc0);
+            b->sample_preflight_cc += 0u;
+            b->sample_native_cc += (uint32_t)(cc3-cc1);
+        }
+    }
+#endif
+    return 1;
+}
+
+static int tab5_dyn613c_install(uint32_t start, uint32_t branch_pc, uint16_t branch_op)
+{
+    tab5_dyn613c_dec_t d[TAB5_DYN613C_MAX_INSNS]; unsigned n=0; uint8_t spans[8],wm=0; uint32_t ct=0,cn=0;
+    if (!s_dyn613c_arena || !s_dyn613c_sync || s_dyn613c_arena_bytes<=TAB5_DYN613C_ARENA_HEAD) return 0;
+    s_dyn613c_last_bad_pc=0xffffffffu; s_dyn613c_last_bad_op=0xffffu;
+    int scan=tab5_dyn613c_scan(start,branch_pc,branch_op,d,&n,spans,&wm,&ct,&cn);
+    if (scan==-2) { ++s_dyn613c_reject_poll; ++s_dyn613c_compile_reject; return 0; }
+    if (scan==-3) { ++s_dyn613c_reject_mem; ++s_dyn613c_compile_reject; return 0; }
+    if (scan<=0) {
+        ++s_dyn613c_reject_decode; ++s_dyn613c_compile_reject;
+#if PX68K_TAB5_DYNAREC_LOG
+        if (s_dyn613c_reject_diag_printed < 32u) {
+            ++s_dyn613c_reject_diag_printed;
+            printf("PX68K_DYN613C14R: REJECT decode $%06lX-$%06lX op=$%04X badpc=$%06lX badop=$%04X span=%lu\n",
+                   (unsigned long)start,(unsigned long)branch_pc,(unsigned)branch_op,
+                   (unsigned long)(s_dyn613c_last_bad_pc&0x00ffffffu),(unsigned)s_dyn613c_last_bad_op,
+                   (unsigned long)(branch_pc-start));
+        }
+#endif
+        return 0;
+    }
+    const tab5_dyn613c_dec_t *br=&d[n-1];
+    const uint32_t full_need=(ct>cn)?ct:cn;
+    unsigned emit_n=n-1u;
+    uint32_t emit_cycles=0u;
+    int fragment=0;
+
+    /* c5: a long loop that cannot fit the scheduler slice is still valuable.
+     * Emit only a straight-line prefix whose exact guest cycle cost is small
+     * enough to enter frequently.  The final Bcc remains in Musashi. */
+    if (full_need > TAB5_DYN613C_FRAG_CYCLE_CAP) {
+        unsigned k=0;
+        for (; k+1u<n; ++k) {
+            const uint32_t ic=tab5_dyn613c_dec_cycles(&d[k]);
+            if (k>=TAB5_DYN613C_FRAG_MIN_INSNS && emit_cycles+ic>TAB5_DYN613C_FRAG_CYCLE_CAP)
+                break;
+            if (emit_cycles+ic>TAB5_DYN613C_FRAG_CYCLE_CAP)
+                break;
+            emit_cycles+=ic;
+        }
+        if (k>=TAB5_DYN613C_FRAG_MIN_INSNS && k<n-1u) {
+            emit_n=k;
+            fragment=1;
+        } else {
+            ++s_dyn613c_perf_reject;
+            ++s_dyn613c_compile_reject;
+            return 0;
+        }
+    }
+
+    uint32_t block_end_pc=branch_pc+br->len;
+    uint32_t block_ppc=branch_pc;
+    uint16_t block_ir=branch_op;
+    uint32_t block_ct=ct, block_cn=cn;
+    unsigned block_insns=n;
+    uint8_t block_spans[8], block_wm=wm;
+    memcpy(block_spans,spans,sizeof(block_spans));
+    if (fragment) {
+        const tab5_dyn613c_dec_t *last=&d[emit_n-1u];
+        block_end_pc=last->pc+last->len;
+        block_ppc=last->pc;
+        block_ir=last->op;
+        block_ct=block_cn=emit_cycles;
+        block_insns=emit_n;
+        if (!tab5_dyn613c_mem_meta_exact(d,emit_n,block_spans,&block_wm)) {
+            ++s_dyn613c_reject_mem; ++s_dyn613c_compile_reject; return 0;
+        }
+    }
+
+    tab5_rv613c_emit_t e={0};
+    const uint32_t sig_guest_bytes=block_end_pc-start;
+    rv613_emit_signature_guard(&e,start,sig_guest_bytes);
+    const unsigned sig_words=e.n;
+    if (e.failed || sig_words>255u) { ++s_dyn613c_reject_cache; ++s_dyn613c_compile_reject; return 0; }
+    const unsigned rg_at=e.n;
+    rv613_emit_ram_guard(&e,block_spans,block_wm,start,block_end_pc);
+    const unsigned ram_guard_words=e.n-rg_at;
+    if (e.failed || ram_guard_words>255u) { ++s_dyn613c_reject_cache; ++s_dyn613c_compile_reject; return 0; }
+    for (unsigned i=0;i<emit_n;++i)
+        if (!tab5_dyn613c_emit_insn(&e,&d[i])) { e.failed=1; break; }
+    if (e.failed) { ++s_dyn613c_reject_decode; ++s_dyn613c_compile_reject; return 0; }
+
+    if (fragment) {
+        rv613_write_pc_exit(&e,block_ppc,block_ir,block_end_pc,emit_cycles);
+    } else {
+        const unsigned cc=(br->op>>8)&15u; unsigned patch;
+        rv613_lw(&e,R_T0,R_A0,cc==10u||cc==11u?D613_OFF_N:D613_OFF_Z);
+        if (cc==10u||cc==11u) rv613_andi(&e,R_T0,R_T0,0x80);
+        if (cc==6u || cc==11u) patch=rv613_branch_placeholder(&e,0,R_T0,R_ZERO); /* BNE/BMI: if zero -> not */
+        else patch=rv613_branch_placeholder(&e,1,R_T0,R_ZERO); /* BEQ/BPL: if nonzero -> not */
+        rv613_write_pc_exit(&e,branch_pc,branch_op,start,ct);
+        const unsigned not_at=e.n; rv613_write_pc_exit(&e,branch_pc,branch_op,branch_pc+br->len,cn);
+        rv613_patch_branch(&e,patch,(cc==6u||cc==11u)?0u:1u,R_T0,R_ZERO,not_at);
+    }
+    if (e.failed) { ++s_dyn613c_reject_cache; ++s_dyn613c_compile_reject; return 0; }
+    const uint32_t raw=e.n*4u, alloc=(raw+63u)&~63u;
+    if (s_dyn613c_arena_used+alloc>s_dyn613c_arena_bytes) { tab5_dyn613c_cache_reset(1); }
+    if (s_dyn613c_arena_used+alloc>s_dyn613c_arena_bytes) { ++s_dyn613c_reject_cache; ++s_dyn613c_compile_reject; return 0; }
+
+    const unsigned base=((start>>1)^(start>>7))&(TAB5_DYN613C_BLOCK_SLOTS-1u); tab5_dyn613c_block_t *b=NULL;
+    for(unsigned p=0;p<4u;++p){tab5_dyn613c_block_t *q=&s_dyn613c_blocks[(base+p)&(TAB5_DYN613C_BLOCK_SLOTS-1u)];if(!q->valid){b=q;break;}}
+    if(!b){++s_dyn613c_reject_cache;++s_dyn613c_compile_reject;return 0;}
+
+    uint8_t *dst=s_dyn613c_arena+s_dyn613c_arena_used;
+    memset(dst,0,alloc); memcpy(dst,e.w,raw);
+    if(!s_dyn613c_sync(dst,alloc)){++s_dyn613c_reject_cache;++s_dyn613c_compile_reject;return 0;}
+    s_dyn613c_arena_used+=alloc;
+
+    memset(b,0,sizeof(*b));
+    b->start_pc=start; b->branch_pc=block_ppc; b->fall_pc=block_end_pc; b->branch_op=block_ir;
+    b->guest_bytes=(uint16_t)(block_end_pc-start); b->guest_insns=(uint16_t)block_insns;
+    b->native_bytes=(uint16_t)raw; b->cycles_taken=(uint16_t)block_ct; b->cycles_not=(uint16_t)block_cn;
+    memcpy(b->mem_span,block_spans,8); b->mem_write_mask=block_wm;
+    b->code_hash=tab5_dyn613c_hash(start,b->guest_bytes);
+    b->fn=(tab5_dyn613c_native_fn_t)(uintptr_t)dst; b->fragment=(uint8_t)fragment;
+    b->sig_words=(uint8_t)sig_words; b->ram_guard_words=(uint8_t)ram_guard_words;
+
+    /* c9-c11 scheduler-fit fallback: build shorter prefixes from the same
+     * start PC.  They are selected only when larger variants cannot fit the
+     * current guest-cycle budget.  Reuse the same 4 KiB emitter so CPU1 stack
+     * usage does not grow versus c8. */
+    if (fragment && emit_cycles > TAB5_DYN613C_SHORT_CYCLE_CAP) {
+        unsigned short_n=0u;
+        uint32_t short_cycles=0u;
+        for (; short_n<emit_n; ++short_n) {
+            const uint32_t ic=tab5_dyn613c_dec_cycles(&d[short_n]);
+            if (short_cycles+ic > TAB5_DYN613C_SHORT_CYCLE_CAP) break;
+            short_cycles+=ic;
+        }
+        if (short_n>=TAB5_DYN613C_SHORT_MIN_INSNS && short_n<emit_n) {
+            uint8_t short_spans[8], short_wm=0u;
+            if (tab5_dyn613c_mem_meta_exact(d,short_n,short_spans,&short_wm)) {
+                const tab5_dyn613c_dec_t *slast=&d[short_n-1u];
+                const uint32_t short_end=slast->pc+slast->len;
+                memset(&e,0,sizeof(e));
+                rv613_emit_signature_guard(&e,start,short_end-start);
+                const unsigned short_sig=e.n;
+                const unsigned short_rg_at=e.n;
+                rv613_emit_ram_guard(&e,short_spans,short_wm,start,short_end);
+                const unsigned short_rg=e.n-short_rg_at;
+                for (unsigned i=0;i<short_n && !e.failed;++i)
+                    if (!tab5_dyn613c_emit_insn(&e,&d[i])) { e.failed=1; break; }
+                if (!e.failed)
+                    rv613_write_pc_exit(&e,slast->pc,slast->op,short_end,short_cycles);
+                if (!e.failed && short_sig<=255u && short_rg<=255u) {
+                    const uint32_t sraw=e.n*4u, salloc=(sraw+63u)&~63u;
+                    if (s_dyn613c_arena_used+salloc<=s_dyn613c_arena_bytes) {
+                        uint8_t *sdst=s_dyn613c_arena+s_dyn613c_arena_used;
+                        memset(sdst,0,salloc); memcpy(sdst,e.w,sraw);
+                        if (s_dyn613c_sync(sdst,salloc)) {
+                            b->short_valid=1u;
+                            b->short_guest_bytes=(uint16_t)(short_end-start);
+                            b->short_guest_insns=(uint16_t)short_n;
+                            b->short_native_bytes=(uint16_t)sraw;
+                            b->short_cycles=(uint16_t)short_cycles;
+                            b->short_sig_words=(uint8_t)short_sig;
+                            b->short_ram_guard_words=(uint8_t)short_rg;
+                            b->short_fn=(tab5_dyn613c_native_fn_t)(uintptr_t)sdst;
+                            s_dyn613c_arena_used+=salloc;
+                            s_dyn613c_native_bytes_total+=sraw;
+                            ++s_dyn613c_short_ok;
+#if PX68K_TAB5_DYNAREC_LOG
+                            printf("PX68K_DYN613C14R: SHORT $%06lX-$%06lX guest=%uB/%u insn native=%uB sig=%uB ramg=%uB cycles=%u primary=%u arena=%lu/%lu\n",
+                                   (unsigned long)start,(unsigned long)short_end,
+                                   (unsigned)b->short_guest_bytes,(unsigned)b->short_guest_insns,
+                                   (unsigned)b->short_native_bytes,(unsigned)b->short_sig_words*4u,
+                                   (unsigned)b->short_ram_guard_words*4u,(unsigned)b->short_cycles,
+                                   (unsigned)block_ct,(unsigned long)s_dyn613c_arena_used,
+                                   (unsigned long)s_dyn613c_arena_bytes);
+#endif
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /* c10/c11 third scheduler tier: a <=32-cycle TINY prefix.  It is emitted only
+     * when at least three complete translated instructions fit and it is
+     * strictly shorter than the SHORT variant (when one exists). */
+    if (fragment && emit_cycles > TAB5_DYN613C_TINY_CYCLE_CAP) {
+        unsigned tiny_n=0u;
+        uint32_t tiny_cycles=0u;
+        for (; tiny_n<emit_n; ++tiny_n) {
+            const uint32_t ic=tab5_dyn613c_dec_cycles(&d[tiny_n]);
+            if (tiny_cycles+ic > TAB5_DYN613C_TINY_CYCLE_CAP) break;
+            tiny_cycles+=ic;
+        }
+        if (tiny_n>=TAB5_DYN613C_TINY_MIN_INSNS && tiny_n<emit_n &&
+            (!b->short_valid || tiny_n<b->short_guest_insns)) {
+            uint8_t tiny_spans[8], tiny_wm=0u;
+            if (tab5_dyn613c_mem_meta_exact(d,tiny_n,tiny_spans,&tiny_wm)) {
+                const tab5_dyn613c_dec_t *tlast=&d[tiny_n-1u];
+                const uint32_t tiny_end=tlast->pc+tlast->len;
+                memset(&e,0,sizeof(e));
+                rv613_emit_signature_guard(&e,start,tiny_end-start);
+                const unsigned tiny_sig=e.n;
+                const unsigned tiny_rg_at=e.n;
+                rv613_emit_ram_guard(&e,tiny_spans,tiny_wm,start,tiny_end);
+                const unsigned tiny_rg=e.n-tiny_rg_at;
+                for (unsigned i=0;i<tiny_n && !e.failed;++i)
+                    if (!tab5_dyn613c_emit_insn(&e,&d[i])) { e.failed=1; break; }
+                if (!e.failed)
+                    rv613_write_pc_exit(&e,tlast->pc,tlast->op,tiny_end,tiny_cycles);
+                if (!e.failed && tiny_sig<=255u && tiny_rg<=255u) {
+                    const uint32_t traw=e.n*4u, talloc=(traw+63u)&~63u;
+                    if (s_dyn613c_arena_used+talloc<=s_dyn613c_arena_bytes) {
+                        uint8_t *tdst=s_dyn613c_arena+s_dyn613c_arena_used;
+                        memset(tdst,0,talloc); memcpy(tdst,e.w,traw);
+                        if (s_dyn613c_sync(tdst,talloc)) {
+                            b->tiny_valid=1u;
+                            b->tiny_guest_bytes=(uint16_t)(tiny_end-start);
+                            b->tiny_guest_insns=(uint16_t)tiny_n;
+                            b->tiny_native_bytes=(uint16_t)traw;
+                            b->tiny_cycles=(uint16_t)tiny_cycles;
+                            b->tiny_sig_words=(uint8_t)tiny_sig;
+                            b->tiny_ram_guard_words=(uint8_t)tiny_rg;
+                            b->tiny_fn=(tab5_dyn613c_native_fn_t)(uintptr_t)tdst;
+                            s_dyn613c_arena_used+=talloc;
+                            s_dyn613c_native_bytes_total+=traw;
+                            ++s_dyn613c_tiny_ok;
+#if PX68K_TAB5_DYNAREC_LOG
+                            printf("PX68K_DYN613C14R: TINY $%06lX-$%06lX guest=%uB/%u insn native=%uB sig=%uB ramg=%uB cycles=%u short=%u primary=%u arena=%lu/%lu\n",
+                                   (unsigned long)start,(unsigned long)tiny_end,
+                                   (unsigned)b->tiny_guest_bytes,(unsigned)b->tiny_guest_insns,
+                                   (unsigned)b->tiny_native_bytes,(unsigned)b->tiny_sig_words*4u,
+                                   (unsigned)b->tiny_ram_guard_words*4u,(unsigned)b->tiny_cycles,
+                                   (unsigned)b->short_cycles,(unsigned)block_ct,
+                                   (unsigned long)s_dyn613c_arena_used,(unsigned long)s_dyn613c_arena_bytes);
+#endif
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    b->valid=1;
+    ++s_dyn613c_active; ++s_dyn613c_compile_ok; s_dyn613c_native_bytes_total+=raw;
+    if (fragment) {
+        ++s_dyn613c_fragment_ok;
+        unsigned guard_mask=0u;
+        for (unsigned a=0;a<8u;++a) if (b->mem_span[a]) guard_mask|=1u<<a;
+#if PX68K_TAB5_DYNAREC_LOG
+        printf("PX68K_DYN613C14R: FRAGMENT $%06lX-$%06lX guest=%uB/%u insn native=%uB sig=%uB ramg=%uB cycles=%u short=%u/%u tiny=%u/%u guard=R%02X/W%02X source-loop=$%06lX-$%06lX arena=%lu/%lu\n",
+               (unsigned long)start,(unsigned long)block_end_pc,(unsigned)b->guest_bytes,(unsigned)block_insns,
+               (unsigned)raw,(unsigned)(sig_words*4u),(unsigned)(ram_guard_words*4u),(unsigned)block_ct,
+               (unsigned)b->short_cycles,(unsigned)b->short_guest_insns,
+               (unsigned)b->tiny_cycles,(unsigned)b->tiny_guest_insns,guard_mask,(unsigned)b->mem_write_mask,
+               (unsigned long)start,(unsigned long)branch_pc,
+               (unsigned long)s_dyn613c_arena_used,(unsigned long)s_dyn613c_arena_bytes);
+#endif
+    } else {
+#if PX68K_TAB5_DYNAREC_LOG
+        printf("PX68K_DYN613C14R: COMPILED $%06lX-$%06lX op=$%04X guest=%uB/%u insn native=%uB sig=%uB ramg=%uB cycles=%u/%u arena=%lu/%lu\n",
+               (unsigned long)start,(unsigned long)branch_pc,(unsigned)branch_op,(unsigned)b->guest_bytes,
+               (unsigned)block_insns,(unsigned)raw,(unsigned)(sig_words*4u),(unsigned)(ram_guard_words*4u),(unsigned)block_ct,(unsigned)block_cn,
+               (unsigned long)s_dyn613c_arena_used,(unsigned long)s_dyn613c_arena_bytes);
+#endif
+    }
+    return 1;
+}
+
+static inline void tab5_dyn613c_candidate_epoch_advance(void)
+{
+    uint8_t next=(uint8_t)(s_dyn613c_cand_epoch+1u);
+    if (!next) {
+        /* 255 phase rotations is already far beyond a normal run; clear only
+         * on wrap so stale epoch tags can never alias a new generation. */
+        memset(s_dyn613c_cands,0,sizeof(s_dyn613c_cands));
+        next=1u;
+    }
+    s_dyn613c_cand_epoch=next;
+    s_dyn613c_cand_miss_run=0u;
+    ++s_dyn613c_cand_rotations;
+}
+
+static tab5_dyn613c_block_t *tab5_dyn613c_observe_taken_bcc(uint32_t from, uint32_t to, uint16_t op)
+{
+    from&=0x00ffffffu; to&=0x00ffffffu;
+    if (!s_dyn613c_arena || to>=from || from-to>TAB5_DYN613C_MAX_GUEST_BYTES || (to&1u)) return NULL;
+
+    /* c13: one authoritative lookup serves both discovery and immediate tail
+     * dispatch.  c12 performed a second block-table lookup after observe(). */
+    tab5_dyn613c_block_t *b=tab5_dyn613c_find(to);
+    if (b) return b;
+
+    /* Memoized rejected/saturated edges avoid repeated candidate-table walks
+     * for the lifetime of the current turnover epoch. */
+    if (tab5_dyn613c_edge_memo_skip(from,to,op)) return NULL;
+
+    const unsigned base=((from>>1)^(to>>3))&(TAB5_DYN613C_CAND_SLOTS-1u);
+    tab5_dyn613c_candidate_t *c=NULL;
+    for(unsigned p=0;p<TAB5_DYN613C_CAND_PROBES;++p){
+        tab5_dyn613c_candidate_t *q=&s_dyn613c_cands[(base+p)&(TAB5_DYN613C_CAND_SLOTS-1u)];
+        if(q->epoch!=s_dyn613c_cand_epoch || !q->count){
+            q->from_pc=from;q->to_pc=to;q->op=op;q->count=1;q->attempted=0;q->epoch=s_dyn613c_cand_epoch;c=q;break;
+        }
+        if(q->from_pc==from&&q->to_pc==to&&q->op==op){if(q->count<0xffffu)++q->count;c=q;break;}
+    }
+    if(!c){
+        ++s_dyn613c_cand_insert_miss;
+        if (++s_dyn613c_cand_miss_run < TAB5_DYN613C_CAND_EPOCH_MISSES) {
+            tab5_dyn613c_edge_memo_store(from,to,op,TAB5_DYN613C_MEMO_MISS);
+            return NULL;
+        }
+        tab5_dyn613c_candidate_epoch_advance();
+        /* Start the new phase with the very edge that proved the old probe
+         * neighborhood was saturated. */
+        c=&s_dyn613c_cands[base];
+        c->from_pc=from;c->to_pc=to;c->op=op;c->count=1;c->attempted=0;c->epoch=s_dyn613c_cand_epoch;
+    }
+    if(c->attempted){
+        tab5_dyn613c_edge_memo_store(from,to,op,TAB5_DYN613C_MEMO_REJECT);
+        return NULL;
+    }
+    if(c->count<TAB5_DYN613C_HOT_THRESHOLD)return NULL;
+    c->attempted=1;
+    if (!tab5_dyn613c_install(to,from,op)) {
+        tab5_dyn613c_edge_memo_store(from,to,op,TAB5_DYN613C_MEMO_REJECT);
+        return NULL;
+    }
+    b=tab5_dyn613c_find(to);
+    return b;
+}
+
+static void tab5_dyn613c_dump(void)
+{
+    unsigned cand_used=0, cand_attempted=0;
+    for (unsigned i=0; i<TAB5_DYN613C_CAND_SLOTS; ++i) {
+        if (s_dyn613c_cands[i].epoch==s_dyn613c_cand_epoch && s_dyn613c_cands[i].count) {
+            ++cand_used; if (s_dyn613c_cands[i].attempted) ++cand_attempted;
+        }
+    }
+    printf("PX68K_DYN613C: STATS blocks=%lu compile=%lu frags=%lu short=%lu shortsel=%lu shortexec=%lu tiny=%lu tinysel=%lu tinyexec=%lu reject=%lu decode=%lu poll=%lu mem=%lu perf=%lu cache=%lu exec=%lu fallback=%lu cyclefail=%lu hashfail=%lu memfail=%lu guest-insn=%llu cycles=%llu native-bytes=%llu arena=%lu/%lu flush=%lu cand=%u/%u attempted=%u insertmiss=%lu epoch=%u rotate=%lu missrun=%lu l0=%lu/%lu memo=%lu/%lu\n",
+           (unsigned long)s_dyn613c_active,(unsigned long)s_dyn613c_compile_ok,(unsigned long)s_dyn613c_fragment_ok,
+           (unsigned long)s_dyn613c_short_ok,(unsigned long)s_dyn613c_short_select,(unsigned long)s_dyn613c_short_exec,
+           (unsigned long)s_dyn613c_tiny_ok,(unsigned long)s_dyn613c_tiny_select,(unsigned long)s_dyn613c_tiny_exec,
+           (unsigned long)s_dyn613c_compile_reject,(unsigned long)s_dyn613c_reject_decode,(unsigned long)s_dyn613c_reject_poll,
+           (unsigned long)s_dyn613c_reject_mem,(unsigned long)s_dyn613c_perf_reject,(unsigned long)s_dyn613c_reject_cache,
+           (unsigned long)s_dyn613c_exec,(unsigned long)s_dyn613c_fallback,(unsigned long)s_dyn613c_cycle_fail,
+           (unsigned long)s_dyn613c_hash_fail,(unsigned long)s_dyn613c_mem_fail,(unsigned long long)s_dyn613c_guest_instr,
+           (unsigned long long)s_dyn613c_cycles,(unsigned long long)s_dyn613c_native_bytes_total,
+           (unsigned long)s_dyn613c_arena_used,(unsigned long)s_dyn613c_arena_bytes,(unsigned long)s_dyn613c_flush,
+           cand_used,(unsigned)TAB5_DYN613C_CAND_SLOTS,cand_attempted,(unsigned long)s_dyn613c_cand_insert_miss,
+           (unsigned)s_dyn613c_cand_epoch,(unsigned long)s_dyn613c_cand_rotations,(unsigned long)s_dyn613c_cand_miss_run,
+           (unsigned long)s_dyn613c_l0_hits,(unsigned long)s_dyn613c_l0_misses,
+           (unsigned long)s_dyn613c_memo_reject_hits,(unsigned long)s_dyn613c_memo_miss_hits);
+
+    /* Report the busiest native blocks.  Research builds may include sampled
+     * host-cycle costs; production mode keeps the functional counters but
+     * compiles the esp_cpu_get_cycle_count() probes out of the hot path. */
+    uint8_t used[TAB5_DYN613C_BLOCK_SLOTS]={0};
+    for (unsigned rank=0; rank<8u; ++rank) {
+        int best=-1; uint32_t score=0;
+        for (unsigned i=0;i<TAB5_DYN613C_BLOCK_SLOTS;++i) {
+            const tab5_dyn613c_block_t *b=&s_dyn613c_blocks[i];
+            if(used[i] || !b->valid) continue;
+            const uint32_t sc=b->exec_count ? b->exec_count : b->enter_count;
+            if(best<0 || sc>score){best=(int)i;score=sc;}
+        }
+        if(best<0 || !score) break;
+        used[best]=1; const tab5_dyn613c_block_t *b=&s_dyn613c_blocks[best];
+        const uint32_t pri_exec=b->exec_count-b->short_exec_count-b->tiny_exec_count;
+        const uint32_t pri_mem=b->mem_fail_count-b->short_mem_fail_count-b->tiny_mem_fail_count;
+#if PX68K_TAB5_DYNAREC_COST_PROFILE
+        const uint32_t ns=b->sample_count, ss=b->short_sample_count, ts=b->tiny_sample_count;
+        printf("PX68K_DYN613C14R: B%02u pc=$%06lX kind=%s guest=%uB/%u native=%uB need=%u short=%uB/%u/%ucy tiny=%uB/%u/%ucy enter=%lu exec=%lu pri=%lu shortsel=%lu shortexec=%lu tinysel=%lu tinyexec=%lu cyclefail=%lu memfail=%lu/%lu/%lu avgcc pri=%lu/%lu short=%lu/%lu tiny=%lu/%lu\n",
+               rank+1u,(unsigned long)b->start_pc,b->fragment?"FRAG":"LOOP",
+               (unsigned)b->guest_bytes,(unsigned)b->guest_insns,(unsigned)b->native_bytes,
+               (unsigned)((b->cycles_taken>b->cycles_not)?b->cycles_taken:b->cycles_not),
+               (unsigned)b->short_guest_bytes,(unsigned)b->short_guest_insns,(unsigned)b->short_cycles,
+               (unsigned)b->tiny_guest_bytes,(unsigned)b->tiny_guest_insns,(unsigned)b->tiny_cycles,
+               (unsigned long)b->enter_count,(unsigned long)b->exec_count,(unsigned long)pri_exec,
+               (unsigned long)b->short_select_count,(unsigned long)b->short_exec_count,
+               (unsigned long)b->tiny_select_count,(unsigned long)b->tiny_exec_count,(unsigned long)b->cycle_fail_count,
+               (unsigned long)pri_mem,(unsigned long)b->short_mem_fail_count,(unsigned long)b->tiny_mem_fail_count,
+               (unsigned long)(ns?b->sample_hash_cc/ns:0u),(unsigned long)(ns?b->sample_native_cc/ns:0u),
+               (unsigned long)(ss?b->short_sample_front_cc/ss:0u),(unsigned long)(ss?b->short_sample_native_cc/ss:0u),
+               (unsigned long)(ts?b->tiny_sample_front_cc/ts:0u),(unsigned long)(ts?b->tiny_sample_native_cc/ts:0u));
+#else
+        printf("PX68K_DYN613C14R: B%02u pc=$%06lX kind=%s guest=%uB/%u native=%uB need=%u short=%uB/%u/%ucy tiny=%uB/%u/%ucy enter=%lu exec=%lu pri=%lu shortsel=%lu shortexec=%lu tinysel=%lu tinyexec=%lu cyclefail=%lu memfail=%lu/%lu/%lu costprobe=OFF\n",
+               rank+1u,(unsigned long)b->start_pc,b->fragment?"FRAG":"LOOP",
+               (unsigned)b->guest_bytes,(unsigned)b->guest_insns,(unsigned)b->native_bytes,
+               (unsigned)((b->cycles_taken>b->cycles_not)?b->cycles_taken:b->cycles_not),
+               (unsigned)b->short_guest_bytes,(unsigned)b->short_guest_insns,(unsigned)b->short_cycles,
+               (unsigned)b->tiny_guest_bytes,(unsigned)b->tiny_guest_insns,(unsigned)b->tiny_cycles,
+               (unsigned long)b->enter_count,(unsigned long)b->exec_count,(unsigned long)pri_exec,
+               (unsigned long)b->short_select_count,(unsigned long)b->short_exec_count,
+               (unsigned long)b->tiny_select_count,(unsigned long)b->tiny_exec_count,(unsigned long)b->cycle_fail_count,
+               (unsigned long)pri_mem,(unsigned long)b->short_mem_fail_count,(unsigned long)b->tiny_mem_fail_count);
+#endif
+    }
+}
+
 
 /* profile-safe code peek */
 static inline __attribute__((always_inline)) uint16_t tab5_poll58_fetch16(uint32_t a);
@@ -760,6 +2418,16 @@ static DRAM_ATTR uint32_t s_tab5_dispatch_misses = 0;
 
 static DRAM_ATTR tab5_m68k_dispatch_entry_t s_tab5_dispatch_l2[TAB5_M68K_DISPATCH_L2_SIZE];
 static DRAM_ATTR uint32_t s_tab5_dispatch_l2_hits = 0;
+
+uint32_t m68k_tab5_dispatch_tcm_bytes(void)
+{
+    return (uint32_t)sizeof(s_tab5_dispatch_cache);
+}
+
+uint32_t m68k_tab5_dispatch_l2_bytes(void)
+{
+    return (uint32_t)sizeof(s_tab5_dispatch_l2);
+}
 
 /* Build 5.59 poll accelerator diagnostics live in ordinary internal DRAM,
  * not scarce TCM. */
@@ -2467,19 +4135,35 @@ void m68k_tab5_opcode_profile_set(int enabled)
     if (enabled && !s_tab5_opcode_profile_enabled) {
         memset(s_tab5_opcode_counts, 0, sizeof(s_tab5_opcode_counts));
         s_tab5_opcode_total = 0;
+        tab5_hotpc613_reset();
+        tab5_backedge613_reset();
         tab5_movew65b_reset();
         tab5_piecpu598g4b_reset();
         s_tab5_opcode_profile_enabled = 1;
     } else if (!enabled && s_tab5_opcode_profile_enabled) {
         s_tab5_opcode_profile_enabled = 0;
         tab5_opcode_profile_dump();
+        tab5_hotpc613_dump();
+        tab5_backedge613_dump();
+        tab5_dyn613c_dump();
         tab5_movew65b_dump();
         tab5_piecpu598g4b_dump();
     }
 }
+
+void m68k_tab5_dynarec_dump(void)
+{
+    tab5_dyn613c_dump();
+}
 #else
 void m68k_tab5_opcode_profile_set(int enabled) { (void)enabled; }
 void m68k_tab5_dispatch_profile_set(int enabled) { (void)enabled; }
+uint32_t m68k_tab5_profile_storage_bytes(void) { return 0u; }
+unsigned int m68k_tab5_dynarec_metadata_bytes(void) { return 0u; }
+void m68k_tab5_dynarec_bind(void *arena, unsigned int bytes,
+                            int (*sync_fn)(void *addr, unsigned int bytes))
+{ (void)arena; (void)bytes; (void)sync_fn; }
+void m68k_tab5_dynarec_dump(void) { }
 #endif
 
 /* ======================================================================== */
@@ -3233,6 +4917,10 @@ void m68k_set_cpu_type(unsigned int cpu_type)
 {
 #ifdef ESP_PLATFORM
 	tab5_dispatch_cache_reset();
+#if PX68K_TAB5_DYNAREC
+	/* c12: JIT lifetime is independent of the research profiler. */
+	tab5_dyn613c_cache_reset(0);
+#endif
 #endif
 	switch(cpu_type)
 	{
@@ -3502,6 +5190,8 @@ int m68k_execute(int num_cycles)
 			if (__builtin_expect(PX68K_TAB5_PERF_PROFILE && s_tab5_opcode_profile_enabled, 0)) {
 				s_tab5_opcode_counts[REG_IR]++;
 				s_tab5_opcode_total++;
+				tab5_hotpc613_observe(REG_PPC, (uint16_t)REG_IR);
+				tab5_backedge613_observe(REG_PPC);
 				tab5_movew65b_observe((uint16_t)REG_IR, REG_PPC);
 				tab5_piecpu598g4b_observe((uint16_t)REG_IR);
 			}
@@ -3514,6 +5204,10 @@ int m68k_execute(int num_cycles)
 				tab5_m68k_handler_t handler;
 				uint32_t instr_cycles;
 				uint32_t post_flags;
+#if PX68K_TAB5_DYNAREC
+				uint32_t dyn_backedge_target = 0xffffffffu;
+				uint32_t dyn_backedge_from = 0xffffffffu;
+#endif
 
 				if (__builtin_expect((sig & 0x8000ffffu) == (0x80000000u | (uint32_t)op), 1)) {
 					handler = ce->handler;
@@ -3605,6 +5299,19 @@ int m68k_execute(int num_cycles)
 					}
 					USE_CYCLES(instr_cycles);
 
+					/* Build 6.13c: learn only actually-taken backward conditional
+					 * edges.  Compilation happens after the current architectural
+					 * iteration, so a failed/rejected translation cannot alter it. */
+#if PX68K_TAB5_DYNAREC
+					if (__builtin_expect((post_flags & (TAB5_POST598F_BNE_FAST |
+					                                      TAB5_POST598F_BEQ_FAST |
+					                                      TAB5_POST598F_BCC_FAST)) &&
+					                     ((REG_PC & 0x00ffffffu) < (REG_PPC & 0x00ffffffu)), 0)) {
+						dyn_backedge_from = REG_PPC & 0x00ffffffu;
+						dyn_backedge_target = REG_PC & 0x00ffffffu;
+					}
+#endif
+
 					/* Build 5.98g6: the current BNE cycles are now charged, so any
 					 * future CLR/CMPA/BNE iterations may be bounded exactly by the
 					 * remaining scheduler slice. */
@@ -3630,6 +5337,28 @@ int m68k_execute(int num_cycles)
 						else if (!tab5_dbf74_try_store_body(op))
 							tab5_fill59_try_dbf(op);
 					}
+
+#if PX68K_TAB5_DYNAREC
+					/* Build 6.13c14r: discovery and dispatch both live at the true tail,
+					 * after the specialized poll/DBF/clear/stream helpers above.  If one
+					 * of those helpers consumed the loop or exhausted the scheduler slice,
+					 * generic JIT discovery pays nothing.  observe() performs the single
+					 * authoritative block lookup and returns a compiled block directly,
+					 * so c12's second lookup is gone as well. */
+					if (__builtin_expect(dyn_backedge_target != 0xffffffffu &&
+					                     dyn_backedge_from != 0xffffffffu &&
+					                     ((REG_PC & 0x00ffffffu) == dyn_backedge_target) &&
+					                     GET_CYCLES() > 0, 0)) {
+						tab5_dyn613c_block_t *dynb = tab5_dyn613c_observe_taken_bcc(
+						    dyn_backedge_from, dyn_backedge_target, op);
+						while (dynb && dynb->valid &&
+						       ((REG_PC & 0x00ffffffu) == dyn_backedge_target) &&
+						       GET_CYCLES() > 0) {
+							if (!tab5_dyn613c_try_execute_block(dynb))
+								break;
+						}
+					}
+#endif
 				}
 			}
 #else
@@ -3768,6 +5497,9 @@ void m68k_pulse_bus_error(void)
 /* Pulse the RESET line on the CPU */
 void m68k_pulse_reset(void)
 {
+#if defined(ESP_PLATFORM) && PX68K_TAB5_DYNAREC
+	tab5_dyn613c_cache_reset(0);
+#endif
 	/* Disable the PMMU on reset */
 	m68ki_cpu.pmmu_enabled = 0;
 

@@ -21,6 +21,13 @@ typedef struct
     uint32_t live_presented_frames;
     uint32_t live_row_retries;
     uint32_t live_unstable_rows;
+    /* Build 6.14d: host-side display cadence / latest-frame pacing stats. */
+    uint32_t pace_waits;
+    uint32_t pace_wait_us;
+    uint32_t pace_last_wait_us;
+    uint32_t pace_coalesced_frames;
+    uint32_t pace_skipped_slots;
+    uint32_t pace_last_interval_us;
 } tab5_video_async_stats_t;
 
 typedef enum

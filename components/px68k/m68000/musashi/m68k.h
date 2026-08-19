@@ -306,6 +306,12 @@ void m68k_init(void);
  */
 void m68k_pulse_reset(void);
 
+/* Build 6.13c: bind the P4 runtime-code arena after the Tab5 cache-sync
+ * probe has succeeded.  Passing NULL keeps stock Musashi behavior. */
+void m68k_tab5_dynarec_bind(void *arena, unsigned int bytes,
+                            int (*sync_fn)(void *addr, unsigned int bytes));
+unsigned int m68k_tab5_dynarec_metadata_bytes(void);
+
 /* execute num_cycles worth of instructions.  returns number of cycles used */
 int m68k_execute(int num_cycles);
 

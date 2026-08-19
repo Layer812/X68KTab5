@@ -29,3 +29,35 @@ CONFIG_SPIRAM_BOOT_INIT=y
 CONFIG_SPIRAM_USE_MALLOC=y
 CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
 CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=32768
+
+# Build 6.13b2: experimental Dynarec research build. Runtime-generated RV32
+# code requires the same internal SRAM region to be writable and executable.
+# ESP-IDF 5.4.2 enables PMP/PMS instruction/data split protection by default;
+# disable both 5.x protection knobs for this research build.
+# SECURITY: this intentionally removes SRAM W^X hardening for X68K Tab.
+# CONFIG_ESP_SYSTEM_PMP_IDRAM_SPLIT is not set
+# CONFIG_ESP_SYSTEM_MEMPROT_FEATURE is not set
+# CONFIG_ESP_SYSTEM_MEMPROT_FEATURE_LOCK is not set
+
+# Build 6.13c14r2: pin the ESP32-P4 L2 cache to the exact layout used by the
+# known-good c13/c14 hardware runs.  On rev<3 P4 silicon, 512 KiB L2 consumes
+# the entire SRAM_HIGH window; 128 KiB L2 leaves the proven 384 KiB SRAM_HIGH
+# region available for .dram1 data and heap.
+CONFIG_CACHE_L2_CACHE_128KB=y
+# CONFIG_CACHE_L2_CACHE_256KB is not set
+# CONFIG_CACHE_L2_CACHE_512KB is not set
+CONFIG_CACHE_L2_CACHE_SIZE=0x20000
+CONFIG_CACHE_L2_CACHE_LINE_64B=y
+# CONFIG_CACHE_L2_CACHE_LINE_128B is not set
+CONFIG_CACHE_L2_CACHE_LINE_SIZE=64
+
+# Keep the generated ESP-IDF sdkconfig consistent with the Tab5 board setting.
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+# CONFIG_ESPTOOLPY_FLASHSIZE_1MB is not set
+# CONFIG_ESPTOOLPY_FLASHSIZE_2MB is not set
+# CONFIG_ESPTOOLPY_FLASHSIZE_4MB is not set
+# CONFIG_ESPTOOLPY_FLASHSIZE_8MB is not set
+# CONFIG_ESPTOOLPY_FLASHSIZE_32MB is not set
+# CONFIG_ESPTOOLPY_FLASHSIZE_64MB is not set
+# CONFIG_ESPTOOLPY_FLASHSIZE_128MB is not set
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"

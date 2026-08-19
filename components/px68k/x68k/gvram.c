@@ -17,7 +17,47 @@
 #include	"m68000.h"
 #include	<string.h>
 
-uint8_t	GVRAM[0x80000];
+#ifdef ESP_PLATFORM
+/* Build 6.14b2: async raw-GVRAM scanline DMA must observe the exact raster
+ * snapshot.  Fast zero-pending test stays in this hot component; only a live
+ * DMA read pays the cross-component barrier call. */
+extern volatile uint32_t tab5_compose_gvram_dma_pending;
+extern volatile uint32_t tab5_compose_gvram_cache_pending;
+extern void tab5_compose_guest_gvram_barrier(void);
+#define GVRAM_HOST_SOURCE_BARRIER() do { \
+    if (__builtin_expect((__atomic_load_n(&tab5_compose_gvram_dma_pending, __ATOMIC_ACQUIRE) | \
+                          __atomic_load_n(&tab5_compose_gvram_cache_pending, __ATOMIC_ACQUIRE)) != 0u, 0)) \
+        tab5_compose_guest_gvram_barrier(); \
+} while (0)
+#else
+#define GVRAM_HOST_SOURCE_BARRIER() do { } while (0)
+#endif
+
+uint8_t	GVRAM[0x80000] __attribute__((aligned(64)));
+volatile uint32_t GVRAM_RowGeneration[512];
+
+static inline void gvram_row_generation_bump(uint32_t row)
+{
+#ifdef ESP_PLATFORM
+    __atomic_add_fetch(&GVRAM_RowGeneration[row & 511u], 1u, __ATOMIC_RELEASE);
+#else
+    ++GVRAM_RowGeneration[row & 511u];
+#endif
+}
+
+uint32_t GVRAM_RowGenerationGet(uint32_t row)
+{
+#ifdef ESP_PLATFORM
+    return __atomic_load_n(&GVRAM_RowGeneration[row & 511u], __ATOMIC_ACQUIRE);
+#else
+    return GVRAM_RowGeneration[row & 511u];
+#endif
+}
+
+static void gvram_row_generation_reset_all(void)
+{
+    for (uint32_t i = 0; i < 512u; ++i) GVRAM_RowGeneration[i] = 1u;
+}
 /* Build 5.25: hot scanline scratch is defined by the app component so it
  * remains in internal SRAM instead of libpx68k.a external-BSS/PSRAM. */
 extern uint16_t Grp_LineBuf[1024];
@@ -55,6 +95,10 @@ int GVRAM_StateAction(StateMem *sm, int load, int data_only)
 
 	int ret = PX68KSS_StateAction(sm, load, data_only, StateRegs, "X68K_GVRAM", false);
 
+    if (load) {
+        /* Host-only row cache is not serialized. Force every cached row stale. */
+        for (uint32_t i = 0; i < 512u; ++i) gvram_row_generation_bump(i);
+    }
 	return ret;
 }
 
@@ -73,6 +117,7 @@ void GVRAM_Init(void)
 	s_debug_last_addr = 0;
 	s_debug_last_data = 0;
 	s_debug_last_mode = 0;
+    gvram_row_generation_reset_all();
 
 	memset(GVRAM, 0, 0x80000);
 	for (i=0; i<128; i++) /* For 16bit color palette address calculation */
@@ -84,6 +129,7 @@ void GVRAM_Init(void)
 
 void FASTCALL GVRAM_FastClear(void)
 {
+	GVRAM_HOST_SOURCE_BARRIER();
 	s_debug_fast_clear_count++;
 	uint32_t v = ((CRTC_Regs[0x29]&4)?512:256);
 	uint32_t h = ((CRTC_Regs[0x29]&3)?512:256);
@@ -102,7 +148,8 @@ void FASTCALL GVRAM_FastClear(void)
 	}
 
 	for (y = 0; y < v; y++) {
-		offset = ((y + GrphScrollY[0]) & 0x1ff) << 10;
+        const uint32_t phys_row = (y + GrphScrollY[0]) & 0x1ffu;
+		offset = phys_row << 10;
 		p = (uint16_t *)(GVRAM + offset + ((GrphScrollX[0] & 0x1ff) * 2));
 
 		for (x = 0; x < w[0]; x++) {
@@ -115,6 +162,7 @@ void FASTCALL GVRAM_FastClear(void)
 				*p++ &= CRTC_FastClrMask;
 			}
 		}
+        gvram_row_generation_bump(phys_row);
 	}
 }
 
@@ -253,6 +301,7 @@ uint8_t FASTCALL GVRAM_Read(uint32_t adr)
 
 void FASTCALL GVRAM_Write(uint32_t adr, uint8_t data)
 {
+	GVRAM_HOST_SOURCE_BARRIER();
 	int line = 1023, scr = 0;
 	uint32_t temp;
 	int type;
@@ -362,6 +411,7 @@ void FASTCALL GVRAM_Write(uint32_t adr, uint8_t data)
 		if ((adr & 1) == 0)
 			break;
 
+        const uint32_t phys_row_256 = (adr & 0x7ffffu) >> 10;
 		if (adr < 0x100000)
 		{
 			scr = GrphScrollY[(adr >> 18) & 2];
@@ -385,6 +435,7 @@ void FASTCALL GVRAM_Write(uint32_t adr, uint8_t data)
 				adr &= 0x7ffff;
 				GVRAM[adr] = (uint8_t)data;
 			}
+            gvram_row_generation_bump(phys_row_256);
 		}
 #if 0
 		/* TODO: */
@@ -467,6 +518,7 @@ static inline void gvram_word_stream256_store_low(uint32_t odd, uint8_t lo)
     else
         GVRAM[odd & 0x7ffffu] = lo;
 
+    gvram_row_generation_bump((odd & 0x7ffffu) >> 10);
     TextDirtyLine[line] = 1;
 }
 
@@ -479,6 +531,7 @@ uint32_t GVRAM_WriteWordRepeat256(uint32_t adr, uint16_t data, uint32_t count)
     int type;
 
     if (!gvram_word_stream256_prepare(adr, count, &rel, &type)) return 0;
+    GVRAM_HOST_SOURCE_BARRIER();
     lo = (uint8_t)data;
 
     /* The even-byte half of every normal word write reaches GVRAM_Write(),
@@ -509,6 +562,7 @@ uint32_t GVRAM_WriteWordCopy256(uint32_t adr, const uint8_t *src_native_words,
 
     if (!src_native_words || !last_word) return 0;
     if (!gvram_word_stream256_prepare(adr, count, &rel, &type)) return 0;
+    GVRAM_HOST_SOURCE_BARRIER();
 
     TextDirtyLine[1023] = 1;
 
@@ -580,6 +634,7 @@ static void gvram_word_stream256_mark_span(uint32_t rel, uint32_t count)
         const uint32_t key_line = (odd & 0x7ffffu) >> 10;
         const uint32_t key_page = (odd >> 18) & 2u;
         gvram_word_stream256_mark_low(odd);
+        gvram_row_generation_bump(key_line);
         ++i;
         while (i < count)
         {
@@ -682,6 +737,7 @@ uint32_t GVRAM_WriteWordRepeat256P4(uint32_t adr, uint16_t data, uint32_t count,
     blocks = gvram_word_stream256_p4_plan(rel, NULL, count, 0,
                                           &prefix, &odd_lane);
     if (!blocks) return 0;
+    GVRAM_HOST_SOURCE_BARRIER();
     vec_words = blocks << 3;
 
     TextDirtyLine[1023] = 1;
@@ -729,6 +785,7 @@ uint32_t GVRAM_WriteWordCopy256P4(uint32_t adr, const uint8_t *src_native_words,
     blocks = gvram_word_stream256_p4_plan(rel, src_native_words, count, 1,
                                           &prefix, &odd_lane);
     if (!blocks || odd_lane != 0u) return 0;
+    GVRAM_HOST_SOURCE_BARRIER();
     vec_words = blocks << 3;
 
     TextDirtyLine[1023] = 1;
@@ -832,6 +889,7 @@ uint32_t GVRAM_CopyWordStream256(uint32_t src_adr, uint32_t dst_adr,
 
     if (!last_word || !count || (src_adr & 1u)) return 0;
     if (!gvram_word_stream256_prepare(dst_adr, count, &dst_rel, &type)) return 0;
+    GVRAM_HOST_SOURCE_BARRIER();
 
     src_rel = src_adr & 0x1fffffu;
     if (count > ((0x200000u - src_rel) >> 1)) return 0;

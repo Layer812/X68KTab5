@@ -41,7 +41,7 @@ events:
       Compilation of the C compiler identification source "CMakeCCompilerId.c" produced "a.out"
       
       The C compiler identification is GNU, found in:
-        G:/px68k-tab5/.pio/build/m5stack-tab5/CMakeFiles/3.30.2/CompilerIdC/a.out
+        G:/X68KTab5/.pio/build/m5stack-tab5/CMakeFiles/3.30.2/CompilerIdC/a.out
       
   -
     kind: "message-v1"
@@ -74,7 +74,7 @@ events:
       Compilation of the CXX compiler identification source "CMakeCXXCompilerId.cpp" produced "a.out"
       
       The CXX compiler identification is GNU, found in:
-        G:/px68k-tab5/.pio/build/m5stack-tab5/CMakeFiles/3.30.2/CompilerIdCXX/a.out
+        G:/X68KTab5/.pio/build/m5stack-tab5/CMakeFiles/3.30.2/CompilerIdCXX/a.out
       
   -
     kind: "message-v1"
@@ -100,21 +100,21 @@ events:
     checks:
       - "Detecting C compiler ABI info"
     directories:
-      source: "G:/px68k-tab5/.pio/build/m5stack-tab5/CMakeFiles/CMakeScratch/TryCompile-vitv27"
-      binary: "G:/px68k-tab5/.pio/build/m5stack-tab5/CMakeFiles/CMakeScratch/TryCompile-vitv27"
+      source: "G:/X68KTab5/.pio/build/m5stack-tab5/CMakeFiles/CMakeScratch/TryCompile-hmt16k"
+      binary: "G:/X68KTab5/.pio/build/m5stack-tab5/CMakeFiles/CMakeScratch/TryCompile-hmt16k"
     cmakeVariables:
       CMAKE_C_FLAGS: "-march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f "
       CMAKE_C_FLAGS_DEBUG: "-g"
-      CMAKE_EXE_LINKER_FLAGS: "-nostartfiles -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f --specs=nosys.specs  -Wl,-Map=G:\\px68k-tab5\\.pio\\build\\m5stack-tab5\\firmware.map"
+      CMAKE_EXE_LINKER_FLAGS: "-nostartfiles -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f --specs=nosys.specs  -Wl,-Map=G:\\X68KTab5\\.pio\\build\\m5stack-tab5\\firmware.map"
       CMAKE_MODULE_PATH: "C:/Users/fooba/.platformio/packages/framework-espidf/tools/cmake;C:/Users/fooba/.platformio/packages/framework-espidf/tools/cmake/third_party"
     buildResult:
       variable: "CMAKE_C_ABI_COMPILED"
       cached: true
       stdout: |
-        Change Dir: 'G:/px68k-tab5/.pio/build/m5stack-tab5/CMakeFiles/CMakeScratch/TryCompile-vitv27'
+        Change Dir: 'G:/X68KTab5/.pio/build/m5stack-tab5/CMakeFiles/CMakeScratch/TryCompile-hmt16k'
         
-        Run Build Command(s): C:/Users/fooba/.platformio/packages/tool-ninja/ninja.exe -v cmTC_484f3
-        [1/2] C:\\Users\\fooba\\.platformio\\packages\\toolchain-riscv32-esp\\bin\\riscv32-esp-elf-gcc.exe   -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f     -v -o CMakeFiles/cmTC_484f3.dir/CMakeCCompilerABI.c.obj -c C:/Users/fooba/.platformio/packages/tool-cmake/share/cmake-3.30/Modules/CMakeCCompilerABI.c
+        Run Build Command(s): C:/Users/fooba/.platformio/packages/tool-ninja/ninja.exe -v cmTC_a1e1d
+        [1/2] C:\\Users\\fooba\\.platformio\\packages\\toolchain-riscv32-esp\\bin\\riscv32-esp-elf-gcc.exe   -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f     -v -o CMakeFiles/cmTC_a1e1d.dir/CMakeCCompilerABI.c.obj -c C:/Users/fooba/.platformio/packages/tool-cmake/share/cmake-3.30/Modules/CMakeCCompilerABI.c
         Using built-in specs.
         COLLECT_GCC=C:\\Users\\fooba\\.platformio\\packages\\toolchain-riscv32-esp\\bin\\riscv32-esp-elf-gcc.exe
         Target: riscv32-esp-elf
@@ -122,8 +122,8 @@ events:
         Thread model: posix
         Supported LTO compression algorithms: zlib zstd
         gcc version 14.2.0 (crosstool-NG esp-14.2.0_20241119) 
-        COLLECT_GCC_OPTIONS='-march=rv32imafc_zicsr_zifencei_xesppie' '-mabi=ilp32f' '-v' '-o' 'CMakeFiles/cmTC_484f3.dir/CMakeCCompilerABI.c.obj' '-c' '-misa-spec=20191213' '-march=rv32imafc_zicsr_zifencei_xesppie' '-dumpdir' 'CMakeFiles/cmTC_484f3.dir/'
-         C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../libexec/gcc/riscv32-esp-elf/14.2.0/cc1.exe -quiet -v -imultilib rv32imafc_zicsr_zifencei/ilp32f -iprefix C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/ -isysroot C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf C:/Users/fooba/.platformio/packages/tool-cmake/share/cmake-3.30/Modules/CMakeCCompilerABI.c -quiet -dumpdir CMakeFiles/cmTC_484f3.dir/ -dumpbase CMakeCCompilerABI.c.c -dumpbase-ext .c -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f -misa-spec=20191213 -march=rv32imafc_zicsr_zifencei_xesppie -version -o C:\\Users\\fooba\\AppData\\Local\\Temp\\cc7oiOtb.s
+        COLLECT_GCC_OPTIONS='-march=rv32imafc_zicsr_zifencei_xesppie' '-mabi=ilp32f' '-v' '-o' 'CMakeFiles/cmTC_a1e1d.dir/CMakeCCompilerABI.c.obj' '-c' '-misa-spec=20191213' '-march=rv32imafc_zicsr_zifencei_xesppie' '-dumpdir' 'CMakeFiles/cmTC_a1e1d.dir/'
+         C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../libexec/gcc/riscv32-esp-elf/14.2.0/cc1.exe -quiet -v -imultilib rv32imafc_zicsr_zifencei/ilp32f -iprefix C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/ -isysroot C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf C:/Users/fooba/.platformio/packages/tool-cmake/share/cmake-3.30/Modules/CMakeCCompilerABI.c -quiet -dumpdir CMakeFiles/cmTC_a1e1d.dir/ -dumpbase CMakeCCompilerABI.c.c -dumpbase-ext .c -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f -misa-spec=20191213 -march=rv32imafc_zicsr_zifencei_xesppie -version -o C:\\Users\\fooba\\AppData\\Local\\Temp\\cc1RAXVb.s
         GNU C17 (crosstool-NG esp-14.2.0_20241119) version 14.2.0 (riscv32-esp-elf)
         	compiled by GNU C version 6.3.0 20170516, GMP version 6.2.1, MPFR version 4.2.1, MPC version 1.2.1, isl version isl-0.26-GMP
         
@@ -140,13 +140,13 @@ events:
          C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/include
         End of search list.
         Compiler executable checksum: bd4b44cd937a52babfee906ad526682a
-        COLLECT_GCC_OPTIONS='-march=rv32imafc_zicsr_zifencei_xesppie' '-mabi=ilp32f' '-v' '-o' 'CMakeFiles/cmTC_484f3.dir/CMakeCCompilerABI.c.obj' '-c' '-misa-spec=20191213' '-march=rv32imafc_zicsr_zifencei_xesppie' '-dumpdir' 'CMakeFiles/cmTC_484f3.dir/'
-         C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/bin/as.exe -v --traditional-format -march=rv32imafc_zicsr_zifencei_xesppie -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f -misa-spec=20191213 -o CMakeFiles/cmTC_484f3.dir/CMakeCCompilerABI.c.obj C:\\Users\\fooba\\AppData\\Local\\Temp\\cc7oiOtb.s
+        COLLECT_GCC_OPTIONS='-march=rv32imafc_zicsr_zifencei_xesppie' '-mabi=ilp32f' '-v' '-o' 'CMakeFiles/cmTC_a1e1d.dir/CMakeCCompilerABI.c.obj' '-c' '-misa-spec=20191213' '-march=rv32imafc_zicsr_zifencei_xesppie' '-dumpdir' 'CMakeFiles/cmTC_a1e1d.dir/'
+         C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/bin/as.exe -v --traditional-format -march=rv32imafc_zicsr_zifencei_xesppie -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f -misa-spec=20191213 -o CMakeFiles/cmTC_a1e1d.dir/CMakeCCompilerABI.c.obj C:\\Users\\fooba\\AppData\\Local\\Temp\\cc1RAXVb.s
         GNU assembler version 2.43.1 (riscv32-esp-elf) using BFD version (crosstool-NG esp-14.2.0_20241119) 2.43.1
         COMPILER_PATH=C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../libexec/gcc/riscv32-esp-elf/14.2.0/;C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../libexec/gcc/;C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/bin/
         LIBRARY_PATH=C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/rv32imafc_zicsr_zifencei/ilp32f/;C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/lib/rv32imafc_zicsr_zifencei/ilp32f/;C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf/lib/rv32imafc_zicsr_zifencei/ilp32f/;C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/;C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/;C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/lib/;C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf/lib/;C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf/usr/lib/
-        COLLECT_GCC_OPTIONS='-march=rv32imafc_zicsr_zifencei_xesppie' '-mabi=ilp32f' '-v' '-o' 'CMakeFiles/cmTC_484f3.dir/CMakeCCompilerABI.c.obj' '-c' '-misa-spec=20191213' '-march=rv32imafc_zicsr_zifencei_xesppie' '-dumpdir' 'CMakeFiles/cmTC_484f3.dir/CMakeCCompilerABI.c.'
-        [2/2] C:\\Windows\\system32\\cmd.exe /C "cd . && C:\\Users\\fooba\\.platformio\\packages\\toolchain-riscv32-esp\\bin\\riscv32-esp-elf-gcc.exe -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f -nostartfiles -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f --specs=nosys.specs  -Wl,-Map=G:\\px68k-tab5\\.pio\\build\\m5stack-tab5\\firmware.map -v CMakeFiles/cmTC_484f3.dir/CMakeCCompilerABI.c.obj -o cmTC_484f3   && cd ."
+        COLLECT_GCC_OPTIONS='-march=rv32imafc_zicsr_zifencei_xesppie' '-mabi=ilp32f' '-v' '-o' 'CMakeFiles/cmTC_a1e1d.dir/CMakeCCompilerABI.c.obj' '-c' '-misa-spec=20191213' '-march=rv32imafc_zicsr_zifencei_xesppie' '-dumpdir' 'CMakeFiles/cmTC_a1e1d.dir/CMakeCCompilerABI.c.'
+        [2/2] C:\\Windows\\system32\\cmd.exe /C "cd . && C:\\Users\\fooba\\.platformio\\packages\\toolchain-riscv32-esp\\bin\\riscv32-esp-elf-gcc.exe -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f -nostartfiles -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f --specs=nosys.specs  -Wl,-Map=G:\\X68KTab5\\.pio\\build\\m5stack-tab5\\firmware.map -v CMakeFiles/cmTC_a1e1d.dir/CMakeCCompilerABI.c.obj -o cmTC_a1e1d   && cd ."
         Using built-in specs.
         Reading specs from C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/lib/nosys.specs
         rename spec link_gcc_c_sequence to nosys_link_gcc_c_sequence
@@ -159,10 +159,10 @@ events:
         gcc version 14.2.0 (crosstool-NG esp-14.2.0_20241119) 
         COMPILER_PATH=C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../libexec/gcc/riscv32-esp-elf/14.2.0/;C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../libexec/gcc/;C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/bin/
         LIBRARY_PATH=C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/rv32imafc_zicsr_zifencei/ilp32f/;C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/lib/rv32imafc_zicsr_zifencei/ilp32f/;C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf/lib/rv32imafc_zicsr_zifencei/ilp32f/;C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/;C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/;C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/lib/;C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf/lib/;C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf/usr/lib/
-        COLLECT_GCC_OPTIONS='-nostartfiles' '-march=rv32imafc_zicsr_zifencei_xesppie' '-mabi=ilp32f' '-specs=nosys.specs' '-v' '-o' 'cmTC_484f3' '-misa-spec=20191213' '-march=rv32imafc_zicsr_zifencei_xesppie' '-dumpdir' 'cmTC_484f3.'
-         C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../libexec/gcc/riscv32-esp-elf/14.2.0/collect2.exe -plugin C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../libexec/gcc/riscv32-esp-elf/14.2.0/liblto_plugin.dll -plugin-opt=C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../libexec/gcc/riscv32-esp-elf/14.2.0/lto-wrapper.exe -plugin-opt=-fresolution=C:\\Users\\fooba\\AppData\\Local\\Temp\\cc1t1eHc.res -plugin-opt=-pass-through=-lgcc -plugin-opt=-pass-through=-lc -plugin-opt=-pass-through=-lnosys -plugin-opt=-pass-through=-lc -plugin-opt=-pass-through=-lgcc -plugin-opt=-pass-through=-lgcc -plugin-opt=-pass-through=-lc -plugin-opt=-pass-through=-lnosys --sysroot=C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf -melf32lriscv -X -o cmTC_484f3 -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/rv32imafc_zicsr_zifencei/ilp32f -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/lib/rv32imafc_zicsr_zifencei/ilp32f -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf/lib/rv32imafc_zicsr_zifencei/ilp32f -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0 -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/lib -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf/lib -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf/usr/lib -Map=G:\\px68k-tab5\\.pio\\build\\m5stack-tab5\\firmware.map CMakeFiles/cmTC_484f3.dir/CMakeCCompilerABI.c.obj -lgcc -lc -lnosys -lc -lgcc --start-group -lgcc -lc -lnosys --end-group
+        COLLECT_GCC_OPTIONS='-nostartfiles' '-march=rv32imafc_zicsr_zifencei_xesppie' '-mabi=ilp32f' '-specs=nosys.specs' '-v' '-o' 'cmTC_a1e1d' '-misa-spec=20191213' '-march=rv32imafc_zicsr_zifencei_xesppie' '-dumpdir' 'cmTC_a1e1d.'
+         C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../libexec/gcc/riscv32-esp-elf/14.2.0/collect2.exe -plugin C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../libexec/gcc/riscv32-esp-elf/14.2.0/liblto_plugin.dll -plugin-opt=C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../libexec/gcc/riscv32-esp-elf/14.2.0/lto-wrapper.exe -plugin-opt=-fresolution=C:\\Users\\fooba\\AppData\\Local\\Temp\\ccDFI8Fc.res -plugin-opt=-pass-through=-lgcc -plugin-opt=-pass-through=-lc -plugin-opt=-pass-through=-lnosys -plugin-opt=-pass-through=-lc -plugin-opt=-pass-through=-lgcc -plugin-opt=-pass-through=-lgcc -plugin-opt=-pass-through=-lc -plugin-opt=-pass-through=-lnosys --sysroot=C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf -melf32lriscv -X -o cmTC_a1e1d -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/rv32imafc_zicsr_zifencei/ilp32f -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/lib/rv32imafc_zicsr_zifencei/ilp32f -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf/lib/rv32imafc_zicsr_zifencei/ilp32f -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0 -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/lib -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf/lib -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf/usr/lib -Map=G:\\X68KTab5\\.pio\\build\\m5stack-tab5\\firmware.map CMakeFiles/cmTC_a1e1d.dir/CMakeCCompilerABI.c.obj -lgcc -lc -lnosys -lc -lgcc --start-group -lgcc -lc -lnosys --end-group
         C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/bin/ld.exe: warning: cannot find entry symbol _start; defaulting to 00010094
-        COLLECT_GCC_OPTIONS='-nostartfiles' '-march=rv32imafc_zicsr_zifencei_xesppie' '-mabi=ilp32f' '-specs=nosys.specs' '-v' '-o' 'cmTC_484f3' '-misa-spec=20191213' '-march=rv32imafc_zicsr_zifencei_xesppie' '-dumpdir' 'cmTC_484f3.'
+        COLLECT_GCC_OPTIONS='-nostartfiles' '-march=rv32imafc_zicsr_zifencei_xesppie' '-mabi=ilp32f' '-specs=nosys.specs' '-v' '-o' 'cmTC_a1e1d' '-misa-spec=20191213' '-march=rv32imafc_zicsr_zifencei_xesppie' '-dumpdir' 'cmTC_a1e1d.'
         
       exitCode: 0
   -
@@ -197,10 +197,10 @@ events:
       Parsed C implicit link information:
         link line regex: [^( *|.*[/\\])(ld[0-9]*(\\.[a-z]+)?|CMAKE_LINK_STARTFILE-NOTFOUND|([^/\\]+-)?ld|collect2)[^/\\]*( |$)]
         linker tool regex: [^[ 	]*(->|")?[ 	]*(([^"]*[/\\])?(ld[0-9]*(\\.[a-z]+)?))("|,| |$)]
-        ignore line: [Change Dir: 'G:/px68k-tab5/.pio/build/m5stack-tab5/CMakeFiles/CMakeScratch/TryCompile-vitv27']
+        ignore line: [Change Dir: 'G:/X68KTab5/.pio/build/m5stack-tab5/CMakeFiles/CMakeScratch/TryCompile-hmt16k']
         ignore line: []
-        ignore line: [Run Build Command(s): C:/Users/fooba/.platformio/packages/tool-ninja/ninja.exe -v cmTC_484f3]
-        ignore line: [[1/2] C:\\Users\\fooba\\.platformio\\packages\\toolchain-riscv32-esp\\bin\\riscv32-esp-elf-gcc.exe   -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f     -v -o CMakeFiles/cmTC_484f3.dir/CMakeCCompilerABI.c.obj -c C:/Users/fooba/.platformio/packages/tool-cmake/share/cmake-3.30/Modules/CMakeCCompilerABI.c]
+        ignore line: [Run Build Command(s): C:/Users/fooba/.platformio/packages/tool-ninja/ninja.exe -v cmTC_a1e1d]
+        ignore line: [[1/2] C:\\Users\\fooba\\.platformio\\packages\\toolchain-riscv32-esp\\bin\\riscv32-esp-elf-gcc.exe   -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f     -v -o CMakeFiles/cmTC_a1e1d.dir/CMakeCCompilerABI.c.obj -c C:/Users/fooba/.platformio/packages/tool-cmake/share/cmake-3.30/Modules/CMakeCCompilerABI.c]
         ignore line: [Using built-in specs.]
         ignore line: [COLLECT_GCC=C:\\Users\\fooba\\.platformio\\packages\\toolchain-riscv32-esp\\bin\\riscv32-esp-elf-gcc.exe]
         ignore line: [Target: riscv32-esp-elf]
@@ -208,8 +208,8 @@ events:
         ignore line: [Thread model: posix]
         ignore line: [Supported LTO compression algorithms: zlib zstd]
         ignore line: [gcc version 14.2.0 (crosstool-NG esp-14.2.0_20241119) ]
-        ignore line: [COLLECT_GCC_OPTIONS='-march=rv32imafc_zicsr_zifencei_xesppie' '-mabi=ilp32f' '-v' '-o' 'CMakeFiles/cmTC_484f3.dir/CMakeCCompilerABI.c.obj' '-c' '-misa-spec=20191213' '-march=rv32imafc_zicsr_zifencei_xesppie' '-dumpdir' 'CMakeFiles/cmTC_484f3.dir/']
-        ignore line: [ C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../libexec/gcc/riscv32-esp-elf/14.2.0/cc1.exe -quiet -v -imultilib rv32imafc_zicsr_zifencei/ilp32f -iprefix C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/ -isysroot C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf C:/Users/fooba/.platformio/packages/tool-cmake/share/cmake-3.30/Modules/CMakeCCompilerABI.c -quiet -dumpdir CMakeFiles/cmTC_484f3.dir/ -dumpbase CMakeCCompilerABI.c.c -dumpbase-ext .c -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f -misa-spec=20191213 -march=rv32imafc_zicsr_zifencei_xesppie -version -o C:\\Users\\fooba\\AppData\\Local\\Temp\\cc7oiOtb.s]
+        ignore line: [COLLECT_GCC_OPTIONS='-march=rv32imafc_zicsr_zifencei_xesppie' '-mabi=ilp32f' '-v' '-o' 'CMakeFiles/cmTC_a1e1d.dir/CMakeCCompilerABI.c.obj' '-c' '-misa-spec=20191213' '-march=rv32imafc_zicsr_zifencei_xesppie' '-dumpdir' 'CMakeFiles/cmTC_a1e1d.dir/']
+        ignore line: [ C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../libexec/gcc/riscv32-esp-elf/14.2.0/cc1.exe -quiet -v -imultilib rv32imafc_zicsr_zifencei/ilp32f -iprefix C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/ -isysroot C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf C:/Users/fooba/.platformio/packages/tool-cmake/share/cmake-3.30/Modules/CMakeCCompilerABI.c -quiet -dumpdir CMakeFiles/cmTC_a1e1d.dir/ -dumpbase CMakeCCompilerABI.c.c -dumpbase-ext .c -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f -misa-spec=20191213 -march=rv32imafc_zicsr_zifencei_xesppie -version -o C:\\Users\\fooba\\AppData\\Local\\Temp\\cc1RAXVb.s]
         ignore line: [GNU C17 (crosstool-NG esp-14.2.0_20241119) version 14.2.0 (riscv32-esp-elf)]
         ignore line: [	compiled by GNU C version 6.3.0 20170516  GMP version 6.2.1  MPFR version 4.2.1  MPC version 1.2.1  isl version isl-0.26-GMP]
         ignore line: []
@@ -226,8 +226,8 @@ events:
         ignore line: [ C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/include]
         ignore line: [End of search list.]
         ignore line: [Compiler executable checksum: bd4b44cd937a52babfee906ad526682a]
-        ignore line: [COLLECT_GCC_OPTIONS='-march=rv32imafc_zicsr_zifencei_xesppie' '-mabi=ilp32f' '-v' '-o' 'CMakeFiles/cmTC_484f3.dir/CMakeCCompilerABI.c.obj' '-c' '-misa-spec=20191213' '-march=rv32imafc_zicsr_zifencei_xesppie' '-dumpdir' 'CMakeFiles/cmTC_484f3.dir/']
-        ignore line: [ C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/bin/as.exe -v --traditional-format -march=rv32imafc_zicsr_zifencei_xesppie -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f -misa-spec=20191213 -o CMakeFiles/cmTC_484f3.dir/CMakeCCompilerABI.c.obj C:\\Users\\fooba\\AppData\\Local\\Temp\\cc7oiOtb.s]
+        ignore line: [COLLECT_GCC_OPTIONS='-march=rv32imafc_zicsr_zifencei_xesppie' '-mabi=ilp32f' '-v' '-o' 'CMakeFiles/cmTC_a1e1d.dir/CMakeCCompilerABI.c.obj' '-c' '-misa-spec=20191213' '-march=rv32imafc_zicsr_zifencei_xesppie' '-dumpdir' 'CMakeFiles/cmTC_a1e1d.dir/']
+        ignore line: [ C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/bin/as.exe -v --traditional-format -march=rv32imafc_zicsr_zifencei_xesppie -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f -misa-spec=20191213 -o CMakeFiles/cmTC_a1e1d.dir/CMakeCCompilerABI.c.obj C:\\Users\\fooba\\AppData\\Local\\Temp\\cc1RAXVb.s]
         ignore line: [GNU assembler version 2.43.1 (riscv32-esp-elf) using BFD version (crosstool-NG esp-14.2.0_20241119) 2.43.1]
         ignore line: [COMPILER_PATH=C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../libexec/gcc/riscv32-esp-elf/14.2.0/]
         ignore line: [C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../libexec/gcc/]
@@ -240,8 +240,8 @@ events:
         ignore line: [C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/lib/]
         ignore line: [C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf/lib/]
         ignore line: [C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf/usr/lib/]
-        ignore line: [COLLECT_GCC_OPTIONS='-march=rv32imafc_zicsr_zifencei_xesppie' '-mabi=ilp32f' '-v' '-o' 'CMakeFiles/cmTC_484f3.dir/CMakeCCompilerABI.c.obj' '-c' '-misa-spec=20191213' '-march=rv32imafc_zicsr_zifencei_xesppie' '-dumpdir' 'CMakeFiles/cmTC_484f3.dir/CMakeCCompilerABI.c.']
-        ignore line: [[2/2] C:\\Windows\\system32\\cmd.exe /C "cd . && C:\\Users\\fooba\\.platformio\\packages\\toolchain-riscv32-esp\\bin\\riscv32-esp-elf-gcc.exe -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f -nostartfiles -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f --specs=nosys.specs  -Wl -Map=G:\\px68k-tab5\\.pio\\build\\m5stack-tab5\\firmware.map -v CMakeFiles/cmTC_484f3.dir/CMakeCCompilerABI.c.obj -o cmTC_484f3   && cd ."]
+        ignore line: [COLLECT_GCC_OPTIONS='-march=rv32imafc_zicsr_zifencei_xesppie' '-mabi=ilp32f' '-v' '-o' 'CMakeFiles/cmTC_a1e1d.dir/CMakeCCompilerABI.c.obj' '-c' '-misa-spec=20191213' '-march=rv32imafc_zicsr_zifencei_xesppie' '-dumpdir' 'CMakeFiles/cmTC_a1e1d.dir/CMakeCCompilerABI.c.']
+        ignore line: [[2/2] C:\\Windows\\system32\\cmd.exe /C "cd . && C:\\Users\\fooba\\.platformio\\packages\\toolchain-riscv32-esp\\bin\\riscv32-esp-elf-gcc.exe -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f -nostartfiles -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f --specs=nosys.specs  -Wl -Map=G:\\X68KTab5\\.pio\\build\\m5stack-tab5\\firmware.map -v CMakeFiles/cmTC_a1e1d.dir/CMakeCCompilerABI.c.obj -o cmTC_a1e1d   && cd ."]
         ignore line: [Using built-in specs.]
         ignore line: [Reading specs from C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/lib/nosys.specs]
         ignore line: [rename spec link_gcc_c_sequence to nosys_link_gcc_c_sequence]
@@ -263,13 +263,13 @@ events:
         ignore line: [C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/lib/]
         ignore line: [C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf/lib/]
         ignore line: [C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf/usr/lib/]
-        ignore line: [COLLECT_GCC_OPTIONS='-nostartfiles' '-march=rv32imafc_zicsr_zifencei_xesppie' '-mabi=ilp32f' '-specs=nosys.specs' '-v' '-o' 'cmTC_484f3' '-misa-spec=20191213' '-march=rv32imafc_zicsr_zifencei_xesppie' '-dumpdir' 'cmTC_484f3.']
-        link line: [ C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../libexec/gcc/riscv32-esp-elf/14.2.0/collect2.exe -plugin C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../libexec/gcc/riscv32-esp-elf/14.2.0/liblto_plugin.dll -plugin-opt=C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../libexec/gcc/riscv32-esp-elf/14.2.0/lto-wrapper.exe -plugin-opt=-fresolution=C:\\Users\\fooba\\AppData\\Local\\Temp\\cc1t1eHc.res -plugin-opt=-pass-through=-lgcc -plugin-opt=-pass-through=-lc -plugin-opt=-pass-through=-lnosys -plugin-opt=-pass-through=-lc -plugin-opt=-pass-through=-lgcc -plugin-opt=-pass-through=-lgcc -plugin-opt=-pass-through=-lc -plugin-opt=-pass-through=-lnosys --sysroot=C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf -melf32lriscv -X -o cmTC_484f3 -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/rv32imafc_zicsr_zifencei/ilp32f -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/lib/rv32imafc_zicsr_zifencei/ilp32f -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf/lib/rv32imafc_zicsr_zifencei/ilp32f -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0 -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/lib -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf/lib -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf/usr/lib -Map=G:\\px68k-tab5\\.pio\\build\\m5stack-tab5\\firmware.map CMakeFiles/cmTC_484f3.dir/CMakeCCompilerABI.c.obj -lgcc -lc -lnosys -lc -lgcc --start-group -lgcc -lc -lnosys --end-group]
+        ignore line: [COLLECT_GCC_OPTIONS='-nostartfiles' '-march=rv32imafc_zicsr_zifencei_xesppie' '-mabi=ilp32f' '-specs=nosys.specs' '-v' '-o' 'cmTC_a1e1d' '-misa-spec=20191213' '-march=rv32imafc_zicsr_zifencei_xesppie' '-dumpdir' 'cmTC_a1e1d.']
+        link line: [ C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../libexec/gcc/riscv32-esp-elf/14.2.0/collect2.exe -plugin C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../libexec/gcc/riscv32-esp-elf/14.2.0/liblto_plugin.dll -plugin-opt=C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../libexec/gcc/riscv32-esp-elf/14.2.0/lto-wrapper.exe -plugin-opt=-fresolution=C:\\Users\\fooba\\AppData\\Local\\Temp\\ccDFI8Fc.res -plugin-opt=-pass-through=-lgcc -plugin-opt=-pass-through=-lc -plugin-opt=-pass-through=-lnosys -plugin-opt=-pass-through=-lc -plugin-opt=-pass-through=-lgcc -plugin-opt=-pass-through=-lgcc -plugin-opt=-pass-through=-lc -plugin-opt=-pass-through=-lnosys --sysroot=C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf -melf32lriscv -X -o cmTC_a1e1d -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/rv32imafc_zicsr_zifencei/ilp32f -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/lib/rv32imafc_zicsr_zifencei/ilp32f -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf/lib/rv32imafc_zicsr_zifencei/ilp32f -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0 -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/lib -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf/lib -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf/usr/lib -Map=G:\\X68KTab5\\.pio\\build\\m5stack-tab5\\firmware.map CMakeFiles/cmTC_a1e1d.dir/CMakeCCompilerABI.c.obj -lgcc -lc -lnosys -lc -lgcc --start-group -lgcc -lc -lnosys --end-group]
           arg [C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../libexec/gcc/riscv32-esp-elf/14.2.0/collect2.exe] ==> ignore
           arg [-plugin] ==> ignore
           arg [C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../libexec/gcc/riscv32-esp-elf/14.2.0/liblto_plugin.dll] ==> ignore
           arg [-plugin-opt=C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../libexec/gcc/riscv32-esp-elf/14.2.0/lto-wrapper.exe] ==> ignore
-          arg [-plugin-opt=-fresolution=C:\\Users\\fooba\\AppData\\Local\\Temp\\cc1t1eHc.res] ==> ignore
+          arg [-plugin-opt=-fresolution=C:\\Users\\fooba\\AppData\\Local\\Temp\\ccDFI8Fc.res] ==> ignore
           arg [-plugin-opt=-pass-through=-lgcc] ==> ignore
           arg [-plugin-opt=-pass-through=-lc] ==> ignore
           arg [-plugin-opt=-pass-through=-lnosys] ==> ignore
@@ -282,7 +282,7 @@ events:
           arg [-melf32lriscv] ==> ignore
           arg [-X] ==> ignore
           arg [-o] ==> ignore
-          arg [cmTC_484f3] ==> ignore
+          arg [cmTC_a1e1d] ==> ignore
           arg [-LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/rv32imafc_zicsr_zifencei/ilp32f] ==> dir [C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/rv32imafc_zicsr_zifencei/ilp32f]
           arg [-LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/lib/rv32imafc_zicsr_zifencei/ilp32f] ==> dir [C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/lib/rv32imafc_zicsr_zifencei/ilp32f]
           arg [-LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf/lib/rv32imafc_zicsr_zifencei/ilp32f] ==> dir [C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf/lib/rv32imafc_zicsr_zifencei/ilp32f]
@@ -291,8 +291,8 @@ events:
           arg [-LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/lib] ==> dir [C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/lib]
           arg [-LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf/lib] ==> dir [C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf/lib]
           arg [-LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf/usr/lib] ==> dir [C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf/usr/lib]
-          arg [-Map=G:\\px68k-tab5\\.pio\\build\\m5stack-tab5\\firmware.map] ==> ignore
-          arg [CMakeFiles/cmTC_484f3.dir/CMakeCCompilerABI.c.obj] ==> ignore
+          arg [-Map=G:\\X68KTab5\\.pio\\build\\m5stack-tab5\\firmware.map] ==> ignore
+          arg [CMakeFiles/cmTC_a1e1d.dir/CMakeCCompilerABI.c.obj] ==> ignore
           arg [-lgcc] ==> lib [gcc]
           arg [-lc] ==> lib [c]
           arg [-lnosys] ==> lib [nosys]
@@ -305,7 +305,7 @@ events:
           arg [--end-group] ==> ignore
         ignore line: [C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/bin/ld.exe: warning: cannot find entry symbol _start]
         ignore line: [ defaulting to 00010094]
-        ignore line: [COLLECT_GCC_OPTIONS='-nostartfiles' '-march=rv32imafc_zicsr_zifencei_xesppie' '-mabi=ilp32f' '-specs=nosys.specs' '-v' '-o' 'cmTC_484f3' '-misa-spec=20191213' '-march=rv32imafc_zicsr_zifencei_xesppie' '-dumpdir' 'cmTC_484f3.']
+        ignore line: [COLLECT_GCC_OPTIONS='-nostartfiles' '-march=rv32imafc_zicsr_zifencei_xesppie' '-mabi=ilp32f' '-specs=nosys.specs' '-v' '-o' 'cmTC_a1e1d' '-misa-spec=20191213' '-march=rv32imafc_zicsr_zifencei_xesppie' '-dumpdir' 'cmTC_a1e1d.']
         ignore line: []
         ignore line: []
         collapse library dir [C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/rv32imafc_zicsr_zifencei/ilp32f] ==> [C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/lib/gcc/riscv32-esp-elf/14.2.0/rv32imafc_zicsr_zifencei/ilp32f]
@@ -332,22 +332,22 @@ events:
     checks:
       - "Detecting CXX compiler ABI info"
     directories:
-      source: "G:/px68k-tab5/.pio/build/m5stack-tab5/CMakeFiles/CMakeScratch/TryCompile-3qzssj"
-      binary: "G:/px68k-tab5/.pio/build/m5stack-tab5/CMakeFiles/CMakeScratch/TryCompile-3qzssj"
+      source: "G:/X68KTab5/.pio/build/m5stack-tab5/CMakeFiles/CMakeScratch/TryCompile-8rqwyd"
+      binary: "G:/X68KTab5/.pio/build/m5stack-tab5/CMakeFiles/CMakeScratch/TryCompile-8rqwyd"
     cmakeVariables:
       CMAKE_CXX_FLAGS: "-march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f "
       CMAKE_CXX_FLAGS_DEBUG: "-g"
       CMAKE_CXX_SCAN_FOR_MODULES: "OFF"
-      CMAKE_EXE_LINKER_FLAGS: "-nostartfiles -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f --specs=nosys.specs  -Wl,-Map=G:\\px68k-tab5\\.pio\\build\\m5stack-tab5\\firmware.map"
+      CMAKE_EXE_LINKER_FLAGS: "-nostartfiles -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f --specs=nosys.specs  -Wl,-Map=G:\\X68KTab5\\.pio\\build\\m5stack-tab5\\firmware.map"
       CMAKE_MODULE_PATH: "C:/Users/fooba/.platformio/packages/framework-espidf/tools/cmake;C:/Users/fooba/.platformio/packages/framework-espidf/tools/cmake/third_party"
     buildResult:
       variable: "CMAKE_CXX_ABI_COMPILED"
       cached: true
       stdout: |
-        Change Dir: 'G:/px68k-tab5/.pio/build/m5stack-tab5/CMakeFiles/CMakeScratch/TryCompile-3qzssj'
+        Change Dir: 'G:/X68KTab5/.pio/build/m5stack-tab5/CMakeFiles/CMakeScratch/TryCompile-8rqwyd'
         
-        Run Build Command(s): C:/Users/fooba/.platformio/packages/tool-ninja/ninja.exe -v cmTC_bf96b
-        [1/2] C:\\Users\\fooba\\.platformio\\packages\\toolchain-riscv32-esp\\bin\\riscv32-esp-elf-g++.exe   -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f     -v -o CMakeFiles/cmTC_bf96b.dir/CMakeCXXCompilerABI.cpp.obj -c C:/Users/fooba/.platformio/packages/tool-cmake/share/cmake-3.30/Modules/CMakeCXXCompilerABI.cpp
+        Run Build Command(s): C:/Users/fooba/.platformio/packages/tool-ninja/ninja.exe -v cmTC_01445
+        [1/2] C:\\Users\\fooba\\.platformio\\packages\\toolchain-riscv32-esp\\bin\\riscv32-esp-elf-g++.exe   -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f     -v -o CMakeFiles/cmTC_01445.dir/CMakeCXXCompilerABI.cpp.obj -c C:/Users/fooba/.platformio/packages/tool-cmake/share/cmake-3.30/Modules/CMakeCXXCompilerABI.cpp
         Using built-in specs.
         COLLECT_GCC=C:\\Users\\fooba\\.platformio\\packages\\toolchain-riscv32-esp\\bin\\riscv32-esp-elf-g++.exe
         Target: riscv32-esp-elf
@@ -355,8 +355,8 @@ events:
         Thread model: posix
         Supported LTO compression algorithms: zlib zstd
         gcc version 14.2.0 (crosstool-NG esp-14.2.0_20241119) 
-        COLLECT_GCC_OPTIONS='-march=rv32imafc_zicsr_zifencei_xesppie' '-mabi=ilp32f' '-v' '-o' 'CMakeFiles/cmTC_bf96b.dir/CMakeCXXCompilerABI.cpp.obj' '-c' '-misa-spec=20191213' '-march=rv32imafc_zicsr_zifencei_xesppie' '-dumpdir' 'CMakeFiles/cmTC_bf96b.dir/'
-         C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../libexec/gcc/riscv32-esp-elf/14.2.0/cc1plus.exe -quiet -v -imultilib rv32imafc_zicsr_zifencei/ilp32f -iprefix C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/ -isysroot C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf C:/Users/fooba/.platformio/packages/tool-cmake/share/cmake-3.30/Modules/CMakeCXXCompilerABI.cpp -quiet -dumpdir CMakeFiles/cmTC_bf96b.dir/ -dumpbase CMakeCXXCompilerABI.cpp.cpp -dumpbase-ext .cpp -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f -misa-spec=20191213 -march=rv32imafc_zicsr_zifencei_xesppie -version -o C:\\Users\\fooba\\AppData\\Local\\Temp\\cc7uEbwn.s
+        COLLECT_GCC_OPTIONS='-march=rv32imafc_zicsr_zifencei_xesppie' '-mabi=ilp32f' '-v' '-o' 'CMakeFiles/cmTC_01445.dir/CMakeCXXCompilerABI.cpp.obj' '-c' '-misa-spec=20191213' '-march=rv32imafc_zicsr_zifencei_xesppie' '-dumpdir' 'CMakeFiles/cmTC_01445.dir/'
+         C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../libexec/gcc/riscv32-esp-elf/14.2.0/cc1plus.exe -quiet -v -imultilib rv32imafc_zicsr_zifencei/ilp32f -iprefix C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/ -isysroot C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf C:/Users/fooba/.platformio/packages/tool-cmake/share/cmake-3.30/Modules/CMakeCXXCompilerABI.cpp -quiet -dumpdir CMakeFiles/cmTC_01445.dir/ -dumpbase CMakeCXXCompilerABI.cpp.cpp -dumpbase-ext .cpp -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f -misa-spec=20191213 -march=rv32imafc_zicsr_zifencei_xesppie -version -o C:\\Users\\fooba\\AppData\\Local\\Temp\\ccfJs6oq.s
         GNU C++17 (crosstool-NG esp-14.2.0_20241119) version 14.2.0 (riscv32-esp-elf)
         	compiled by GNU C version 6.3.0 20170516, GMP version 6.2.1, MPFR version 4.2.1, MPC version 1.2.1, isl version isl-0.26-GMP
         
@@ -379,13 +379,13 @@ events:
          C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/include
         End of search list.
         Compiler executable checksum: b8daf4944b33b24ed9ecf5a047df93fe
-        COLLECT_GCC_OPTIONS='-march=rv32imafc_zicsr_zifencei_xesppie' '-mabi=ilp32f' '-v' '-o' 'CMakeFiles/cmTC_bf96b.dir/CMakeCXXCompilerABI.cpp.obj' '-c' '-misa-spec=20191213' '-march=rv32imafc_zicsr_zifencei_xesppie' '-dumpdir' 'CMakeFiles/cmTC_bf96b.dir/'
-         C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/bin/as.exe -v --traditional-format -march=rv32imafc_zicsr_zifencei_xesppie -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f -misa-spec=20191213 -o CMakeFiles/cmTC_bf96b.dir/CMakeCXXCompilerABI.cpp.obj C:\\Users\\fooba\\AppData\\Local\\Temp\\cc7uEbwn.s
+        COLLECT_GCC_OPTIONS='-march=rv32imafc_zicsr_zifencei_xesppie' '-mabi=ilp32f' '-v' '-o' 'CMakeFiles/cmTC_01445.dir/CMakeCXXCompilerABI.cpp.obj' '-c' '-misa-spec=20191213' '-march=rv32imafc_zicsr_zifencei_xesppie' '-dumpdir' 'CMakeFiles/cmTC_01445.dir/'
+         C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/bin/as.exe -v --traditional-format -march=rv32imafc_zicsr_zifencei_xesppie -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f -misa-spec=20191213 -o CMakeFiles/cmTC_01445.dir/CMakeCXXCompilerABI.cpp.obj C:\\Users\\fooba\\AppData\\Local\\Temp\\ccfJs6oq.s
         GNU assembler version 2.43.1 (riscv32-esp-elf) using BFD version (crosstool-NG esp-14.2.0_20241119) 2.43.1
         COMPILER_PATH=C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../libexec/gcc/riscv32-esp-elf/14.2.0/;C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../libexec/gcc/;C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/bin/
         LIBRARY_PATH=C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/rv32imafc_zicsr_zifencei/ilp32f/;C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/lib/rv32imafc_zicsr_zifencei/ilp32f/;C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf/lib/rv32imafc_zicsr_zifencei/ilp32f/;C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/;C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/;C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/lib/;C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf/lib/;C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf/usr/lib/
-        COLLECT_GCC_OPTIONS='-march=rv32imafc_zicsr_zifencei_xesppie' '-mabi=ilp32f' '-v' '-o' 'CMakeFiles/cmTC_bf96b.dir/CMakeCXXCompilerABI.cpp.obj' '-c' '-misa-spec=20191213' '-march=rv32imafc_zicsr_zifencei_xesppie' '-dumpdir' 'CMakeFiles/cmTC_bf96b.dir/CMakeCXXCompilerABI.cpp.'
-        [2/2] C:\\Windows\\system32\\cmd.exe /C "cd . && C:\\Users\\fooba\\.platformio\\packages\\toolchain-riscv32-esp\\bin\\riscv32-esp-elf-g++.exe -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f -nostartfiles -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f --specs=nosys.specs  -Wl,-Map=G:\\px68k-tab5\\.pio\\build\\m5stack-tab5\\firmware.map -v CMakeFiles/cmTC_bf96b.dir/CMakeCXXCompilerABI.cpp.obj -o cmTC_bf96b   && cd ."
+        COLLECT_GCC_OPTIONS='-march=rv32imafc_zicsr_zifencei_xesppie' '-mabi=ilp32f' '-v' '-o' 'CMakeFiles/cmTC_01445.dir/CMakeCXXCompilerABI.cpp.obj' '-c' '-misa-spec=20191213' '-march=rv32imafc_zicsr_zifencei_xesppie' '-dumpdir' 'CMakeFiles/cmTC_01445.dir/CMakeCXXCompilerABI.cpp.'
+        [2/2] C:\\Windows\\system32\\cmd.exe /C "cd . && C:\\Users\\fooba\\.platformio\\packages\\toolchain-riscv32-esp\\bin\\riscv32-esp-elf-g++.exe -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f -nostartfiles -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f --specs=nosys.specs  -Wl,-Map=G:\\X68KTab5\\.pio\\build\\m5stack-tab5\\firmware.map -v CMakeFiles/cmTC_01445.dir/CMakeCXXCompilerABI.cpp.obj -o cmTC_01445   && cd ."
         Using built-in specs.
         Reading specs from C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/lib/nosys.specs
         rename spec link_gcc_c_sequence to nosys_link_gcc_c_sequence
@@ -398,10 +398,10 @@ events:
         gcc version 14.2.0 (crosstool-NG esp-14.2.0_20241119) 
         COMPILER_PATH=C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../libexec/gcc/riscv32-esp-elf/14.2.0/;C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../libexec/gcc/;C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/bin/
         LIBRARY_PATH=C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/rv32imafc_zicsr_zifencei/ilp32f/;C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/lib/rv32imafc_zicsr_zifencei/ilp32f/;C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf/lib/rv32imafc_zicsr_zifencei/ilp32f/;C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/;C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/;C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/lib/;C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf/lib/;C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf/usr/lib/
-        COLLECT_GCC_OPTIONS='-nostartfiles' '-march=rv32imafc_zicsr_zifencei_xesppie' '-mabi=ilp32f' '-specs=nosys.specs' '-v' '-o' 'cmTC_bf96b' '-misa-spec=20191213' '-march=rv32imafc_zicsr_zifencei_xesppie' '-dumpdir' 'cmTC_bf96b.'
-         C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../libexec/gcc/riscv32-esp-elf/14.2.0/collect2.exe -plugin C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../libexec/gcc/riscv32-esp-elf/14.2.0/liblto_plugin.dll -plugin-opt=C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../libexec/gcc/riscv32-esp-elf/14.2.0/lto-wrapper.exe -plugin-opt=-fresolution=C:\\Users\\fooba\\AppData\\Local\\Temp\\ccpq72fo.res -plugin-opt=-pass-through=-lgcc -plugin-opt=-pass-through=-lc -plugin-opt=-pass-through=-lnosys -plugin-opt=-pass-through=-lc -plugin-opt=-pass-through=-lgcc -plugin-opt=-pass-through=-lgcc -plugin-opt=-pass-through=-lc -plugin-opt=-pass-through=-lnosys --sysroot=C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf -melf32lriscv -X -o cmTC_bf96b -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/rv32imafc_zicsr_zifencei/ilp32f -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/lib/rv32imafc_zicsr_zifencei/ilp32f -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf/lib/rv32imafc_zicsr_zifencei/ilp32f -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0 -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/lib -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf/lib -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf/usr/lib -Map=G:\\px68k-tab5\\.pio\\build\\m5stack-tab5\\firmware.map CMakeFiles/cmTC_bf96b.dir/CMakeCXXCompilerABI.cpp.obj -lstdc++ -lm -lgcc -lc -lnosys -lc -lgcc --start-group -lgcc -lc -lnosys --end-group
+        COLLECT_GCC_OPTIONS='-nostartfiles' '-march=rv32imafc_zicsr_zifencei_xesppie' '-mabi=ilp32f' '-specs=nosys.specs' '-v' '-o' 'cmTC_01445' '-misa-spec=20191213' '-march=rv32imafc_zicsr_zifencei_xesppie' '-dumpdir' 'cmTC_01445.'
+         C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../libexec/gcc/riscv32-esp-elf/14.2.0/collect2.exe -plugin C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../libexec/gcc/riscv32-esp-elf/14.2.0/liblto_plugin.dll -plugin-opt=C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../libexec/gcc/riscv32-esp-elf/14.2.0/lto-wrapper.exe -plugin-opt=-fresolution=C:\\Users\\fooba\\AppData\\Local\\Temp\\ccV8bfOq.res -plugin-opt=-pass-through=-lgcc -plugin-opt=-pass-through=-lc -plugin-opt=-pass-through=-lnosys -plugin-opt=-pass-through=-lc -plugin-opt=-pass-through=-lgcc -plugin-opt=-pass-through=-lgcc -plugin-opt=-pass-through=-lc -plugin-opt=-pass-through=-lnosys --sysroot=C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf -melf32lriscv -X -o cmTC_01445 -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/rv32imafc_zicsr_zifencei/ilp32f -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/lib/rv32imafc_zicsr_zifencei/ilp32f -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf/lib/rv32imafc_zicsr_zifencei/ilp32f -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0 -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/lib -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf/lib -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf/usr/lib -Map=G:\\X68KTab5\\.pio\\build\\m5stack-tab5\\firmware.map CMakeFiles/cmTC_01445.dir/CMakeCXXCompilerABI.cpp.obj -lstdc++ -lm -lgcc -lc -lnosys -lc -lgcc --start-group -lgcc -lc -lnosys --end-group
         C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/bin/ld.exe: warning: cannot find entry symbol _start; defaulting to 00010094
-        COLLECT_GCC_OPTIONS='-nostartfiles' '-march=rv32imafc_zicsr_zifencei_xesppie' '-mabi=ilp32f' '-specs=nosys.specs' '-v' '-o' 'cmTC_bf96b' '-misa-spec=20191213' '-march=rv32imafc_zicsr_zifencei_xesppie' '-dumpdir' 'cmTC_bf96b.'
+        COLLECT_GCC_OPTIONS='-nostartfiles' '-march=rv32imafc_zicsr_zifencei_xesppie' '-mabi=ilp32f' '-specs=nosys.specs' '-v' '-o' 'cmTC_01445' '-misa-spec=20191213' '-march=rv32imafc_zicsr_zifencei_xesppie' '-dumpdir' 'cmTC_01445.'
         
       exitCode: 0
   -
@@ -442,10 +442,10 @@ events:
       Parsed CXX implicit link information:
         link line regex: [^( *|.*[/\\])(ld[0-9]*(\\.[a-z]+)?|CMAKE_LINK_STARTFILE-NOTFOUND|([^/\\]+-)?ld|collect2)[^/\\]*( |$)]
         linker tool regex: [^[ 	]*(->|")?[ 	]*(([^"]*[/\\])?(ld[0-9]*(\\.[a-z]+)?))("|,| |$)]
-        ignore line: [Change Dir: 'G:/px68k-tab5/.pio/build/m5stack-tab5/CMakeFiles/CMakeScratch/TryCompile-3qzssj']
+        ignore line: [Change Dir: 'G:/X68KTab5/.pio/build/m5stack-tab5/CMakeFiles/CMakeScratch/TryCompile-8rqwyd']
         ignore line: []
-        ignore line: [Run Build Command(s): C:/Users/fooba/.platformio/packages/tool-ninja/ninja.exe -v cmTC_bf96b]
-        ignore line: [[1/2] C:\\Users\\fooba\\.platformio\\packages\\toolchain-riscv32-esp\\bin\\riscv32-esp-elf-g++.exe   -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f     -v -o CMakeFiles/cmTC_bf96b.dir/CMakeCXXCompilerABI.cpp.obj -c C:/Users/fooba/.platformio/packages/tool-cmake/share/cmake-3.30/Modules/CMakeCXXCompilerABI.cpp]
+        ignore line: [Run Build Command(s): C:/Users/fooba/.platformio/packages/tool-ninja/ninja.exe -v cmTC_01445]
+        ignore line: [[1/2] C:\\Users\\fooba\\.platformio\\packages\\toolchain-riscv32-esp\\bin\\riscv32-esp-elf-g++.exe   -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f     -v -o CMakeFiles/cmTC_01445.dir/CMakeCXXCompilerABI.cpp.obj -c C:/Users/fooba/.platformio/packages/tool-cmake/share/cmake-3.30/Modules/CMakeCXXCompilerABI.cpp]
         ignore line: [Using built-in specs.]
         ignore line: [COLLECT_GCC=C:\\Users\\fooba\\.platformio\\packages\\toolchain-riscv32-esp\\bin\\riscv32-esp-elf-g++.exe]
         ignore line: [Target: riscv32-esp-elf]
@@ -453,8 +453,8 @@ events:
         ignore line: [Thread model: posix]
         ignore line: [Supported LTO compression algorithms: zlib zstd]
         ignore line: [gcc version 14.2.0 (crosstool-NG esp-14.2.0_20241119) ]
-        ignore line: [COLLECT_GCC_OPTIONS='-march=rv32imafc_zicsr_zifencei_xesppie' '-mabi=ilp32f' '-v' '-o' 'CMakeFiles/cmTC_bf96b.dir/CMakeCXXCompilerABI.cpp.obj' '-c' '-misa-spec=20191213' '-march=rv32imafc_zicsr_zifencei_xesppie' '-dumpdir' 'CMakeFiles/cmTC_bf96b.dir/']
-        ignore line: [ C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../libexec/gcc/riscv32-esp-elf/14.2.0/cc1plus.exe -quiet -v -imultilib rv32imafc_zicsr_zifencei/ilp32f -iprefix C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/ -isysroot C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf C:/Users/fooba/.platformio/packages/tool-cmake/share/cmake-3.30/Modules/CMakeCXXCompilerABI.cpp -quiet -dumpdir CMakeFiles/cmTC_bf96b.dir/ -dumpbase CMakeCXXCompilerABI.cpp.cpp -dumpbase-ext .cpp -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f -misa-spec=20191213 -march=rv32imafc_zicsr_zifencei_xesppie -version -o C:\\Users\\fooba\\AppData\\Local\\Temp\\cc7uEbwn.s]
+        ignore line: [COLLECT_GCC_OPTIONS='-march=rv32imafc_zicsr_zifencei_xesppie' '-mabi=ilp32f' '-v' '-o' 'CMakeFiles/cmTC_01445.dir/CMakeCXXCompilerABI.cpp.obj' '-c' '-misa-spec=20191213' '-march=rv32imafc_zicsr_zifencei_xesppie' '-dumpdir' 'CMakeFiles/cmTC_01445.dir/']
+        ignore line: [ C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../libexec/gcc/riscv32-esp-elf/14.2.0/cc1plus.exe -quiet -v -imultilib rv32imafc_zicsr_zifencei/ilp32f -iprefix C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/ -isysroot C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf C:/Users/fooba/.platformio/packages/tool-cmake/share/cmake-3.30/Modules/CMakeCXXCompilerABI.cpp -quiet -dumpdir CMakeFiles/cmTC_01445.dir/ -dumpbase CMakeCXXCompilerABI.cpp.cpp -dumpbase-ext .cpp -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f -misa-spec=20191213 -march=rv32imafc_zicsr_zifencei_xesppie -version -o C:\\Users\\fooba\\AppData\\Local\\Temp\\ccfJs6oq.s]
         ignore line: [GNU C++17 (crosstool-NG esp-14.2.0_20241119) version 14.2.0 (riscv32-esp-elf)]
         ignore line: [	compiled by GNU C version 6.3.0 20170516  GMP version 6.2.1  MPFR version 4.2.1  MPC version 1.2.1  isl version isl-0.26-GMP]
         ignore line: []
@@ -477,8 +477,8 @@ events:
         ignore line: [ C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/include]
         ignore line: [End of search list.]
         ignore line: [Compiler executable checksum: b8daf4944b33b24ed9ecf5a047df93fe]
-        ignore line: [COLLECT_GCC_OPTIONS='-march=rv32imafc_zicsr_zifencei_xesppie' '-mabi=ilp32f' '-v' '-o' 'CMakeFiles/cmTC_bf96b.dir/CMakeCXXCompilerABI.cpp.obj' '-c' '-misa-spec=20191213' '-march=rv32imafc_zicsr_zifencei_xesppie' '-dumpdir' 'CMakeFiles/cmTC_bf96b.dir/']
-        ignore line: [ C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/bin/as.exe -v --traditional-format -march=rv32imafc_zicsr_zifencei_xesppie -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f -misa-spec=20191213 -o CMakeFiles/cmTC_bf96b.dir/CMakeCXXCompilerABI.cpp.obj C:\\Users\\fooba\\AppData\\Local\\Temp\\cc7uEbwn.s]
+        ignore line: [COLLECT_GCC_OPTIONS='-march=rv32imafc_zicsr_zifencei_xesppie' '-mabi=ilp32f' '-v' '-o' 'CMakeFiles/cmTC_01445.dir/CMakeCXXCompilerABI.cpp.obj' '-c' '-misa-spec=20191213' '-march=rv32imafc_zicsr_zifencei_xesppie' '-dumpdir' 'CMakeFiles/cmTC_01445.dir/']
+        ignore line: [ C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/bin/as.exe -v --traditional-format -march=rv32imafc_zicsr_zifencei_xesppie -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f -misa-spec=20191213 -o CMakeFiles/cmTC_01445.dir/CMakeCXXCompilerABI.cpp.obj C:\\Users\\fooba\\AppData\\Local\\Temp\\ccfJs6oq.s]
         ignore line: [GNU assembler version 2.43.1 (riscv32-esp-elf) using BFD version (crosstool-NG esp-14.2.0_20241119) 2.43.1]
         ignore line: [COMPILER_PATH=C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../libexec/gcc/riscv32-esp-elf/14.2.0/]
         ignore line: [C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../libexec/gcc/]
@@ -491,8 +491,8 @@ events:
         ignore line: [C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/lib/]
         ignore line: [C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf/lib/]
         ignore line: [C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf/usr/lib/]
-        ignore line: [COLLECT_GCC_OPTIONS='-march=rv32imafc_zicsr_zifencei_xesppie' '-mabi=ilp32f' '-v' '-o' 'CMakeFiles/cmTC_bf96b.dir/CMakeCXXCompilerABI.cpp.obj' '-c' '-misa-spec=20191213' '-march=rv32imafc_zicsr_zifencei_xesppie' '-dumpdir' 'CMakeFiles/cmTC_bf96b.dir/CMakeCXXCompilerABI.cpp.']
-        ignore line: [[2/2] C:\\Windows\\system32\\cmd.exe /C "cd . && C:\\Users\\fooba\\.platformio\\packages\\toolchain-riscv32-esp\\bin\\riscv32-esp-elf-g++.exe -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f -nostartfiles -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f --specs=nosys.specs  -Wl -Map=G:\\px68k-tab5\\.pio\\build\\m5stack-tab5\\firmware.map -v CMakeFiles/cmTC_bf96b.dir/CMakeCXXCompilerABI.cpp.obj -o cmTC_bf96b   && cd ."]
+        ignore line: [COLLECT_GCC_OPTIONS='-march=rv32imafc_zicsr_zifencei_xesppie' '-mabi=ilp32f' '-v' '-o' 'CMakeFiles/cmTC_01445.dir/CMakeCXXCompilerABI.cpp.obj' '-c' '-misa-spec=20191213' '-march=rv32imafc_zicsr_zifencei_xesppie' '-dumpdir' 'CMakeFiles/cmTC_01445.dir/CMakeCXXCompilerABI.cpp.']
+        ignore line: [[2/2] C:\\Windows\\system32\\cmd.exe /C "cd . && C:\\Users\\fooba\\.platformio\\packages\\toolchain-riscv32-esp\\bin\\riscv32-esp-elf-g++.exe -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f -nostartfiles -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f --specs=nosys.specs  -Wl -Map=G:\\X68KTab5\\.pio\\build\\m5stack-tab5\\firmware.map -v CMakeFiles/cmTC_01445.dir/CMakeCXXCompilerABI.cpp.obj -o cmTC_01445   && cd ."]
         ignore line: [Using built-in specs.]
         ignore line: [Reading specs from C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/lib/nosys.specs]
         ignore line: [rename spec link_gcc_c_sequence to nosys_link_gcc_c_sequence]
@@ -514,13 +514,13 @@ events:
         ignore line: [C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/lib/]
         ignore line: [C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf/lib/]
         ignore line: [C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf/usr/lib/]
-        ignore line: [COLLECT_GCC_OPTIONS='-nostartfiles' '-march=rv32imafc_zicsr_zifencei_xesppie' '-mabi=ilp32f' '-specs=nosys.specs' '-v' '-o' 'cmTC_bf96b' '-misa-spec=20191213' '-march=rv32imafc_zicsr_zifencei_xesppie' '-dumpdir' 'cmTC_bf96b.']
-        link line: [ C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../libexec/gcc/riscv32-esp-elf/14.2.0/collect2.exe -plugin C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../libexec/gcc/riscv32-esp-elf/14.2.0/liblto_plugin.dll -plugin-opt=C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../libexec/gcc/riscv32-esp-elf/14.2.0/lto-wrapper.exe -plugin-opt=-fresolution=C:\\Users\\fooba\\AppData\\Local\\Temp\\ccpq72fo.res -plugin-opt=-pass-through=-lgcc -plugin-opt=-pass-through=-lc -plugin-opt=-pass-through=-lnosys -plugin-opt=-pass-through=-lc -plugin-opt=-pass-through=-lgcc -plugin-opt=-pass-through=-lgcc -plugin-opt=-pass-through=-lc -plugin-opt=-pass-through=-lnosys --sysroot=C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf -melf32lriscv -X -o cmTC_bf96b -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/rv32imafc_zicsr_zifencei/ilp32f -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/lib/rv32imafc_zicsr_zifencei/ilp32f -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf/lib/rv32imafc_zicsr_zifencei/ilp32f -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0 -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/lib -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf/lib -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf/usr/lib -Map=G:\\px68k-tab5\\.pio\\build\\m5stack-tab5\\firmware.map CMakeFiles/cmTC_bf96b.dir/CMakeCXXCompilerABI.cpp.obj -lstdc++ -lm -lgcc -lc -lnosys -lc -lgcc --start-group -lgcc -lc -lnosys --end-group]
+        ignore line: [COLLECT_GCC_OPTIONS='-nostartfiles' '-march=rv32imafc_zicsr_zifencei_xesppie' '-mabi=ilp32f' '-specs=nosys.specs' '-v' '-o' 'cmTC_01445' '-misa-spec=20191213' '-march=rv32imafc_zicsr_zifencei_xesppie' '-dumpdir' 'cmTC_01445.']
+        link line: [ C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../libexec/gcc/riscv32-esp-elf/14.2.0/collect2.exe -plugin C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../libexec/gcc/riscv32-esp-elf/14.2.0/liblto_plugin.dll -plugin-opt=C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../libexec/gcc/riscv32-esp-elf/14.2.0/lto-wrapper.exe -plugin-opt=-fresolution=C:\\Users\\fooba\\AppData\\Local\\Temp\\ccV8bfOq.res -plugin-opt=-pass-through=-lgcc -plugin-opt=-pass-through=-lc -plugin-opt=-pass-through=-lnosys -plugin-opt=-pass-through=-lc -plugin-opt=-pass-through=-lgcc -plugin-opt=-pass-through=-lgcc -plugin-opt=-pass-through=-lc -plugin-opt=-pass-through=-lnosys --sysroot=C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf -melf32lriscv -X -o cmTC_01445 -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/rv32imafc_zicsr_zifencei/ilp32f -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/lib/rv32imafc_zicsr_zifencei/ilp32f -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf/lib/rv32imafc_zicsr_zifencei/ilp32f -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0 -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/lib -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf/lib -LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf/usr/lib -Map=G:\\X68KTab5\\.pio\\build\\m5stack-tab5\\firmware.map CMakeFiles/cmTC_01445.dir/CMakeCXXCompilerABI.cpp.obj -lstdc++ -lm -lgcc -lc -lnosys -lc -lgcc --start-group -lgcc -lc -lnosys --end-group]
           arg [C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../libexec/gcc/riscv32-esp-elf/14.2.0/collect2.exe] ==> ignore
           arg [-plugin] ==> ignore
           arg [C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../libexec/gcc/riscv32-esp-elf/14.2.0/liblto_plugin.dll] ==> ignore
           arg [-plugin-opt=C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../libexec/gcc/riscv32-esp-elf/14.2.0/lto-wrapper.exe] ==> ignore
-          arg [-plugin-opt=-fresolution=C:\\Users\\fooba\\AppData\\Local\\Temp\\ccpq72fo.res] ==> ignore
+          arg [-plugin-opt=-fresolution=C:\\Users\\fooba\\AppData\\Local\\Temp\\ccV8bfOq.res] ==> ignore
           arg [-plugin-opt=-pass-through=-lgcc] ==> ignore
           arg [-plugin-opt=-pass-through=-lc] ==> ignore
           arg [-plugin-opt=-pass-through=-lnosys] ==> ignore
@@ -533,7 +533,7 @@ events:
           arg [-melf32lriscv] ==> ignore
           arg [-X] ==> ignore
           arg [-o] ==> ignore
-          arg [cmTC_bf96b] ==> ignore
+          arg [cmTC_01445] ==> ignore
           arg [-LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/rv32imafc_zicsr_zifencei/ilp32f] ==> dir [C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/rv32imafc_zicsr_zifencei/ilp32f]
           arg [-LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/lib/rv32imafc_zicsr_zifencei/ilp32f] ==> dir [C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/lib/rv32imafc_zicsr_zifencei/ilp32f]
           arg [-LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf/lib/rv32imafc_zicsr_zifencei/ilp32f] ==> dir [C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf/lib/rv32imafc_zicsr_zifencei/ilp32f]
@@ -542,8 +542,8 @@ events:
           arg [-LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/lib] ==> dir [C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/lib]
           arg [-LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf/lib] ==> dir [C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf/lib]
           arg [-LC:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf/usr/lib] ==> dir [C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../riscv32-esp-elf/usr/lib]
-          arg [-Map=G:\\px68k-tab5\\.pio\\build\\m5stack-tab5\\firmware.map] ==> ignore
-          arg [CMakeFiles/cmTC_bf96b.dir/CMakeCXXCompilerABI.cpp.obj] ==> ignore
+          arg [-Map=G:\\X68KTab5\\.pio\\build\\m5stack-tab5\\firmware.map] ==> ignore
+          arg [CMakeFiles/cmTC_01445.dir/CMakeCXXCompilerABI.cpp.obj] ==> ignore
           arg [-lstdc++] ==> lib [stdc++]
           arg [-lm] ==> lib [m]
           arg [-lgcc] ==> lib [gcc]
@@ -558,7 +558,7 @@ events:
           arg [--end-group] ==> ignore
         ignore line: [C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/bin/ld.exe: warning: cannot find entry symbol _start]
         ignore line: [ defaulting to 00010094]
-        ignore line: [COLLECT_GCC_OPTIONS='-nostartfiles' '-march=rv32imafc_zicsr_zifencei_xesppie' '-mabi=ilp32f' '-specs=nosys.specs' '-v' '-o' 'cmTC_bf96b' '-misa-spec=20191213' '-march=rv32imafc_zicsr_zifencei_xesppie' '-dumpdir' 'cmTC_bf96b.']
+        ignore line: [COLLECT_GCC_OPTIONS='-nostartfiles' '-march=rv32imafc_zicsr_zifencei_xesppie' '-mabi=ilp32f' '-specs=nosys.specs' '-v' '-o' 'cmTC_01445' '-misa-spec=20191213' '-march=rv32imafc_zicsr_zifencei_xesppie' '-dumpdir' 'cmTC_01445.']
         ignore line: []
         ignore line: []
         collapse library dir [C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/rv32imafc_zicsr_zifencei/ilp32f] ==> [C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/lib/gcc/riscv32-esp-elf/14.2.0/rv32imafc_zicsr_zifencei/ilp32f]
@@ -586,23 +586,23 @@ events:
     checks:
       - "Performing Test CMAKE_HAVE_LIBC_PTHREAD"
     directories:
-      source: "G:/px68k-tab5/.pio/build/m5stack-tab5/CMakeFiles/CMakeScratch/TryCompile-o3zsrw"
-      binary: "G:/px68k-tab5/.pio/build/m5stack-tab5/CMakeFiles/CMakeScratch/TryCompile-o3zsrw"
+      source: "G:/X68KTab5/.pio/build/m5stack-tab5/CMakeFiles/CMakeScratch/TryCompile-qpos00"
+      binary: "G:/X68KTab5/.pio/build/m5stack-tab5/CMakeFiles/CMakeScratch/TryCompile-qpos00"
     cmakeVariables:
       CMAKE_C_FLAGS: "-march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f "
       CMAKE_C_FLAGS_DEBUG: "-g"
-      CMAKE_EXE_LINKER_FLAGS: "-nostartfiles -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f --specs=nosys.specs  -Wl,-Map=G:\\px68k-tab5\\.pio\\build\\m5stack-tab5\\firmware.map"
+      CMAKE_EXE_LINKER_FLAGS: "-nostartfiles -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f --specs=nosys.specs  -Wl,-Map=G:\\X68KTab5\\.pio\\build\\m5stack-tab5\\firmware.map"
       CMAKE_MODULE_PATH: "C:/Users/fooba/.platformio/packages/framework-espidf/tools/cmake;C:/Users/fooba/.platformio/packages/framework-espidf/tools/cmake/third_party"
     buildResult:
       variable: "CMAKE_HAVE_LIBC_PTHREAD"
       cached: true
       stdout: |
-        Change Dir: 'G:/px68k-tab5/.pio/build/m5stack-tab5/CMakeFiles/CMakeScratch/TryCompile-o3zsrw'
+        Change Dir: 'G:/X68KTab5/.pio/build/m5stack-tab5/CMakeFiles/CMakeScratch/TryCompile-qpos00'
         
-        Run Build Command(s): C:/Users/fooba/.platformio/packages/tool-ninja/ninja.exe -v cmTC_cc4b0
-        [1/2] C:\\Users\\fooba\\.platformio\\packages\\toolchain-riscv32-esp\\bin\\riscv32-esp-elf-gcc.exe -DCMAKE_HAVE_LIBC_PTHREAD  -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f -o CMakeFiles/cmTC_cc4b0.dir/src.c.obj -c G:/px68k-tab5/.pio/build/m5stack-tab5/CMakeFiles/CMakeScratch/TryCompile-o3zsrw/src.c
-        [2/2] C:\\Windows\\system32\\cmd.exe /C "cd . && C:\\Users\\fooba\\.platformio\\packages\\toolchain-riscv32-esp\\bin\\riscv32-esp-elf-gcc.exe -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f -nostartfiles -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f --specs=nosys.specs  -Wl,-Map=G:\\px68k-tab5\\.pio\\build\\m5stack-tab5\\firmware.map CMakeFiles/cmTC_cc4b0.dir/src.c.obj -o cmTC_cc4b0   && cd ."
-        C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/bin/ld.exe: CMakeFiles/cmTC_cc4b0.dir/src.c.obj: in function `main':
+        Run Build Command(s): C:/Users/fooba/.platformio/packages/tool-ninja/ninja.exe -v cmTC_e60eb
+        [1/2] C:\\Users\\fooba\\.platformio\\packages\\toolchain-riscv32-esp\\bin\\riscv32-esp-elf-gcc.exe -DCMAKE_HAVE_LIBC_PTHREAD  -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f -o CMakeFiles/cmTC_e60eb.dir/src.c.obj -c G:/X68KTab5/.pio/build/m5stack-tab5/CMakeFiles/CMakeScratch/TryCompile-qpos00/src.c
+        [2/2] C:\\Windows\\system32\\cmd.exe /C "cd . && C:\\Users\\fooba\\.platformio\\packages\\toolchain-riscv32-esp\\bin\\riscv32-esp-elf-gcc.exe -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f -nostartfiles -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f --specs=nosys.specs  -Wl,-Map=G:\\X68KTab5\\.pio\\build\\m5stack-tab5\\firmware.map CMakeFiles/cmTC_e60eb.dir/src.c.obj -o cmTC_e60eb   && cd ."
+        C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/bin/ld.exe: CMakeFiles/cmTC_e60eb.dir/src.c.obj: in function `main':
         src.c:(.text+0x6e): warning: pthread_atfork is not implemented and will always fail
         C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/bin/ld.exe: src.c:(.text+0x50): warning: pthread_cancel is not implemented and will always fail
         C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/bin/ld.exe: src.c:(.text+0x34): warning: pthread_create is not implemented and will always fail
@@ -622,22 +622,22 @@ events:
     checks:
       - "Performing Test C_COMPILER_SUPPORTS_WFORMAT_SIGNEDNESS"
     directories:
-      source: "G:/px68k-tab5/.pio/build/m5stack-tab5/CMakeFiles/CMakeScratch/TryCompile-g5gg7u"
-      binary: "G:/px68k-tab5/.pio/build/m5stack-tab5/CMakeFiles/CMakeScratch/TryCompile-g5gg7u"
+      source: "G:/X68KTab5/.pio/build/m5stack-tab5/CMakeFiles/CMakeScratch/TryCompile-xbuba9"
+      binary: "G:/X68KTab5/.pio/build/m5stack-tab5/CMakeFiles/CMakeScratch/TryCompile-xbuba9"
     cmakeVariables:
       CMAKE_C_FLAGS: "-march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f  -Wall -Wextra -Wwrite-strings -Wmissing-prototypes -Wformat=2 -Wno-format-nonliteral -Wvla -Wlogical-op -Wshadow"
       CMAKE_C_FLAGS_DEBUG: "-g"
-      CMAKE_EXE_LINKER_FLAGS: "-nostartfiles -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f --specs=nosys.specs  -Wl,-Map=G:\\px68k-tab5\\.pio\\build\\m5stack-tab5\\firmware.map"
+      CMAKE_EXE_LINKER_FLAGS: "-nostartfiles -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f --specs=nosys.specs  -Wl,-Map=G:\\X68KTab5\\.pio\\build\\m5stack-tab5\\firmware.map"
       CMAKE_MODULE_PATH: "C:/Users/fooba/.platformio/packages/framework-espidf/tools/cmake;C:/Users/fooba/.platformio/packages/framework-espidf/tools/cmake/third_party"
     buildResult:
       variable: "C_COMPILER_SUPPORTS_WFORMAT_SIGNEDNESS"
       cached: true
       stdout: |
-        Change Dir: 'G:/px68k-tab5/.pio/build/m5stack-tab5/CMakeFiles/CMakeScratch/TryCompile-g5gg7u'
+        Change Dir: 'G:/X68KTab5/.pio/build/m5stack-tab5/CMakeFiles/CMakeScratch/TryCompile-xbuba9'
         
-        Run Build Command(s): C:/Users/fooba/.platformio/packages/tool-ninja/ninja.exe -v cmTC_8a4f6
-        [1/2] C:\\Users\\fooba\\.platformio\\packages\\toolchain-riscv32-esp\\bin\\riscv32-esp-elf-gcc.exe -DC_COMPILER_SUPPORTS_WFORMAT_SIGNEDNESS  -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f  -Wall -Wextra -Wwrite-strings -Wmissing-prototypes -Wformat=2 -Wno-format-nonliteral -Wvla -Wlogical-op -Wshadow    -Wformat-signedness -o CMakeFiles/cmTC_8a4f6.dir/src.c.obj -c G:/px68k-tab5/.pio/build/m5stack-tab5/CMakeFiles/CMakeScratch/TryCompile-g5gg7u/src.c
-        [2/2] C:\\Windows\\system32\\cmd.exe /C "cd . && C:\\Users\\fooba\\.platformio\\packages\\toolchain-riscv32-esp\\bin\\riscv32-esp-elf-gcc.exe -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f  -Wall -Wextra -Wwrite-strings -Wmissing-prototypes -Wformat=2 -Wno-format-nonliteral -Wvla -Wlogical-op -Wshadow -nostartfiles -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f --specs=nosys.specs  -Wl,-Map=G:\\px68k-tab5\\.pio\\build\\m5stack-tab5\\firmware.map CMakeFiles/cmTC_8a4f6.dir/src.c.obj -o cmTC_8a4f6   && cd ."
+        Run Build Command(s): C:/Users/fooba/.platformio/packages/tool-ninja/ninja.exe -v cmTC_40f0a
+        [1/2] C:\\Users\\fooba\\.platformio\\packages\\toolchain-riscv32-esp\\bin\\riscv32-esp-elf-gcc.exe -DC_COMPILER_SUPPORTS_WFORMAT_SIGNEDNESS  -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f  -Wall -Wextra -Wwrite-strings -Wmissing-prototypes -Wformat=2 -Wno-format-nonliteral -Wvla -Wlogical-op -Wshadow    -Wformat-signedness -o CMakeFiles/cmTC_40f0a.dir/src.c.obj -c G:/X68KTab5/.pio/build/m5stack-tab5/CMakeFiles/CMakeScratch/TryCompile-xbuba9/src.c
+        [2/2] C:\\Windows\\system32\\cmd.exe /C "cd . && C:\\Users\\fooba\\.platformio\\packages\\toolchain-riscv32-esp\\bin\\riscv32-esp-elf-gcc.exe -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f  -Wall -Wextra -Wwrite-strings -Wmissing-prototypes -Wformat=2 -Wno-format-nonliteral -Wvla -Wlogical-op -Wshadow -nostartfiles -march=rv32imafc_zicsr_zifencei_xesppie -mabi=ilp32f --specs=nosys.specs  -Wl,-Map=G:\\X68KTab5\\.pio\\build\\m5stack-tab5\\firmware.map CMakeFiles/cmTC_40f0a.dir/src.c.obj -o cmTC_40f0a   && cd ."
         C:/Users/fooba/.platformio/packages/toolchain-riscv32-esp/bin/../lib/gcc/riscv32-esp-elf/14.2.0/../../../../riscv32-esp-elf/bin/ld.exe: warning: cannot find entry symbol _start; defaulting to 00010094
         
       exitCode: 0

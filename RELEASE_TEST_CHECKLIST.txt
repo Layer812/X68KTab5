@@ -1,0 +1,24 @@
+PX68K Tab5 6.00 RELEASE CHECKLIST
+
+Use the stock release configuration (PERF/verbose traces disabled).
+
+[ ] HDD0 direct boot reaches Human68k/application.
+[ ] HostFS B:/F: DIR + create/write/delete works.
+[ ] Flash HUMAN302 quick boot works and SD HostFS remains usable.
+[ ] FDD XDF/DIM boot and F7/F8/F10/F11/F12 media controls work.
+[ ] USB keyboard key-down/key-up and function controls work.
+[ ] USB mouse movement + left/right buttons work.
+[ ] USB JoyPAD direction + A/B/C + upper A/B/C + L/R work, including combinations.
+[ ] JoyPAD remains connected for >=2 minutes with no periodic reconnect cycle.
+[ ] FM + ADPCM audio is audible with no pitch shift or permanent loss after heavy scenes.
+[ ] 256x256, 512x512, and 768-wide video modes show no stale/corrupt/frozen frames.
+[ ] Representative heavy scene runs >=5 minutes without panic/assert/WDT/uncommanded reset.
+
+Expected quiet release markers include:
+    PX68K Tab5 - Build 6.00
+    USB RC stability: lib/hid/ctl priority=6/6/5; root reset-recovery=80ms
+    USB PAD known 8-byte profile APPLIED (known retro pad)
+    CPU0 FINAL AUDIO MIX ACTIVE
+    HDD0 HOST READ OK / HDD0 HOST LAYOUT OK
+    HOSTFS WRITE PROBE OK / HOSTFS INIT
+    Human/FDD/keyboard/mouse/JoyPAD/composite baseline stable
