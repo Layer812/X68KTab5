@@ -15,13 +15,10 @@
 PX68K / Musashi をベースに、ESP32-P4 の **2つのHP CPU + LP Core**、PSRAM、MIPI-DSI、USB Host、microSD、内蔵オーディオを使う構成へ再設計しています。
 
 もともとは、昔の X68000 **PANIC** データを M5Stack Tab5 で再生したくなり、専用プレイヤー [**PanicPlayerTab5**](https://github.com/Layer812/PanicPlayerTab5) を作っていました。
-
 PANIC を再生するために必要な X68000 互換環境を少しずつ実装していったのですが、問題がひとつありました。
-
-**肝心の PANIC データが、まったく手元にありませんでした……。**
+**肝心の PANIC データが、まったく手元にありません……**
 
 ということで（？）、**まだ見ぬ PANIC データのために** CPU、画面、音、I/O、メモリ転送をひたすら詰めていった結果……
-
 **CPU1・LP Core・CPU0 が非同期に協調して動く、マルチノード協調型の X68000 エミュレータができました。**
 
 > [!IMPORTANT]
@@ -40,7 +37,7 @@ M5Burner の **Share Burn** で Share Code を入力してください。
 |---|---|---|
 | **Latest / Production** | `qUbdr77ZmhX8Esgo` | **通常はこちらを推奨** |
 | Previous public build | `pfDbZl26Z3MsI3wP` | 直前の公開版・比較用 |
-| Older public build | `aFmGCMA3FSvzcW5H` | 旧版との比較・相性確認用 |
+| Older public build | `aFmGCMA3FSvzcW5H` | 旧版との比較・相性確認用 (SFXVI早い)|
 | Legacy public build | `xX5zvurDW6xMacAK` | さらに古い公開版 |
 
 古い Share Code も残します。新しい版で相性問題が出たときや、以前の挙動と比較したいときに選べます。
