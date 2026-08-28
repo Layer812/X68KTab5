@@ -19,13 +19,16 @@
 #ifdef TCM_DRAM_ATTR
 #define PX68K_DEVHOT TCM_DRAM_ATTR
 #define PX68K_DEVCACHE DRAM_ATTR
+#define PX68K_DEVIRAM IRAM_ATTR
 #else
 #define PX68K_DEVHOT DRAM_ATTR
 #define PX68K_DEVCACHE DRAM_ATTR
+#define PX68K_DEVIRAM IRAM_ATTR
 #endif
 #else
 #define PX68K_DEVHOT
 #define PX68K_DEVCACHE
+#define PX68K_DEVIRAM
 #endif
 
 PX68K_DEVHOT uint8_t LastKey = 0;
@@ -50,6 +53,14 @@ static const int Timer_Prescaler[8] = {1, 10, 25, 40, 125, 160, 250, 500};
  * path whenever TACR bit 3 is set; TACR==8 remains handled by MFP_TimerA(). */
 static PX68K_DEVCACHE uint8_t s_timer_prescale_sel[4] = {0, 0, 0, 0};
 PX68K_DEVCACHE uint8_t MFP_TimerActiveMask = 0;
+#ifdef ESP_PLATFORM
+static DRAM_ATTR uint32_t s_mfp_exact_bc_calls = 0;
+static DRAM_ATTR uint32_t s_mfp_fallback_calls = 0;
+
+/* R26: R25 measured the steady-state exact timer tuple.  Production keeps
+ * only hit/fallback counters; no per-call trace bookkeeping remains. */
+static DRAM_ATTR uint8_t s_mfp_exact_bc_logged = 0;
+#endif
 
 static inline void mfp_refresh_timer_cache(void)
 {
@@ -425,10 +436,51 @@ static inline uint8_t mfp_timer_advance_fast(uint8_t cur, uint8_t reload,
    return (uint8_t)((uint32_t)reload - rem);
 }
 
-void FASTCALL MFP_TimerSlow(int32_t clock)
+void PX68K_DEVIRAM FASTCALL MFP_TimerSlow(int32_t clock)
 {
    static const uint8_t TimerInt[4] = { 2, 7, 10, 11 };
    const uint8_t active = MFP_TimerActiveMask;
+
+#ifdef ESP_PLATFORM
+   /* R26 measured exact steady-state MDX configuration:
+    *   TACR=08  -> Timer A is event-count mode, so not in this path
+    *   TBCR=01  -> Timer B /10, reload 13
+    *   TCDCR=70 -> Timer C /500, Timer D off, reload C=200
+    * R25 observed this tuple in 3,032,964 of 3,033,090 fallback calls.
+    * Keep exact control and reload guards so any guest reprogramming falls
+    * back to the original generic loop immediately. */
+   if (__builtin_expect(active == 0x06u &&
+                        MFP[MFP_TACR] == 0x08u &&
+                        MFP[MFP_TBCR] == 0x01u &&
+                        MFP[MFP_TCDCR] == 0x70u &&
+                        Timer_Reload[1] == 13u &&
+                        Timer_Reload[2] == 200u, 1))
+   {
+      ++s_mfp_exact_bc_calls;
+      if (!s_mfp_exact_bc_logged) {
+         s_mfp_exact_bc_logged = 1u;
+         printf("PX68K_MFPR26: exact TACR=08/TBCR=01/TCDCR=70 B=/10 C=/500 path ACTIVE\n");
+      }
+#define MFP_R26_STEP_CONST(CH, DIV, RELOAD, IRQNO) do { \
+         int32_t accum = Timer_Tick[(CH)] + clock; \
+         if (accum >= (DIV)) { \
+            const uint32_t decs = (uint32_t)accum / (uint32_t)(DIV); \
+            Timer_Tick[(CH)] = accum - (int32_t)(decs * (uint32_t)(DIV)); \
+            int fired = 0; \
+            MFP[MFP_TADR + (CH)] = mfp_timer_advance_fast( \
+               MFP[MFP_TADR + (CH)], (RELOAD), decs, &fired); \
+            if (fired) MFP_Int((IRQNO)); \
+         } else { \
+            Timer_Tick[(CH)] = accum; \
+         } \
+      } while (0)
+      MFP_R26_STEP_CONST(1, 10, 13, 7);
+      MFP_R26_STEP_CONST(2, 500, 200, 10);
+#undef MFP_R26_STEP_CONST
+      return;
+   }
+   ++s_mfp_fallback_calls;
+#endif
 
    for (int chan = 0; chan < 4; ++chan)
    {
@@ -455,7 +507,9 @@ void FASTCALL MFP_TimerSlow(int32_t clock)
    }
 }
 
-void FASTCALL MFP_TimerASlow(void)
+/* R26a: restore Timer-A event-count slow helper accidentally dropped while
+ * removing R25 trace code.  Semantics are byte-for-byte equivalent to R25. */
+void PX68K_DEVIRAM FASTCALL MFP_TimerASlow(void)
 {
    if (MFP[MFP_AER] & 0x10)
    {
@@ -480,4 +534,15 @@ void FASTCALL MFP_TimerASlow(void)
       MFP[MFP_TADR] = Timer_Reload[0];
       MFP_Int(2);
    }
+}
+
+void MFP_Tab5TimerFastStats(uint32_t *exact_bc, uint32_t *fallback)
+{
+#ifdef ESP_PLATFORM
+   if (exact_bc) *exact_bc = s_mfp_exact_bc_calls;
+   if (fallback) *fallback = s_mfp_fallback_calls;
+#else
+   if (exact_bc) *exact_bc = 0;
+   if (fallback) *fallback = 0;
+#endif
 }

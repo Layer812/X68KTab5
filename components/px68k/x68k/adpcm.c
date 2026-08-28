@@ -15,22 +15,36 @@
 
 #ifdef ESP_PLATFORM
 #include "esp_attr.h"
-#ifdef TCM_DRAM_ATTR
+#include "esp_memory_utils.h"
+#if defined(SPM_DRAM_ATTR)
+#define PX68K_ADHOT SPM_DRAM_ATTR
+#elif defined(TCM_DRAM_ATTR)
 #define PX68K_ADHOT TCM_DRAM_ATTR
-#define PX68K_ADTABLE DRAM_ATTR
 #else
 #define PX68K_ADHOT DRAM_ATTR
-#define PX68K_ADTABLE DRAM_ATTR
 #endif
+#define PX68K_ADTABLE DRAM_ATTR
+#define PX68K_ADBUF DRAM_ATTR
+#define PX68K_ADIRAM IRAM_ATTR
 #else
 #define PX68K_ADHOT
 #define PX68K_ADTABLE
+#define PX68K_ADBUF
+#define PX68K_ADIRAM
 #endif
 
 
 /* Intent: Exact audio samples are more important than vector speed here; keep the scalar-hoisted path after the PIE interpolation trial failed bit-exact validation.  Layer8 Aug/17/2026 */
 /* Build 5.99rc1: failed PIE interpolation trial removed; scalar-hoisted cubic path is production. */
+#ifdef ESP_PLATFORM
+/* R24: this is a Core1-only decode staging FIFO, not the Core1->Core0 host
+ * audio ring.  R23 runtime high-water was only 24 samples, so retain >10x
+ * safety margin at 256 samples = 1 KiB total.  The old 96,000-sample pair
+ * consumed 375 KiB of external BSS. */
+#define ADPCM_BufSize      256
+#else
 #define ADPCM_BufSize      96000
+#endif
 #define ADPCMMAX           2047
 #define ADPCMMIN          -2048
 #define FM_IPSCALE         256L
@@ -78,9 +92,13 @@ static PX68K_ADTABLE const uint16_t ADPCM_DifStep[8] = {
 
 #define ADPCM_SAMPLE_RATE_X12 (44100u * 12u)
 #define ADPCM_SAMPLE_RATE_DIV100 (ADPCM_SAMPLE_RATE_X12 / 100u)
-static PX68K_ADHOT int dif_table[49*16];
-static int16_t ADPCM_BufR[ADPCM_BufSize];
-static int16_t ADPCM_BufL[ADPCM_BufSize];
+/* The 3.1 KiB nibble-difference table is read once per decoded ADPCM nibble.
+ * It is hot, but not hot enough to monopolize nearly half of the P4's 8 KiB
+ * SPM.  R23 leaves SPM for tiny per-sample/per-instruction state. */
+static PX68K_ADTABLE int dif_table[49*16];
+/* R23: force the Core1 decode staging FIFO into on-chip SRAM. */
+static PX68K_ADBUF int16_t ADPCM_BufR[ADPCM_BufSize];
+static PX68K_ADBUF int16_t ADPCM_BufL[ADPCM_BufSize];
 
 static PX68K_ADHOT int32_t  ADPCM_WrPtr = 0;
 static PX68K_ADHOT int32_t  ADPCM_RdPtr = 0;
@@ -92,10 +110,31 @@ static PX68K_ADHOT int ADPCM_Out = 0;
 static PX68K_ADHOT uint8_t ADPCM_Playing = 0;
 static uint32_t s_debug_adpcm_control_writes = 0;
 static uint32_t s_debug_adpcm_data_writes = 0;
+#ifdef ESP_PLATFORM
+static PX68K_ADHOT uint32_t s_adpcm_buf_highwater = 0;
+static PX68K_ADHOT uint32_t s_adpcm_buf_overflows = 0;
+#endif
 
 uint32_t ADPCM_DebugControlWriteCount(void) { return s_debug_adpcm_control_writes; }
 uint32_t ADPCM_DebugDataWriteCount(void) { return s_debug_adpcm_data_writes; }
 int ADPCM_DebugPlaying(void) { return ADPCM_Playing ? 1 : 0; }
+uint32_t ADPCM_Tab5BufferCapacity(void) { return (uint32_t)ADPCM_BufSize; }
+uint32_t ADPCM_Tab5BufferHighWater(void)
+{
+#ifdef ESP_PLATFORM
+    return s_adpcm_buf_highwater;
+#else
+    return 0;
+#endif
+}
+uint32_t ADPCM_Tab5BufferOverflows(void)
+{
+#ifdef ESP_PLATFORM
+    return s_adpcm_buf_overflows;
+#else
+    return 0;
+#endif
+}
 static PX68K_ADHOT uint8_t ADPCM_Clock = 0;
 static PX68K_ADHOT int ADPCM_PreCounter = 0;
 static PX68K_ADHOT int ADPCM_DifBuf = 0;
@@ -107,13 +146,30 @@ static PX68K_ADHOT int OutsIp[4];
 static PX68K_ADHOT int OutsIpR[4];
 static PX68K_ADHOT int OutsIpL[4];
 
+int ADPCM_Tab5SpmStateOk(void)
+{
+#ifdef ESP_PLATFORM
+    const void *ptrs[] = {
+        &ADPCM_VolumeShift, &ADPCM_WrPtr, &ADPCM_RdPtr, &ADPCM_SampleRate,
+        &ADPCM_ClockRate, &ADPCM_Count, &ADPCM_Step, &ADPCM_Out, &ADPCM_Playing,
+        &ADPCM_Clock, &ADPCM_PreCounter, &ADPCM_DifBuf, &ADPCM_Pan,
+        &OldR, &OldL, Outs, OutsIp, OutsIpR, OutsIpL
+    };
+    for (unsigned i = 0; i < sizeof(ptrs) / sizeof(ptrs[0]); ++i)
+        if (!esp_ptr_in_tcm(ptrs[i])) return 0;
+    return 1;
+#else
+    return 0;
+#endif
+}
+
 int ADPCM_StateAction(StateMem *sm, int load, int data_only)
 {
 	SFORMAT StateRegs[] = 
 	{
 		/* TODO: Some of the vars might not be necessary */
-		SFARRAY16(ADPCM_BufL, 96000),
-		SFARRAY16(ADPCM_BufR, 96000),
+		SFARRAY16(ADPCM_BufL, ADPCM_BufSize),
+		SFARRAY16(ADPCM_BufR, ADPCM_BufSize),
 
 		SFVAR(ADPCM_VolumeShift),
 		SFVAR(ADPCM_WrPtr),
@@ -171,7 +227,7 @@ static void ADPCM_InitTable(void)
 	}
 }
 
-void FASTCALL ADPCM_PreUpdate(uint32_t clock)
+void PX68K_ADIRAM FASTCALL ADPCM_PreUpdate(uint32_t clock)
 {
 	const uint8_t ci = (uint8_t)(ADPCM_Clock & 7u);
 	ADPCM_PreCounter += (int)(ADPCM_PreStep[ci] * clock);
@@ -181,7 +237,7 @@ void FASTCALL ADPCM_PreUpdate(uint32_t clock)
 		if ( ADPCM_DifBuf<=0 )
       {
 			ADPCM_DifBuf = 0;
-			DMA_Exec(3);
+			if (!DMA_Exec3ADPCMFast()) DMA_Exec(3);
 		}
 		ADPCM_PreCounter -= 10000000L;
 	}
@@ -203,7 +259,7 @@ void ADPCM_Update(int16_t *buffer, size_t length, uint8_t *pbsp, uint8_t *pbep)
             buffer = (int16_t*)pbsp;
 
          if ( (ADPCM_WrPtr==ADPCM_RdPtr)&&(!(DMA[3].CCR&0x40)) )
-            DMA_Exec(3);
+            if (!DMA_Exec3ADPCMFast()) DMA_Exec(3);
          if ( ADPCM_WrPtr!=ADPCM_RdPtr )
          {
             OldR = outr = ADPCM_BufL[ADPCM_RdPtr];
@@ -266,7 +322,7 @@ void ADPCM_Update(int16_t *buffer, size_t length, uint8_t *pbsp, uint8_t *pbep)
             buffer = (int16_t*)pbsp;
 
          if ( (ADPCM_WrPtr==ADPCM_RdPtr)&&(!(DMA[3].CCR&0x40)) )
-            DMA_Exec(3);
+            if (!DMA_Exec3ADPCMFast()) DMA_Exec(3);
          if ( ADPCM_WrPtr!=ADPCM_RdPtr )
          {
             OldR = outr = ADPCM_BufL[ADPCM_RdPtr];
@@ -332,12 +388,30 @@ static INLINE int adpcm_clip12(int v)
 
 static INLINE void adpcm598c_store_sample(int tmp)
 {
+    int32_t next = ADPCM_WrPtr + 1;
+    if (next >= ADPCM_BufSize) next = 0;
+#ifdef ESP_PLATFORM
+    /* A full FIFO must never become indistinguishable from empty.  The old
+     * 96k buffer relied on "this never fills".  Keep that assumption visible
+     * after shrinking it: preserve queued samples, drop only the impossible
+     * newest sample, and count it. */
+    if (next == ADPCM_RdPtr) {
+        ++s_adpcm_buf_overflows;
+        return;
+    }
+#endif
     tmp = adpcm_clip12(tmp);
     if (!(ADPCM_Pan & 1)) ADPCM_BufR[ADPCM_WrPtr] = (int16_t)tmp;
     else                  ADPCM_BufR[ADPCM_WrPtr] = 0;
     if (!(ADPCM_Pan & 2)) ADPCM_BufL[ADPCM_WrPtr] = (int16_t)tmp;
     else                  ADPCM_BufL[ADPCM_WrPtr] = 0;
-    if (++ADPCM_WrPtr >= ADPCM_BufSize) ADPCM_WrPtr = 0;
+    ADPCM_WrPtr = next;
+#ifdef ESP_PLATFORM
+    int32_t used = ADPCM_WrPtr - ADPCM_RdPtr;
+    if (used < 0) used += ADPCM_BufSize;
+    if ((uint32_t)used > s_adpcm_buf_highwater)
+        s_adpcm_buf_highwater = (uint32_t)used;
+#endif
 }
 
 static INLINE void ADPCM_WriteOne(uint8_t val)
@@ -388,7 +462,7 @@ static INLINE void ADPCM_WriteOne(uint8_t val)
     }
 }
 
-void FASTCALL ADPCM_Write(uint32_t adr, uint8_t data)
+void PX68K_ADIRAM FASTCALL ADPCM_Write(uint32_t adr, uint8_t data)
 {
 	if ( adr==0xe92001 )
    {
@@ -462,6 +536,10 @@ void ADPCM_Init(void)
 	ADPCM_Playing    = 0;
 	ADPCM_SampleRate = ADPCM_SAMPLE_RATE_X12;
 	ADPCM_PreCounter = 0;
+#ifdef ESP_PLATFORM
+    s_adpcm_buf_highwater = 0;
+    s_adpcm_buf_overflows = 0;
+#endif
 	memset(Outs, 0, sizeof(Outs));
 	OutsIp[0]  = OutsIp[1]  = OutsIp[2]  = OutsIp[3]  = -1;
 	OutsIpR[0] = OutsIpR[1] = OutsIpR[2] = OutsIpR[3] = 0;
@@ -470,4 +548,10 @@ void ADPCM_Init(void)
 
 	ADPCM_SetPan(0x0b);
 	ADPCM_InitTable();
+#ifdef ESP_PLATFORM
+    printf("PX68K_ADSRAM_R24: Core1 ADPCM decode staging INTERNAL bytes=%u frames=%u (~%ums) highwater=0 overflow=0; R23 measured max=24, capacity reduced 4096->256\n",
+           (unsigned)(ADPCM_BufSize * 2u * sizeof(int16_t)),
+           (unsigned)ADPCM_BufSize,
+           (unsigned)((ADPCM_BufSize * 1000u) / 44100u));
+#endif
 }

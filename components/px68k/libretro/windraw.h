@@ -15,6 +15,14 @@ void WinDraw_PerfGetLast(uint32_t *grp_us, uint32_t *text_us, uint32_t *bg_us,
                          uint32_t *dirty_lines, uint32_t *grp_calls,
                          uint32_t *text_calls, uint32_t *bg_calls,
                          uint32_t *blend_calls);
+void WinDraw_PerfGetR57E40(uint32_t *gbt_us, uint32_t *commit_us,
+                           uint32_t *gbt_calls, uint32_t *commit_calls,
+                           uint32_t *arm_count, uint32_t *active);
+void WinDraw_PerfGetR57E44(uint32_t *fused_lines, uint32_t *fallback_lines,
+                           uint32_t *cache_rebuilds, uint32_t *cache_failures);
+void WinDraw_PerfGetR57E48(uint32_t *direct_lines, uint32_t *fallback_lines,
+                           uint32_t *text_reject, uint32_t *bg_reject,
+                           uint32_t *final_reject);
 
 int WinDraw_MenuInit(void);
 void WinDraw_DrawMenu(int menu_state, int mkey_pos, int mkey_y, int *mval_y);

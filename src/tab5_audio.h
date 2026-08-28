@@ -39,6 +39,8 @@ typedef struct
     uint32_t speaker_rate_hz;
     uint32_t rate_servo_active; /* 1 = pitch-safe 22.05-kHz quality mode */
     uint32_t rate_changes;
+    uint32_t cpu0_mix_work_us;      /* Build 6.15g cumulative host final-mix/pull work */
+    uint32_t cpu0_speaker_work_us;  /* Build 6.15g cumulative speaker staging work */
 } tab5_audio_stats_t;
 
 int tab5_audio_init(void);
@@ -49,6 +51,7 @@ void tab5_audio_get_stats(tab5_audio_stats_t *out);
 /* Runtime master-volume stepper. direction >0 = louder, <0 = quieter. */
 int tab5_audio_step_volume(int direction);
 int tab5_audio_get_volume(void);
+uint32_t tab5_audio_stack_highwater(void);
 
 #ifdef __cplusplus
 }

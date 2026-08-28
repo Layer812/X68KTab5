@@ -55,6 +55,20 @@ uint8_t GVRAM_DebugLastData(void);
 uint8_t GVRAM_DebugLastMode(void);
 
 void Grp_DrawLine16(void);
+/* BAT177NW14/R57E44: exact common 65K GRP decode + GBT selector fusion.
+ * Returns 1 when fused rendering completed, 0 when caller must materialize
+ * Grp_LineBuf and use the retained R57E34 selector. */
+int Grp_DrawLine16GBT(uint16_t *dst, const uint16_t *bt, const uint8_t *flags,
+                      uint32_t width, uint8_t grp_pri, uint8_t bg_pri,
+                      uint8_t text_pri);
+int Grp_DrawLine16GBT_SelfCheck(void);
+void Grp_DrawLine16GBT_DebugGet(uint32_t *cache_rebuilds, uint32_t *cache_failures);
+/* BAT177NW18/R57E48: direct final compositor. TEXT/BG are compact palette
+ * indices; raw 65K GVRAM decode and G/B/T priority resolution happen once. */
+int Grp_DrawLine16TBGI(uint16_t *dst, const uint8_t *text_idx,
+                       const uint8_t *bg_idx, uint32_t width,
+                       uint8_t grp_pri, uint8_t bg_pri, uint8_t text_pri);
+int Grp_DrawLine16TBGI_SelfCheck(void);
 void FASTCALL Grp_DrawLine8(int page, int opaq);
 void FASTCALL Grp_DrawLine8Pair(int bottom_page, int top_page);
 void FASTCALL Grp_DrawLine4(uint32_t page, int opaq);

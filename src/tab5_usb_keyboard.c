@@ -5,6 +5,10 @@
  */
 #include "tab5_usb_keyboard.h"
 
+#ifndef PX68K_TAB5_RELEASE_DIAGNOSTICS
+#define PX68K_TAB5_RELEASE_DIAGNOSTICS 0
+#endif
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -28,6 +32,7 @@
 #include "libretro/joystick.h"
 #include "tab5_guest_input.h"
 #include "tab5_usb_keymap.h"
+#include "esp_rom_sys.h"
 
 #define TAB5_USB_CTRL_QUEUE_DEPTH 8
 #define TAB5_USB_BOOT_REPORT_SIZE 8u
@@ -58,6 +63,8 @@ typedef struct
 } usb_ctrl_event_t;
 
 static QueueHandle_t s_ctrl_queue = NULL;
+static TaskHandle_t s_usb_lib_task = NULL;
+static TaskHandle_t s_usb_ctl_task = NULL;
 static hid_host_device_handle_t s_keyboard_handle = NULL;
 static hid_host_device_handle_t s_mouse_handle = NULL;
 static hid_host_device_handle_t s_joypad_handle = NULL;
@@ -761,6 +768,16 @@ static void hid_driver_callback(hid_host_device_handle_t handle,
 
 static void usb_control_task(void *arg)
 {
+#if PX68K_TAB5_RELEASE_DIAGNOSTICS
+    {
+        const uintptr_t r56k5_base = (uintptr_t)pxTaskGetStackStart(NULL);
+        esp_rom_printf("R56K5_TASKSELF name=tab5_usb_ctl core=%d base=0x%08x top=0x%08x bytes=4096 hwm=%u\\n",
+                       (int)xPortGetCoreID(), (unsigned)r56k5_base,
+                       (unsigned)(r56k5_base + 4096u),
+                       (unsigned)uxTaskGetStackHighWaterMark(NULL));
+    }
+#endif
+
     usb_ctrl_event_t ctrl;
     (void)arg;
 
@@ -884,6 +901,16 @@ static void usb_control_task(void *arg)
 
 static void usb_library_task(void *arg)
 {
+#if PX68K_TAB5_RELEASE_DIAGNOSTICS
+    {
+        const uintptr_t r56k5_base = (uintptr_t)pxTaskGetStackStart(NULL);
+        esp_rom_printf("R56K5_TASKSELF name=tab5_usb_lib core=%d base=0x%08x top=0x%08x bytes=4096 hwm=%u\\n",
+                       (int)xPortGetCoreID(), (unsigned)r56k5_base,
+                       (unsigned)(r56k5_base + 4096u),
+                       (unsigned)uxTaskGetStackHighWaterMark(NULL));
+    }
+#endif
+
     TaskHandle_t starter = (TaskHandle_t)arg;
     const usb_host_config_t config = {
         .skip_phy_setup = false,
@@ -966,7 +993,7 @@ int tab5_usb_keyboard_start(void)
                           4096,
                           (void *)self,
                           TAB5_USB_LIB_TASK_PRIO,
-                          NULL,
+                          &s_usb_lib_task,
                           0);
 #else
     task_ok = xTaskCreate(usb_library_task,
@@ -974,7 +1001,7 @@ int tab5_usb_keyboard_start(void)
                           4096,
                           (void *)self,
                           TAB5_USB_LIB_TASK_PRIO,
-                          NULL);
+                          &s_usb_lib_task);
 #endif
     if (task_ok != pdPASS)
     {
@@ -997,7 +1024,7 @@ int tab5_usb_keyboard_start(void)
                           4096,
                           NULL,
                           TAB5_USB_CTRL_TASK_PRIO,
-                          NULL,
+                          &s_usb_ctl_task,
                           0);
 #else
     task_ok = xTaskCreate(usb_control_task,
@@ -1005,7 +1032,7 @@ int tab5_usb_keyboard_start(void)
                           4096,
                           NULL,
                           TAB5_USB_CTRL_TASK_PRIO,
-                          NULL);
+                          &s_usb_ctl_task);
 #endif
     if (task_ok != pdPASS)
     {
@@ -1083,4 +1110,10 @@ uint32_t tab5_usb_joypad_event_count(void)
 uint32_t tab5_usb_keyboard_take_hotkeys(void)
 {
     return __atomic_exchange_n(&s_hotkeys, 0u, __ATOMIC_ACQ_REL);
+}
+
+void tab5_usb_keyboard_stack_highwater(uint32_t *lib_bytes, uint32_t *ctl_bytes)
+{
+    if (lib_bytes) *lib_bytes = s_usb_lib_task ? (uint32_t)uxTaskGetStackHighWaterMark(s_usb_lib_task) : 0u;
+    if (ctl_bytes) *ctl_bytes = s_usb_ctl_task ? (uint32_t)uxTaskGetStackHighWaterMark(s_usb_ctl_task) : 0u;
 }

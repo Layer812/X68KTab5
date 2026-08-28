@@ -311,6 +311,11 @@ void m68k_pulse_reset(void);
 void m68k_tab5_dynarec_bind(void *arena, unsigned int bytes,
                             int (*sync_fn)(void *addr, unsigned int bytes));
 unsigned int m68k_tab5_dynarec_metadata_bytes(void);
+void m68k_tab5_cmphi617_stats(unsigned int *calls, unsigned long long *loops, unsigned int *maxbatch);
+void m68k_tab5_mdx619_stats(unsigned int *calls, unsigned long long *outer, unsigned long long *fixed_insn, unsigned int *maxbatch);
+void m68k_tab5_mdx622_stats(unsigned int *calls, unsigned long long *loops, unsigned int *maxbatch);
+void m68k_tab5_be01161_stats(unsigned int *bsr_seen, unsigned int *tail_hits,
+                             unsigned int *dbf_exit);
 
 /* execute num_cycles worth of instructions.  returns number of cycles used */
 int m68k_execute(int num_cycles);
@@ -372,6 +377,12 @@ void m68k_set_reg(m68k_register_t reg, unsigned int value);
 
 /* Check if an instruction is valid for the specified CPU type */
 unsigned int m68k_is_valid_instruction(unsigned int instruction, unsigned int cpu_type);
+
+#ifdef ESP_PLATFORM
+/* R57E65: use pacing slack only as a cache hint.  The helper never advances
+ * guest state and only reads the current PC when it lies in ordinary RAM/IPL. */
+unsigned int m68k_tab5_slack_prefetch_current(void);
+#endif
 
 /* ======================================================================== */
 /* ============================== END OF FILE ============================= */

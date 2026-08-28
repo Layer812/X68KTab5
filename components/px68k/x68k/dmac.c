@@ -13,16 +13,22 @@
 #include "adpcm.h"
 #include "mercury.h"
 #include "dmac.h"
+#ifdef ESP_PLATFORM
+#include "../libretro/dswin.h"
+#endif
 
 #ifdef ESP_PLATFORM
 #include "esp_attr.h"
 #ifdef TCM_DRAM_ATTR
 #define PX68K_DEVHOT TCM_DRAM_ATTR
+#define PX68K_DEVIRAM IRAM_ATTR
 #else
 #define PX68K_DEVHOT DRAM_ATTR
+#define PX68K_DEVIRAM IRAM_ATTR
 #endif
 #else
 #define PX68K_DEVHOT
+#define PX68K_DEVIRAM
 #endif
 
 PX68K_DEVHOT dmac_ch DMA[4];
@@ -30,15 +36,31 @@ PX68K_DEVHOT dmac_ch DMA[4];
 static PX68K_DEVHOT int DMA_IntCH = 0;
 static PX68K_DEVHOT int DMA_LastInt = 0;
 static PX68K_DEVHOT int (*IsReady[4])(void) = { 0, 0, 0, 0 };
+#ifdef ESP_PLATFORM
+static DRAM_ATTR uint32_t s_dma3_adpcm_fast_hits = 0;
+static DRAM_ATTR uint32_t s_dma3_adpcm_fast_fallbacks = 0;
+static DRAM_ATTR uint8_t s_dma3_adpcm_fast_logged = 0;
+
+/* R26: R25 trace proved the MDX channel-3 mode is effectively invariant:
+ * OCR=0x32 DCR=0x80 SCR=0x04, RAM -> $E92003, one byte/request.
+ * Keep only production hit/fallback counters here; the trace tables are gone. */
+#endif
 
 static uint32_t FASTCALL DMA_Int(uint8_t irq);
 
-#define DMAINT(ch)     if ( DMA[ch].CCR&0x08 )	{ DMA_IntCH |= (1<<ch); IRQH_Int(3, &DMA_Int); }
-#define DMAERR(ch,err) DMA[ch].CER  = err; \
-                       DMA[ch].CSR |= 0x10; \
-                       DMA[ch].CSR &= 0xf7; \
-                       DMA[ch].CCR &= 0x7f; \
-                       DMAINT(ch)
+#define DMAINT(ch) do { \
+    if (DMA[ch].CCR & 0x08) { \
+        DMA_IntCH |= (1u << (ch)); \
+        IRQH_Int(3, &DMA_Int); \
+    } \
+} while (0)
+#define DMAERR(ch,err) do { \
+    DMA[ch].CER  = (err); \
+    DMA[ch].CSR |= 0x10; \
+    DMA[ch].CSR &= 0xf7; \
+    DMA[ch].CCR &= 0x7f; \
+    DMAINT(ch); \
+} while (0)
 
 int DMAC_StateAction(StateMem *sm, int load, int data_only)
 {
@@ -283,7 +305,7 @@ void FASTCALL DMA_Write(uint32_t adr, uint8_t data)
          if ((data & 0x10) && (DMA[ch].CCR & 0x80))
          {
             /* Software Abort */
-            DMAERR(ch, 0x11)
+            DMAERR(ch, 0x11);
                break;
          }
          if (data & 0x20) /* Halt */
@@ -306,7 +328,7 @@ void FASTCALL DMA_Write(uint32_t adr, uint8_t data)
                if (DMA[ch].CSR & 0xf8)
                {
                   /* Timing errors */
-                  DMAERR(ch, 0x02)
+                  DMAERR(ch, 0x02);
                      break;
                }
                DMA[ch].CSR |= 0x08;
@@ -325,7 +347,7 @@ void FASTCALL DMA_Write(uint32_t adr, uint8_t data)
                      if (!DMA[ch].BTC)
                      {
                         /* This is also a counting error */
-                        DMAERR(ch, 0x0f)
+                        DMAERR(ch, 0x0f);
                            break;
                      }
                   }
@@ -333,7 +355,7 @@ void FASTCALL DMA_Write(uint32_t adr, uint8_t data)
                if (!DMA[ch].MTC)
                {
                   /* Counting error */
-                  DMAERR(ch, 0x0d)
+                  DMAERR(ch, 0x0d);
                      break;
                }
                DMA[ch].CER = 0x00;
@@ -347,12 +369,12 @@ void FASTCALL DMA_Write(uint32_t adr, uint8_t data)
             {
                if (DMA[ch].CCR & 0x40)
                {
-                  DMAERR(ch, 0x02)
+                  DMAERR(ch, 0x02);
                }
                else if (DMA[ch].OCR & 8)
                {
                   /* Array/Link Array Chain */
-                  DMAERR(ch, 0x01)
+                  DMAERR(ch, 0x01);
                }
                else
                {
@@ -364,12 +386,12 @@ void FASTCALL DMA_Write(uint32_t adr, uint8_t data)
                   if (!DMA[ch].MAR)
                   {
                      DMA[ch].CSR |= 0x40; /* Block transfer end bit/interrupt? */
-                     DMAINT(ch)
+                     DMAINT(ch);
                         break;
                   }
                   else if (!DMA[ch].MTC)
                   {
-                     DMAERR(ch, 0x0d)
+                     DMAERR(ch, 0x0d);
                         break;
                   }
                   DMA[ch].CCR &= 0xbf;
@@ -379,7 +401,7 @@ void FASTCALL DMA_Write(uint32_t adr, uint8_t data)
             else
             {
                /* The CNT bit in non-active mode indicates an operation timing error */
-               DMAERR(ch, 0x02)
+               DMAERR(ch, 0x02);
             }
          }
          break;
@@ -478,6 +500,89 @@ void FASTCALL DMA_Write(uint32_t adr, uint8_t data)
    }
 }
 
+
+/* R24 DEVICE-FIRST: guarded DMA channel-3 specialization.
+ *
+ * The MDX/PCM8 hot case is a single byte transfer from ordinary 12 MiB guest
+ * RAM to the MSM6258 data register at $E92003.  The generic DMAC path performs
+ * address dispatch, callback selection, width switching and completion/chain
+ * checks for every byte.  For interior bytes (MTC > 1) none of the completion
+ * machinery can run, so execute only the exact architectural work here.
+ *
+ * Safety:
+ *  - only memory->device byte transfers to exactly $E92003,
+ *  - source must be ordinary guest RAM,
+ *  - only one-transfer request modes are accepted,
+ *  - final byte / completion / chaining is always delegated to DMA_Exec(3),
+ *  - any unusual mode immediately falls back to the generic engine.
+ */
+int PX68K_DEVIRAM FASTCALL DMA_Exec3ADPCMFast(void)
+{
+#ifndef ESP_PLATFORM
+    return 0;
+#else
+    dmac_ch * const d = &DMA[3];
+
+    /* Generic DMA_Exec() would be a no-op for these states. */
+    if (!(d->CSR & 0x08) || (d->CCR & 0x20) || (d->CSR & 0x80) || !d->MTC)
+        return 1;
+
+    /* Keep the terminal transfer authoritative: completion IRQ, continuation
+     * and chain semantics remain entirely in the original implementation. */
+    if (d->MTC <= 1) {
+        ++s_dma3_adpcm_fast_fallbacks;
+        return 0;
+    }
+
+    /* R25 measured 101245/101245 calls in exactly this tuple.  R24 had
+     * incorrectly assumed width_mode=4; OCR=0x32,DCR=0x80 actually maps to
+     * generic DMA case 3, which is still an 8-bit transfer but uses the
+     * device-side packing mode encoded by the 68450 registers. */
+    if (d->OCR != 0x32u ||
+        d->DCR != 0x80u ||
+        d->SCR != 0x04u ||
+        d->DAR != 0x00e92003u ||
+        d->MAR >= 0x00c00000u) {
+        ++s_dma3_adpcm_fast_fallbacks;
+        return 0;
+    }
+
+    BusErrFlag = 0;
+#ifdef MSB_FIRST
+    const uint8_t val = MEM[d->MAR];
+#else
+    const uint8_t val = MEM[d->MAR ^ 1u];
+#endif
+
+    /* Preserve wm_adpcm() ordering exactly: pending guest-time PCM must be
+     * rendered before this newly-arriving ADPCM byte changes decoder state. */
+    DSound_FlushADPCMPending();
+    ADPCM_Write(0x00e92003u, val);
+
+    /* Exact SCR=0x04: increment MAR by one byte, keep DAR fixed. */
+    ++d->MAR;
+    --d->MTC;
+
+    ++s_dma3_adpcm_fast_hits;
+    if (!s_dma3_adpcm_fast_logged) {
+        s_dma3_adpcm_fast_logged = 1;
+        printf("PX68K_DMA3R26: measured OCR=32/DCR=80/SCR=04 RAM->ADPCM fast path ACTIVE; final-byte/completion stays generic\n");
+    }
+    return 1;
+#endif
+}
+
+void DMA_Tab5ADPCMFastStats(uint32_t *hits, uint32_t *fallbacks)
+{
+#ifdef ESP_PLATFORM
+    if (hits) *hits = s_dma3_adpcm_fast_hits;
+    if (fallbacks) *fallbacks = s_dma3_adpcm_fast_fallbacks;
+#else
+    if (hits) *hits = 0;
+    if (fallbacks) *fallbacks = 0;
+#endif
+}
+
 int FASTCALL DMA_Exec(int ch)
 {
 	uint32_t *src, *dst;
@@ -542,27 +647,27 @@ int FASTCALL DMA_Exec(int ch)
 			switch ( BusErrFlag ) {
 			case 1:					/* BusErr/Read */
 				if ( DMA[ch].OCR&0x80 )		/* Device->Memory */
-					DMAERR(ch,0x0a)
+					DMAERR(ch,0x0a);
 				else
-					DMAERR(ch,0x09)
+					DMAERR(ch,0x09);
 				break;
 			case 2:					/* BusErr/Write */
 				if ( DMA[ch].OCR&0x80 )		/* Device->Memory */
-					DMAERR(ch,0x09)
+					DMAERR(ch,0x09);
 				else
-					DMAERR(ch,0x0a)
+					DMAERR(ch,0x0a);
 				break;
 			case 3:					/* AdrErr/Read */
 				if ( DMA[ch].OCR&0x80 )		/* Device->Memory */
-					DMAERR(ch,0x06)
+					DMAERR(ch,0x06);
 				else
-					DMAERR(ch,0x05)
+					DMAERR(ch,0x05);
 				break;
 			case 4:					/* BusErr/Write */
 				if ( DMA[ch].OCR&0x80 )		/* Device->Memory */
-					DMAERR(ch,0x05)
+					DMAERR(ch,0x05);
 				else
-					DMAERR(ch,0x06)
+					DMAERR(ch,0x06);
 				break;
 			}
 			BusErrFlag = 0;
@@ -579,13 +684,13 @@ int FASTCALL DMA_Exec(int ch)
 						DMA[ch].BAR = dma_readmem24_dword(DMA[ch].BAR+6);
 						if ( BusErrFlag ) {
 							if ( BusErrFlag==1 )
-								DMAERR(ch,0x0b)
+								DMAERR(ch,0x0b);
 							else
-								DMAERR(ch,0x07)
+								DMAERR(ch,0x07);
 							BusErrFlag = 0;
 							break;
 						} else if ( !DMA[ch].MTC ) {
-							DMAERR(ch,0x0d)
+							DMAERR(ch,0x0d);
 							break;
 						}
 					}
@@ -597,13 +702,13 @@ int FASTCALL DMA_Exec(int ch)
 						DMA[ch].BAR += 6;
 						if ( BusErrFlag ) {
 							if ( BusErrFlag==1 )
-								DMAERR(ch,0x0b)
+								DMAERR(ch,0x0b);
 							else
-								DMAERR(ch,0x07)
+								DMAERR(ch,0x07);
 							BusErrFlag = 0;
 							break;
 						} else if ( !DMA[ch].MTC ) {
-							DMAERR(ch,0x0d)
+							DMAERR(ch,0x0d);
 							break;
 						}
 					}
@@ -611,7 +716,7 @@ int FASTCALL DMA_Exec(int ch)
 			} else {								      /* Normal mode (only one block) finished */
 				if ( DMA[ch].CCR&0x40 ) {			/* Countinuous action */
 					DMA[ch].CSR |= 0x40;			   /* Block transfer end bit/interrupt */
-					DMAINT(ch)
+					DMAINT(ch);
 					if ( DMA[ch].BAR ) {
 						DMA[ch].MAR  = DMA[ch].BAR;
 						DMA[ch].MTC  = DMA[ch].BTC;
@@ -619,7 +724,7 @@ int FASTCALL DMA_Exec(int ch)
 						DMA[ch].BAR  = 0x00;
 						DMA[ch].BTC  = 0x00;
 						if ( !DMA[ch].MTC ) {
-							DMAERR(ch,0x0d)
+							DMAERR(ch,0x0d);
 							break;
 						}
 						DMA[ch].CCR &= 0xbf;
@@ -629,7 +734,7 @@ int FASTCALL DMA_Exec(int ch)
 			if ( !DMA[ch].MTC ) {
 				DMA[ch].CSR |= 0x80;
 				DMA[ch].CSR &= 0xf7;
-				DMAINT(ch)
+				DMAINT(ch);
 			}
 		}
 		if ( (DMA[ch].OCR&3)!=1 ) break;

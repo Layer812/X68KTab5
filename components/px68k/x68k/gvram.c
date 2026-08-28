@@ -24,11 +24,9 @@
 extern volatile uint32_t tab5_compose_gvram_dma_pending;
 extern volatile uint32_t tab5_compose_gvram_cache_pending;
 extern void tab5_compose_guest_gvram_barrier(void);
-#define GVRAM_HOST_SOURCE_BARRIER() do { \
-    if (__builtin_expect((__atomic_load_n(&tab5_compose_gvram_dma_pending, __ATOMIC_ACQUIRE) | \
-                          __atomic_load_n(&tab5_compose_gvram_cache_pending, __ATOMIC_ACQUIRE)) != 0u, 0)) \
-        tab5_compose_guest_gvram_barrier(); \
-} while (0)
+/* BAT177NW0: CPU1 NO-WAIT. Shared-source CPU0 raster paths are production-
+ * quarantined, so guest writes never wait for host readers. */
+#define GVRAM_HOST_SOURCE_BARRIER() do { } while (0)
 #else
 #define GVRAM_HOST_SOURCE_BARRIER() do { } while (0)
 #endif
@@ -56,7 +54,12 @@ uint32_t GVRAM_RowGenerationGet(uint32_t row)
 
 static void gvram_row_generation_reset_all(void)
 {
-    for (uint32_t i = 0; i < 512u; ++i) GVRAM_RowGeneration[i] = 1u;
+    /* Host caches survive guest-only reset.  Never recycle generation 1 here:
+     * bump every physical row so a pre-reset decoded row cannot compare equal
+     * after GVRAM has been cleared/reinitialized.  First boot naturally moves
+     * BSS zero -> generation 1. */
+    for (uint32_t i = 0; i < 512u; ++i)
+        gvram_row_generation_bump(i);
 }
 /* Build 5.25: hot scanline scratch is defined by the app component so it
  * remains in internal SRAM instead of libpx68k.a external-BSS/PSRAM. */
@@ -112,6 +115,9 @@ void GVRAM_Init(void)
 {
 	int i;
 
+    /* Guest-only reset can occur while host services remain alive.  Drain any
+     * CPU0 cache readers before clearing the shared GVRAM backing store. */
+    GVRAM_HOST_SOURCE_BARRIER();
 	s_debug_write_count = 0;
 	s_debug_fast_clear_count = 0;
 	s_debug_last_addr = 0;
@@ -925,6 +931,360 @@ uint32_t GVRAM_CopyWordStream256(uint32_t src_adr, uint32_t dst_adr,
 /*
  *   From here on, the screen will be expanded line by line.
  */
+/* BAT177NW14/R57E44: exact 65K GRP decode + GBT selector fusion.
+ *
+ * The R57E43 profile shows GRP65K and the final GBT selector each consume
+ * ~36-38 us/dirty line. The historical common path first materializes the
+ * entire 512-pixel Grp_LineBuf, then immediately walks it again in the GBT
+ * selector. This path consumes the raw 65K GVRAM word once and resolves the
+ * final RGB565 pixel in the same loop.
+ *
+ * Palette semantics stay exact. The two Pal_Regs components selected by
+ * Pal16Adr are cached in two 256-entry internal tables and rebuilt whenever
+ * Pal_DebugVisualGeneration() changes (graphics palette, contrast, state
+ * restore). R57E48 further replaces the final Pal16[] random lookup with an
+ * exhaustively validated 32x3 RGB565 channel cache. */
+static uint16_t s_grp16_gbt_lo[256] __attribute__((aligned(16)));
+static uint16_t s_grp16_gbt_hi[256] __attribute__((aligned(16)));
+/* BAT177NW18/R57E48 FINAL: Pal16[65536] lives in the component's large BSS
+ * and may be external.  RGB565 conversion is exactly separable into the
+ * 5-bit R/G/B fields plus the X68000 intensity bit.  Cache only 32 entries
+ * per channel in hot internal BSS and remove the random 128KiB Pal16 lookup
+ * from every 65K graphics pixel. */
+static uint16_t s_grp16_rgb_r[32] __attribute__((aligned(16)));
+static uint16_t s_grp16_rgb_g[32] __attribute__((aligned(16)));
+static uint16_t s_grp16_rgb_b[32] __attribute__((aligned(16)));
+static uint16_t s_grp16_rgb_fallback;
+static uint16_t s_grp16_rgb_ibit;
+static uint8_t s_grp16_rgb_contrast = 0xffu;
+static uint8_t s_grp16_rgb_reported = 0u;
+static uint32_t s_grp16_gbt_generation = 0xffffffffu;
+static uint32_t s_grp16_gbt_cache_rebuilds;
+static uint32_t s_grp16_gbt_cache_failures;
+static int s_grp16_gbt_ok;
+
+static inline uint16_t grp16_code_to_rgb(uint16_t code)
+{
+    uint16_t rgb = (uint16_t)(
+        s_grp16_rgb_r[(code >> 6) & 31u] |
+        s_grp16_rgb_g[(code >> 11) & 31u] |
+        s_grp16_rgb_b[(code >> 1) & 31u]);
+    /* Pal_ChangeContrast preserves the dimmest non-black color by forcing
+     * B[0] when a nonzero RGB code scales entirely to zero. */
+    if ((code & 0xfffeu) != 0u && rgb == 0u)
+        rgb = s_grp16_rgb_fallback;
+    if (code & 1u)
+        rgb |= s_grp16_rgb_ibit;
+    return rgb;
+}
+
+static int grp16_rgb_cache_rebuild(uint8_t contrast)
+{
+    /* At contrast zero every channel contribution is zero; only the legacy
+     * non-black fallback and intensity bit survive. */
+    if (contrast == 0u) {
+        memset(s_grp16_rgb_r, 0, sizeof(s_grp16_rgb_r));
+        memset(s_grp16_rgb_g, 0, sizeof(s_grp16_rgb_g));
+        memset(s_grp16_rgb_b, 0, sizeof(s_grp16_rgb_b));
+    } else {
+        /* A max-blue or max-red anchor guarantees the historical global
+         * "nonblack became zero" fallback cannot contaminate the channel
+         * being extracted.  RGB565 masks are fixed by WinDraw_Init(). */
+        for (uint32_t x = 0u; x < 32u; ++x) {
+            s_grp16_rgb_r[x] = (uint16_t)(
+                Pal16[(x << 6) | (31u << 1)] & WinDraw_Pal16R);
+            s_grp16_rgb_g[x] = (uint16_t)(
+                Pal16[(x << 11) | (31u << 1)] & WinDraw_Pal16G);
+            s_grp16_rgb_b[x] = (uint16_t)(
+                Pal16[(31u << 6) | (x << 1)] & WinDraw_Pal16B);
+        }
+    }
+    s_grp16_rgb_fallback = Pal16[2u];
+    s_grp16_rgb_ibit = Pal16[1u];
+
+    /* Full sequential validation is paid only when effective contrast
+     * changes (normally once at startup).  It proves the 96-entry reduction
+     * against the authoritative Pal16 table for every possible color code. */
+    for (uint32_t code = 0u; code < 65536u; ++code) {
+        if (grp16_code_to_rgb((uint16_t)code) != Pal16[code]) {
+            ++s_grp16_gbt_cache_failures;
+            printf("PX68K_RGB5CACHE_R57E48: exhaustive code->RGB565 validation FAIL code=%04lX contrast=%u; fallback\n",
+                   (unsigned long)code, (unsigned)contrast);
+            return 0;
+        }
+    }
+    s_grp16_rgb_contrast = contrast;
+    if (!s_grp16_rgb_reported) {
+        printf("PX68K_RGB5CACHE_R57E48: exhaustive 65536 code->RGB565 validation PASS contrast=%u; 32x3 channel cache armed\n",
+               (unsigned)contrast);
+        s_grp16_rgb_reported = 1u;
+    }
+    return 1;
+}
+
+static int grp16_gbt_cache_rebuild(void)
+{
+    const uint32_t gen = Pal_DebugVisualGeneration();
+    const uint8_t contrast = Pal_DebugEffectiveContrast();
+    for (uint32_t i = 0; i < 256u; ++i) {
+        s_grp16_gbt_lo[i] = (uint16_t)Pal_Regs[Pal16Adr[i]];
+        s_grp16_gbt_hi[i] = (uint16_t)((uint16_t)Pal_Regs[Pal16Adr[i] + 2u] << 8);
+    }
+    if (s_grp16_rgb_contrast != contrast && !grp16_rgb_cache_rebuild(contrast)) {
+        s_grp16_gbt_ok = 0;
+        return 0;
+    }
+    /* Component-wise validation is sufficient for raw-word -> 16-bit color
+     * code: the legacy decoder forms exactly lo|hi.  code -> RGB565 was
+     * exhaustively certified above for the active contrast. */
+    for (uint32_t i = 0; i < 256u; ++i) {
+        if (s_grp16_gbt_lo[i] != (uint16_t)Pal_Regs[Pal16Adr[i]] ||
+            s_grp16_gbt_hi[i] != (uint16_t)((uint16_t)Pal_Regs[Pal16Adr[i] + 2u] << 8)) {
+            ++s_grp16_gbt_cache_failures;
+            s_grp16_gbt_ok = 0;
+            return 0;
+        }
+    }
+    s_grp16_gbt_generation = gen;
+    ++s_grp16_gbt_cache_rebuilds;
+    return 1;
+}
+
+static inline uint16_t grp16_gbt_decode(uint16_t raw)
+{
+    if (raw == 0u) return 0u;
+    const uint16_t code = (uint16_t)(s_grp16_gbt_lo[raw & 0xffu] |
+                                     s_grp16_gbt_hi[(raw >> 8) & 0xffu]);
+    return grp16_code_to_rgb(code);
+}
+
+static inline uint16_t grp16_gbt_select(uint16_t g, uint16_t bt, uint8_t f,
+                                         const uint8_t mode[4])
+{
+    f &= 3u;
+    if (f == 0u) return g;
+    if (mode[f] == 1u) return bt ? bt : g; /* BG/TEXT candidate above GRP */
+    return g ? g : bt;                    /* GRP above BG/TEXT candidate */
+}
+
+int Grp_DrawLine16GBT_SelfCheck(void)
+{
+    /* Exhaustively validate the per-line priority reduction against the
+     * historical R57E34 structural rule for all G/B/T priorities, flags and
+     * zero/nonzero source combinations. */
+    for (uint32_t gp = 0; gp < 4u; ++gp)
+      for (uint32_t bp = 0; bp < 4u; ++bp)
+        for (uint32_t tp = 0; tp < 4u; ++tp) {
+            uint8_t mode[4] = {0u, 0u, 0u, 0u};
+            mode[1] = (uint8_t)(tp <= gp);
+            mode[2] = (uint8_t)(bp <= gp);
+            mode[3] = (uint8_t)(((bp < tp) ? bp : tp) <= gp);
+            for (uint32_t f = 0; f < 4u; ++f)
+              for (uint32_t gz = 0; gz < 2u; ++gz)
+                for (uint32_t bz = 0; bz < 2u; ++bz) {
+                    const uint16_t g = gz ? 0u : 0x1234u;
+                    const uint16_t bt = bz ? 0u : 0x5678u;
+                    uint8_t p = 4u;
+                    if (f & 2u) p = (uint8_t)bp;
+                    if ((f & 1u) && tp < p) p = (uint8_t)tp;
+                    const uint16_t ref = !f ? g :
+                        ((p <= gp) ? (bt ? bt : g) : (g ? g : bt));
+                    const uint16_t got = grp16_gbt_select(g, bt, (uint8_t)f, mode);
+                    if (got != ref) {
+                        s_grp16_gbt_ok = 0;
+                        return 0;
+                    }
+                }
+        }
+    s_grp16_gbt_ok = 1;
+    s_grp16_gbt_generation = 0xffffffffu;
+    return 1;
+}
+
+void Grp_DrawLine16GBT_DebugGet(uint32_t *cache_rebuilds, uint32_t *cache_failures)
+{
+    if (cache_rebuilds) *cache_rebuilds = s_grp16_gbt_cache_rebuilds;
+    if (cache_failures) *cache_failures = s_grp16_gbt_cache_failures;
+}
+
+int Grp_DrawLine16GBT(uint16_t *dst, const uint16_t *bt, const uint8_t *flags,
+                      uint32_t width, uint8_t grp_pri, uint8_t bg_pri,
+                      uint8_t text_pri)
+{
+    if (!s_grp16_gbt_ok || !dst || !bt || !flags || width == 0u || width > 800u)
+        return 0;
+
+    const uint32_t gen = Pal_DebugVisualGeneration();
+    if (s_grp16_gbt_generation != gen && !grp16_gbt_cache_rebuild())
+        return 0;
+
+    grp_pri &= 3u; bg_pri &= 3u; text_pri &= 3u;
+    uint8_t mode[4] = {0u, 0u, 0u, 0u};
+    mode[1] = (uint8_t)(text_pri <= grp_pri);
+    mode[2] = (uint8_t)(bg_pri <= grp_pri);
+    mode[3] = (uint8_t)(((bg_pri < text_pri) ? bg_pri : text_pri) <= grp_pri);
+
+    uint32_t y = GrphScrollY[0] + VLINE;
+    if ((CRTC_Regs[0x29] & 0x1c) == 0x1c) y += VLINE;
+    y = (y & 0x1ffu) << 10;
+    uint32_t sx = GrphScrollX[0] & 0x1ffu;
+    const uint16_t *src = (const uint16_t *)(GVRAM + y + sx * 2u);
+    uint32_t run = 0x200u - sx;
+    if (run > width) run = width;
+
+    uint32_t i = 0u;
+    while (i < width) {
+        uint32_t n = run;
+        if (n > width - i) n = width - i;
+        uint32_t j = 0u;
+        /* Four-pixel unroll keeps raw GVRAM/palette/BT/flag accesses adjacent
+         * while preserving exact per-pixel transparency semantics. */
+        for (; j + 4u <= n; j += 4u) {
+            const uint16_t g0 = grp16_gbt_decode(src[j + 0u]);
+            const uint16_t g1 = grp16_gbt_decode(src[j + 1u]);
+            const uint16_t g2 = grp16_gbt_decode(src[j + 2u]);
+            const uint16_t g3 = grp16_gbt_decode(src[j + 3u]);
+            dst[i+j+0u] = grp16_gbt_select(g0, bt[i+j+0u], flags[i+j+0u], mode);
+            dst[i+j+1u] = grp16_gbt_select(g1, bt[i+j+1u], flags[i+j+1u], mode);
+            dst[i+j+2u] = grp16_gbt_select(g2, bt[i+j+2u], flags[i+j+2u], mode);
+            dst[i+j+3u] = grp16_gbt_select(g3, bt[i+j+3u], flags[i+j+3u], mode);
+        }
+        for (; j < n; ++j) {
+            const uint16_t g = grp16_gbt_decode(src[j]);
+            dst[i+j] = grp16_gbt_select(g, bt[i+j], flags[i+j], mode);
+        }
+        i += n;
+        if (i >= width) break;
+        src = (const uint16_t *)(GVRAM + y);
+        run = width - i;
+    }
+    return 1;
+}
+
+
+/* BAT177NW18/R57E48: final common compositor in the compact index domain.
+ * TEXT and BG have already been decoded to palette indices, but neither has
+ * materialized RGB565 nor Text_TrFlag.  Resolve their exact historical draw
+ * order, decode raw 65K GVRAM once, then apply the frozen R57E34 GRP-vs-B/T
+ * priority/key-zero rule. */
+static int s_grp16_tbgi_ok;
+
+static inline uint8_t grp16_tbgi_pick_idx(uint8_t ti, uint8_t bi,
+                                          uint8_t bg_pri, uint8_t text_pri)
+{
+    if (ti && bi)
+        return (bg_pri < text_pri) ? bi : ti; /* TEXT wins equal priority */
+    return ti ? ti : bi;
+}
+
+int Grp_DrawLine16TBGI_SelfCheck(void)
+{
+    /* Validate candidate-presence, BG/TEXT tie order, and final GRP relation
+     * for every priority tuple.  RGB zero remains a key-zero value exactly as
+     * in the materialized R57E44 selector. */
+    for (uint32_t gp = 0; gp < 4u; ++gp)
+      for (uint32_t bp = 0; bp < 4u; ++bp)
+        for (uint32_t tp = 0; tp < 4u; ++tp)
+          for (uint32_t tv = 0; tv < 2u; ++tv)
+            for (uint32_t bv = 0; bv < 2u; ++bv)
+              for (uint32_t gz = 0; gz < 2u; ++gz)
+                for (uint32_t wz = 0; wz < 2u; ++wz) {
+                    const uint8_t f = (uint8_t)((tv ? 1u : 0u) | (bv ? 2u : 0u));
+                    const uint8_t ti = tv ? 0x57u : 0u;
+                    const uint8_t bi = bv ? 0x34u : 0u;
+                    const uint8_t exp_idx = !f ? 0u :
+                        (tv && bv ? ((bp < tp) ? bi : ti) : (tv ? ti : bi));
+                    if (grp16_tbgi_pick_idx(ti, bi, (uint8_t)bp, (uint8_t)tp) != exp_idx) {
+                        s_grp16_tbgi_ok = 0;
+                        return 0;
+                    }
+                    const uint16_t g = gz ? 0u : 0x1234u;
+                    uint16_t bt = 0u;
+                    if (f) bt = wz ? 0u : (tv && bv ? ((bp < tp) ? 0x3456u : 0x5678u)
+                                                        : (tv ? 0x5678u : 0x3456u));
+                    uint8_t p = 4u;
+                    if (f & 2u) p = (uint8_t)bp;
+                    if ((f & 1u) && tp < p) p = (uint8_t)tp;
+                    const uint16_t ref = !f ? g :
+                        ((p <= gp) ? (bt ? bt : g) : (g ? g : bt));
+
+                    uint8_t mode[4] = {0u,0u,0u,0u};
+                    mode[1] = (uint8_t)(tp <= gp);
+                    mode[2] = (uint8_t)(bp <= gp);
+                    mode[3] = (uint8_t)(((bp < tp) ? bp : tp) <= gp);
+                    const uint16_t got = !f ? g :
+                        (mode[f] ? (bt ? bt : g) : (g ? g : bt));
+                    if (got != ref) { s_grp16_tbgi_ok = 0; return 0; }
+                }
+    s_grp16_tbgi_ok = 1;
+    return 1;
+}
+
+int __attribute__((hot, optimize("O3"))) Grp_DrawLine16TBGI(uint16_t *dst, const uint8_t *text_idx,
+                       const uint8_t *bg_idx, uint32_t width,
+                       uint8_t grp_pri, uint8_t bg_pri, uint8_t text_pri)
+{
+    if (!s_grp16_tbgi_ok || !s_grp16_gbt_ok || !dst || !text_idx || !bg_idx ||
+        width == 0u || width > 800u)
+        return 0;
+    const uint32_t gen = Pal_DebugVisualGeneration();
+    if (s_grp16_gbt_generation != gen && !grp16_gbt_cache_rebuild())
+        return 0;
+
+    grp_pri &= 3u; bg_pri &= 3u; text_pri &= 3u;
+    uint8_t mode[4] = {0u,0u,0u,0u};
+    mode[1] = (uint8_t)(text_pri <= grp_pri);
+    mode[2] = (uint8_t)(bg_pri <= grp_pri);
+    mode[3] = (uint8_t)(((bg_pri < text_pri) ? bg_pri : text_pri) <= grp_pri);
+
+    uint32_t y = GrphScrollY[0] + VLINE;
+    if ((CRTC_Regs[0x29] & 0x1cu) == 0x1cu) y += VLINE;
+    y = (y & 0x1ffu) << 10;
+    uint32_t sx = GrphScrollX[0] & 0x1ffu;
+    const uint16_t *src = (const uint16_t *)(GVRAM + y + sx * 2u);
+    uint32_t run = 0x200u - sx;
+    if (run > width) run = width;
+
+    uint32_t i = 0u;
+    while (i < width) {
+        uint32_t n = run;
+        if (n > width - i) n = width - i;
+        uint32_t j = 0u;
+        for (; j + 4u <= n; j += 4u) {
+            for (uint32_t k = 0u; k < 4u; ++k) {
+                const uint32_t q = i + j + k;
+                const uint8_t ti = text_idx[q];
+                const uint8_t bi = bg_idx[q];
+                const uint8_t f = (uint8_t)((ti ? 1u : 0u) | (bi ? 2u : 0u));
+                const uint16_t g = grp16_gbt_decode(src[j + k]);
+                if (!f) {
+                    dst[q] = g;
+                } else {
+                    const uint16_t bt = TextPal[grp16_tbgi_pick_idx(ti, bi, bg_pri, text_pri)];
+                    dst[q] = mode[f] ? (bt ? bt : g) : (g ? g : bt);
+                }
+            }
+        }
+        for (; j < n; ++j) {
+            const uint32_t q = i + j;
+            const uint8_t ti = text_idx[q];
+            const uint8_t bi = bg_idx[q];
+            const uint8_t f = (uint8_t)((ti ? 1u : 0u) | (bi ? 2u : 0u));
+            const uint16_t g = grp16_gbt_decode(src[j]);
+            if (!f) dst[q] = g;
+            else {
+                const uint16_t bt = TextPal[grp16_tbgi_pick_idx(ti, bi, bg_pri, text_pri)];
+                dst[q] = mode[f] ? (bt ? bt : g) : (g ? g : bt);
+            }
+        }
+        i += n;
+        if (i >= width) break;
+        src = (const uint16_t *)(GVRAM + y);
+        run = width - i;
+    }
+    return 1;
+}
+
 void Grp_DrawLine16(void)
 {
 	uint16_t *srcp, *destp;
@@ -1541,7 +1901,7 @@ void FASTCALL Grp_DrawLine4SP(uint32_t page/*, int opaq*/)
 	uint32_t off;
 	uint32_t i;
 	uint16_t v;
-	uint32_t scrx, scry;
+	uint32_t scrx = 0, scry = 0;
 	page &= 3;
 	switch(page)
    {

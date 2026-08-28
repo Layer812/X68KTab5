@@ -71,23 +71,23 @@ struct internal_file
 	int	fd;
 };
 
+/*
+ * PX68K Tab5:
+ * local_alloc() below always returns a fixed handle: the payload address
+ * immediately following struct internal_handle.  This file never creates a
+ * movable/header-style handle, so keeping both representations makes modern
+ * GCC's object-bounds analysis see impossible out-of-bounds branches.
+ *
+ * Keep one unambiguous representation and use byte-pointer arithmetic.
+ */
 #define ptrtohandle(h)							\
-    ((struct internal_handle *)((void *)(h) - sizeof(struct internal_handle)))
-
-#define isfixed(h)							\
-    ((ptrtohandle(h)->p == (h)) ? 1 : 0)
+    ((struct internal_handle *)((uint8_t *)(h) - sizeof(struct internal_handle)))
 
 #define sethandletype(h,t)						\
-    do {								\
-        if (isfixed(h))							\
-	    ptrtohandle(h)->type = (t);					\
-	else								\
-	    (((struct internal_handle *)(h))->type = (t));		\
-    } while (/* CONSTCOND */0)
+    do { ptrtohandle(h)->type = (t); } while (/* CONSTCOND */0)
 
 #define handletype(h)							\
-    ((isfixed(h)) ?							\
-        ptrtohandle(h)->type : (((struct internal_handle *)(h))->type))
+    (ptrtohandle(h)->type)
 
 uint32_t FAKE_GetTickCount(void)
 {
@@ -99,59 +99,46 @@ uint32_t FAKE_GetTickCount(void)
 
 static void *local_lock(void *h)
 {
-	struct internal_handle *ih = h;
-
-	if (isfixed(h))
-		return h;
-	ih->refcount++;
-
-	return ih->p;
+	/* local_alloc() creates fixed handles; the handle is already the payload. */
+	return h;
 }
 
 static int local_unlock(void *h)
 {
-	struct internal_handle *ih = h;
-
-	if (isfixed(h) || ih->refcount == 0)
-		return 0;
-
-	if (--ih->refcount != 0) /* still locked? */
-		return 1;
-
-	/* unlocked */
+	(void)h;
+	/* Fixed handles do not have a lock/unlock transition. */
 	return 0;
 }
 
-static void *local_alloc(size_t bytes) 
+static void *local_alloc(size_t bytes)
 {
-	struct internal_handle *p = (struct internal_handle*)
-		malloc(bytes + sizeof(struct internal_handle));
+	struct internal_handle *p = (struct internal_handle *)
+		malloc(sizeof(*p) + bytes);
 	if (p)
 	{
-		p->p        = &p[1];
+		p->p        = (uint8_t *)p + sizeof(*p);
+		p->flags    = 0;
 		p->psize    = bytes;
 		p->refcount = 0;
 		p->type     = HTYPE_MEMORY;
 		return p->p;
 	}
-	return 0;
+	return NULL;
 }
 
 static void *local_free(void *h)
 {
-	struct internal_handle *ih = h;
+	struct internal_handle *ih;
 
-	if (h == 0)
+	if (h == NULL)
 		return NULL;
-	if (!isfixed(h))
-		return NULL;
-	ih = (void*)(h - sizeof(struct internal_handle));
-	if (ih->p == &ih[1])
-	{
-		free(ih);
-		return NULL;
-	}
-	return h;
+
+	ih = ptrtohandle(h);
+	if (ih->p != h)
+		return h;
+
+	free(ih);
+	return NULL;
 }
 
 int read_file(void* h, void *buf, size_t len, size_t *lp)

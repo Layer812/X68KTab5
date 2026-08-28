@@ -1,6 +1,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <string.h>
 
 extern void exit(int);
 
@@ -41,23 +42,24 @@ static uint32 pkmask3[18] =
 
 static inline double fx80_to_double(floatx80 fx)
 {
-	uint64 d;
-	double *foo;
+	uint64 bits = floatx80_to_float64(fx);
+	double out;
 
-	foo = (double *)&d;
-
-	d = floatx80_to_float64(fx);
-
-	return *foo;
+	/*
+	 * Do not type-pun through pointers here.  Besides violating strict
+	 * aliasing, GCC 14 can correctly diagnose an out-of-bounds 8-byte read
+	 * if uint64 is ever accidentally narrowed by configuration.
+	 */
+	memcpy(&out, &bits, sizeof(out));
+	return out;
 }
 
 static inline floatx80 double_to_fx80(double in)
 {
-	uint64 *d;
+	uint64 bits;
 
-	d = (uint64 *)&in;
-
-	return float64_to_floatx80(*d);
+	memcpy(&bits, &in, sizeof(bits));
+	return float64_to_floatx80(bits);
 }
 
 static inline floatx80 load_extended_float80(uint32 ea)

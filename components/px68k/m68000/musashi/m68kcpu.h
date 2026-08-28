@@ -83,13 +83,20 @@ typedef signed   int sint;
 typedef unsigned int uint;
 
 
-#if M68K_USE_64_BIT
+/*
+ * PX68K Tab5 / modern Musashi type-width fix:
+ *
+ * M68K_USE_64_BIT selects Musashi's optional 64-bit optimized execution
+ * paths.  It must NOT change the semantic width of the uint64/sint64 types:
+ * SoftFloat/FPU/MMU code requires these names to be real 64-bit integers
+ * even when the optional CPU fast paths are disabled.
+ */
 typedef signed   long long sint64;
 typedef unsigned long long uint64;
-#else
-typedef sint32 sint64;
-typedef uint32 uint64;
-#endif /* M68K_USE_64_BIT */
+
+/* Fail at compile time if a toolchain ever violates the required widths. */
+typedef char px68k_musashi_uint64_must_be_8_bytes[(sizeof(uint64) == 8) ? 1 : -1];
+typedef char px68k_musashi_sint64_must_be_8_bytes[(sizeof(sint64) == 8) ? 1 : -1];
 
 /* U64 and S64 are used to wrap long integer constants. */
 #ifdef __GNUC__

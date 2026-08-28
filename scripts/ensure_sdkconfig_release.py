@@ -1,6 +1,6 @@
-# Build 6.13c14r2: converge old/fresh PlatformIO worktrees on the exact
-# memory layout proven by the c13/c14 Tab5 runs (128 KiB L2 cache + 16 MiB flash),
-# while retaining production CPU affinity/WDT, HEX-PSRAM and Dynarec W^X settings.
+# Build 6.15h17-dbfb: converge old/fresh PlatformIO worktrees on the exact
+# known-good 6.15g memory/runtime baseline.  Explicitly remove every LP-core/ULP
+# setting from experimental h..h13 trees so this build is a genuinely clean HP-only baseline.
 Import("env")
 from pathlib import Path
 
@@ -59,6 +59,11 @@ unsets = {
     "CONFIG_ESPTOOLPY_FLASHSIZE_32MB",
     "CONFIG_ESPTOOLPY_FLASHSIZE_64MB",
     "CONFIG_ESPTOOLPY_FLASHSIZE_128MB",
+    # Build 6.15h17-dbfb: LP-core experiments are archived, not active.
+    "CONFIG_ULP_COPROC_ENABLED",
+    "CONFIG_ULP_COPROC_TYPE_LP_CORE",
+    "CONFIG_ULP_COPROC_RUN_FROM_HP_MEM",
+    "CONFIG_RTC_FAST_CLK_SRC_XTAL",
     # Build 6.13b2: native Dynarec needs runtime write + execute on the
     # statically reserved internal SRAM arena. ESP-IDF 5.4.2 enables both
     # protection mechanisms by default where supported; force them off even
@@ -92,10 +97,10 @@ def patch_sdkconfig(path: Path) -> bool:
     for key in unsets:
         if key not in unset_done: out.append(f"# {key} is not set")
     path.write_text("\n".join(out) + "\n", encoding="utf-8")
-    print(f"Build 6.13c14r2: known-good 128KB L2 + 16MB flash + HEX PSRAM + Dynarec settings enforced in {path.name}")
+    print(f"Build 6.15h17-dbfb: known-good 6.15g memory + HP-only (ULP disabled) settings enforced for DoubleFB build in {path.name}")
     return True
 
 patched = patch_sdkconfig(project / f"sdkconfig.{pioenv}")
 patched = patch_sdkconfig(project / "sdkconfig") or patched
 if not patched:
-    print("Build 6.13c14r2: no generated sdkconfig yet; sdkconfig.defaults will seed known-good 128KB L2 + 16MB flash + HEX PSRAM")
+    print("Build 6.15h17-dbfb: no generated sdkconfig yet; sdkconfig.defaults will seed known-good 6.15g HP-only configuration")

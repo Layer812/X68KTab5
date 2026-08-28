@@ -26,6 +26,16 @@ uint32_t Pal_DebugGrphWriteCount(void);
 uint32_t Pal_DebugTextWriteCount(void);
 uint32_t Pal_DebugLastAddr(void);
 uint8_t Pal_DebugLastData(void);
+/* Build 6.15e: raster-safe 65K cache key. */
+uint32_t Pal_DebugVisualGeneration(void);
+uint8_t Pal_DebugEffectiveContrast(void);
+/* BAT177NW6/R57E36: classify palette-driven full-screen dirties. */
+void Pal_Tab5DirtyStatsTake(uint32_t *grph, uint32_t *text, uint32_t *contrast);
+/* BAT177NW7/R57E37: exact TextPal prune reasons + source bank histogram. */
+void Pal_Tab5PruneStatsTake(uint32_t *effective_same,
+                            uint32_t *unused_bank,
+                            uint32_t *visual_dirty,
+                            uint32_t bank_write[16]);
 int Pal_StateAction(StateMem *sm, int load, int data_only);
 
 extern uint16_t Ibit, Pal_HalfMask, Pal_Ix2;

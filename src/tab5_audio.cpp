@@ -5,6 +5,13 @@
  */
 #include "tab5_audio.h"
 
+#ifndef PX68K_TAB5_RELEASE_DIAGNOSTICS
+#define PX68K_TAB5_RELEASE_DIAGNOSTICS 0
+#endif
+#ifndef PX68K_TAB5_R57E63_AUDIO_AUDIT
+#define PX68K_TAB5_R57E63_AUDIO_AUDIT 0
+#endif
+
 #include <M5Unified.h>
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -15,9 +22,13 @@
 #include <algorithm>
 #include <cstring>
 #include <climits>
+#include "esp_rom_sys.h"
 
 extern "C" int WinX68k_AudioHostFramesAvail(void);
 extern "C" int WinX68k_AudioHostReadFrames(int16_t *dst, int max_frames);
+extern "C" void WinX68k_AudioAsyncGetStats(uint32_t *qdepth, uint32_t *event_drops, uint32_t *ring_overruns, uint32_t *fm_avail);
+extern "C" uint32_t WinX68k_AudioProducedFrames(void);
+extern "C" uint32_t OPM_DebugDataWriteCount(void);
 
 static const char *TAG = "TAB5_AUDIO";
 
@@ -43,11 +54,16 @@ static const char *TAG = "TAB5_AUDIO";
  * real speaker underflow.  Keep full 1024-frame chunks, build a small reserve
  * before first playback/recovery, and let producer notifications wake us.
  */
-static constexpr size_t kRingFrames = 32768;
+static constexpr size_t kRingFrames = 32768; /* R13: restore 128 KiB host ring; keep in PSRAM to preserve compositor Internal SRAM */
 static constexpr size_t kRingMask = kRingFrames - 1;
-static constexpr size_t kChunkFrames = 1024;
-static constexpr size_t kStartupWatermarkFrames = 3 * kChunkFrames; /* 69.7 ms */
-static constexpr size_t kResumeWatermarkFrames = 2 * kChunkFrames;  /* 46.4 ms */
+static constexpr size_t kChunkFrames = 512;
+/* R57E57: halve feeder granularity so a real starvation recovers in ~23 ms
+ * instead of ~46 ms, while keeping the original ~70 ms cold-start reserve. */
+static constexpr size_t kStartupWatermarkFrames = 6 * kChunkFrames; /* 69.7 ms */
+/* R57E67: recovery needs more than a single 23-ms cushion when guest
+ * production is hovering around real time.  Resume with ~46 ms in hand;
+ * normal steady playback latency is unchanged. */
+static constexpr size_t kResumeWatermarkFrames = 4 * kChunkFrames;  /* 46.4 ms */
 static constexpr size_t kLowWatermarkFrames = kChunkFrames;
 static constexpr size_t kPlayBuffers = 3;
 static constexpr int kSpeakerChannel = 0;
@@ -62,7 +78,9 @@ static size_t s_count = 0;
 static TaskHandle_t s_task = nullptr;
 static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
 static bool s_started = false;
+#if PX68K_TAB5_RELEASE_DIAGNOSTICS
 static bool s_nonzero_announced = false;
+#endif
 static bool s_host_mix_announced = false;
 static uint32_t s_reset_seq = 0;
 
@@ -81,13 +99,23 @@ static uint32_t s_max_queued = 0;
 static uint32_t s_playbuf_internal = 0;
 static uint32_t s_speaker_queued_frames = 0;
 static uint32_t s_speaker_full_waits = 0;
-/* Build 5.98g9b: producer-rate estimator + pitch-safe 44.1/22.05 kHz quality switch. */
+/* Build 5.98g9b: producer-rate estimator + pitch-safe 44.1/22.05 kHz quality switch.
+ * R57E68 keeps only the functional speaker-rate state in release; producer
+ * wall-rate exists solely when focused audit/research diagnostics are enabled. */
+#if PX68K_TAB5_R57E63_AUDIO_AUDIT || PX68K_TAB5_RELEASE_DIAGNOSTICS
 static uint32_t s_producer_rate_hz = PX68K_TAB5_AUDIO_RATE;
+#endif
 static uint32_t s_speaker_rate_hz = PX68K_TAB5_AUDIO_RATE;
+#if PX68K_TAB5_RELEASE_DIAGNOSTICS
+static uint32_t s_cpu0_mix_work_us = 0;
+static uint32_t s_cpu0_speaker_work_us = 0;
+#endif
 static uint32_t s_rate_changes = 0;
+#if PX68K_TAB5_R57E63_AUDIO_AUDIT || PX68K_TAB5_RELEASE_DIAGNOSTICS
 static uint32_t s_rate_window_frames = 0;
 static int64_t s_rate_window_start_us = 0;
 static bool s_rate_valid = false;
+#endif
 static bool s_quality_22k_requested = false;
 static bool s_quality_22k_active = false;
 
@@ -120,11 +148,11 @@ static void pump_host_source(void)
      * let the CPU0-local enqueue perform the established destination-side drop
      * accounting.  This keeps ADPCM and FM consumption locked together and
      * prevents back-pressure from crossing into the emulated audio sources. */
-    for (unsigned batch = 0; batch < 4; ++batch)
+    for (unsigned batch = 0; batch < 8; ++batch)
     {
         const size_t ask = kChunkFrames;
         const int got = WinX68k_AudioHostReadFrames(s_source_pull, (int)ask);
-        if (got <= 0)
+if (got <= 0)
             break;
 
         if (!s_host_mix_announced)
@@ -143,10 +171,25 @@ static void pump_host_source(void)
 
 static void audio_task(void *)
 {
+#if PX68K_TAB5_RELEASE_DIAGNOSTICS
+    {
+        const uintptr_t r56k5_base = (uintptr_t)pxTaskGetStackStart(NULL);
+        esp_rom_printf("R56K5_TASKSELF name=px68k_audio core=%d base=0x%08x top=0x%08x bytes=4096 hwm=%u\\n",
+                       (int)xPortGetCoreID(), (unsigned)r56k5_base,
+                       (unsigned)(r56k5_base + 4096u),
+                       (unsigned)uxTaskGetStackHighWaterMark(NULL));
+    }
+#endif
+
     size_t play_index = 0;
     bool primed = false;
     bool playback_started = false;
     uint32_t seen_reset_seq = 0;
+#if PX68K_TAB5_RELEASE_DIAGNOSTICS
+    int64_t diag_prev_us = 0;
+    uint32_t diag_prev_guest_frames = 0;
+    uint32_t diag_prev_opm_writes = 0;
+#endif
 
     for (;;)
     {
@@ -157,7 +200,13 @@ static void audio_task(void *)
         }
 
         /* CPU0 owns final extraction + FM saturation mix from this point. */
+#if PX68K_TAB5_RELEASE_DIAGNOSTICS
+        const int64_t mix_work_t0 = esp_timer_get_time();
+#endif
         pump_host_source();
+#if PX68K_TAB5_RELEASE_DIAGNOSTICS
+        s_cpu0_mix_work_us += (uint32_t)(esp_timer_get_time() - mix_work_t0);
+#endif
 
         uint32_t reset_seq;
         bool quality_22k_requested;
@@ -173,7 +222,65 @@ static void audio_task(void *)
             seen_reset_seq = reset_seq;
             primed = false;
             playback_started = false;
+#if PX68K_TAB5_RELEASE_DIAGNOSTICS
+            diag_prev_us = 0;
+            diag_prev_guest_frames = WinX68k_AudioProducedFrames();
+            diag_prev_opm_writes = OPM_DebugDataWriteCount();
+#endif
         }
+
+        /* Build 6.15b: sparse MDX/audio-only telemetry plus OPM-write rate. Production CPU/render
+         * profiling remains OFF; one line every two seconds distinguishes a
+         * slow guest producer from FM queue pressure and speaker starvation. */
+#if PX68K_TAB5_RELEASE_DIAGNOSTICS
+        if ((!PX68K_TAB5_R43_QUIET_RUNTIME) && s_host_mix_announced)
+        {
+            const int64_t now_us = esp_timer_get_time();
+            if (!diag_prev_us)
+            {
+                diag_prev_us = now_us;
+                diag_prev_guest_frames = WinX68k_AudioProducedFrames();
+                diag_prev_opm_writes = OPM_DebugDataWriteCount();
+            }
+            const int64_t diag_dt = now_us - diag_prev_us;
+            if (diag_dt >= 2000000LL)
+            {
+                const uint32_t guest_now = WinX68k_AudioProducedFrames();
+                const uint32_t guest_delta = guest_now - diag_prev_guest_frames;
+                const uint32_t guest_rate = (uint32_t)(((uint64_t)guest_delta * 1000000ULL) / (uint64_t)diag_dt);
+                const uint32_t opm_now = OPM_DebugDataWriteCount();
+                const uint32_t opm_delta = opm_now - diag_prev_opm_writes;
+                const uint32_t opm_rate = (uint32_t)(((uint64_t)opm_delta * 1000000ULL) / (uint64_t)diag_dt);
+                uint32_t fm_q = 0, fm_drop = 0, fm_over = 0, fm_avail = 0;
+                WinX68k_AudioAsyncGetStats(&fm_q, &fm_drop, &fm_over, &fm_avail);
+                uint32_t q, spq, prod, sprate, q22, under, drop, fail, fullwait;
+                portENTER_CRITICAL(&s_mux);
+                q = (uint32_t)s_count;
+                spq = s_speaker_queued_frames;
+                prod = s_producer_rate_hz;
+                sprate = s_speaker_rate_hz;
+                q22 = s_quality_22k_active ? 1u : 0u;
+                under = s_underflow;
+                drop = s_dropped;
+                fail = s_play_fail;
+                fullwait = s_speaker_full_waits;
+                portEXIT_CRITICAL(&s_mux);
+                ESP_LOGI(TAG,
+                         "AUDIO615H17 MDX guest=%luHz host=%luHz out=%luHz opmw=%lu/s q22=%lu q=%lu spq=%lu under=%lu drop=%lu fail=%lu fullwait=%lu FM{q=%lu avail=%lu drop=%lu over=%lu}",
+                         (unsigned long)guest_rate, (unsigned long)prod,
+                         (unsigned long)sprate, (unsigned long)opm_rate,
+                         (unsigned long)q22,
+                         (unsigned long)q, (unsigned long)spq,
+                         (unsigned long)under, (unsigned long)drop,
+                         (unsigned long)fail, (unsigned long)fullwait,
+                         (unsigned long)fm_q, (unsigned long)fm_avail,
+                         (unsigned long)fm_drop, (unsigned long)fm_over);
+                diag_prev_us = now_us;
+                diag_prev_guest_frames = guest_now;
+                diag_prev_opm_writes = opm_now;
+            }
+        }
+#endif
 
         /*
          * M5Unified keeps two wav slots per virtual channel.  Never call
@@ -232,6 +339,9 @@ static void audio_task(void *)
         }
 
         size_t take = 0;
+#if PX68K_TAB5_RELEASE_DIAGNOSTICS
+        const int64_t speaker_work_t0 = esp_timer_get_time();
+#endif
         portENTER_CRITICAL(&s_mux);
         if (s_count >= kChunkFrames)
         {
@@ -301,8 +411,7 @@ static void audio_task(void *)
         s_quality_22k_active = quality_22k_requested;
         s_speaker_rate_hz = play_rate;
         portEXIT_CRITICAL(&s_mux);
-
-        if (M5.Speaker.playRaw(s_play[play_index],
+if (M5.Speaker.playRaw(s_play[play_index],
                                play_frames * 2,
                                play_rate,
                                true,
@@ -324,6 +433,9 @@ static void audio_task(void *)
             ++s_play_fail;
             portEXIT_CRITICAL(&s_mux);
         }
+#if PX68K_TAB5_RELEASE_DIAGNOSTICS
+        s_cpu0_speaker_work_us += (uint32_t)(esp_timer_get_time() - speaker_work_t0);
+#endif
 
         /* Give the core's IDLE task a scheduling window. */
         vTaskDelay(1);
@@ -332,7 +444,7 @@ static void audio_task(void *)
 
 extern "C" int tab5_audio_init(void)
 {
-    if (s_started)
+if (s_started)
         return 1;
 
     if (!M5.Speaker.isEnabled())
@@ -341,13 +453,25 @@ extern "C" int tab5_audio_init(void)
         return 0;
     }
 
-    s_ring = static_cast<int16_t *>(heap_caps_malloc(
-        kRingFrames * 2 * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    /* R13: keep the large final host ring in PSRAM.  R12 proved that consuming
+     * 64 KiB of scarce Internal SRAM here fragments the heap enough to disable
+     * the 81,920-byte CPU0 compositor arena, which is far more expensive overall. */
+    const bool ring_internal = false;
+    s_ring = static_cast<int16_t *>(heap_caps_aligned_alloc(
+        64, kRingFrames * 2 * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     if (!s_ring)
     {
         ESP_LOGE(TAG, "audio ring allocation failed");
         return 0;
     }
+    ESP_LOGI(TAG,
+             "PX68K_AUDIOLOCAL_R13: Host ring bytes=%u frames=%u placement=%s ptr=%p internalFree=%u largest=%u",
+             (unsigned)(kRingFrames * 2 * sizeof(int16_t)),
+             (unsigned)kRingFrames,
+             ring_internal ? "INTERNAL" : "PSRAM-FALLBACK",
+             (void *)s_ring,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
 
     /* g12 CPU0 pull/mix scratch.  Keep it internal so the final ADPCM+FM
      * saturation pass does not add another PSRAM read/modify/write stream. */
@@ -437,16 +561,24 @@ extern "C" int tab5_audio_init(void)
              (unsigned)verify_cfg.sample_rate);
     ESP_LOGI(TAG, "Speaker master volume applied: %u/255",
              (unsigned)M5.Speaker.getVolume());
+
+
     ESP_LOGI(TAG,
              "Build 5.89a feeder wait: tick_hz=%u tick_ms=%u queue-full=1 tick (never 0)",
              (unsigned)configTICK_RATE_HZ,
              (unsigned)portTICK_PERIOD_MS);
     portENTER_CRITICAL(&s_mux);
+#if PX68K_TAB5_R57E63_AUDIO_AUDIT || PX68K_TAB5_RELEASE_DIAGNOSTICS
     s_rate_window_start_us = 0;
     s_rate_window_frames = 0;
+#endif
+#if PX68K_TAB5_R57E63_AUDIO_AUDIT || PX68K_TAB5_RELEASE_DIAGNOSTICS
     s_producer_rate_hz = PX68K_TAB5_AUDIO_RATE;
+#endif
     s_speaker_rate_hz = PX68K_TAB5_AUDIO_RATE;
+#if PX68K_TAB5_R57E63_AUDIO_AUDIT || PX68K_TAB5_RELEASE_DIAGNOSTICS
     s_rate_valid = false;
+#endif
     s_quality_22k_requested = false;
     s_quality_22k_active = false;
     portEXIT_CRITICAL(&s_mux);
@@ -456,10 +588,10 @@ extern "C" int tab5_audio_init(void)
 
 #if portNUM_PROCESSORS > 1
     const BaseType_t task_res = xTaskCreatePinnedToCore(
-        audio_task, "px68k_audio", 4096, nullptr, 3, &s_task, 0);
+        audio_task, "px68k_audio", 4096, nullptr, 4, &s_task, 0);
 #else
     const BaseType_t task_res = xTaskCreate(
-        audio_task, "px68k_audio", 4096, nullptr, 3, &s_task);
+        audio_task, "px68k_audio", 4096, nullptr, 4, &s_task);
 #endif
     if (task_res != pdPASS)
     {
@@ -470,7 +602,7 @@ extern "C" int tab5_audio_init(void)
 
     s_started = true;
     ESP_LOGI(TAG,
-             "Build 6.00 audio RT: CPU1=ADPCM producer only, CPU0=pull+FM final mix+speaker; CPU0 jitter-buffer pressure-relief=ON; rate=%u ring=%u chunk=%u startup=%u resume=%u playbuf_internal=%u/%u feeder_prio=3 speaker_prio=4",
+             "PX68K_AUDIO_R57E67: continuity feeder ACTIVE; MDX quantum=256; CPU0 YM2151 prio=3, feeder=4, speaker=4; pressure-relief=ON; rate=%u ring=%u chunk=%u startup=%u resume=%u playbuf_internal=%u/%u",
              (unsigned)PX68K_TAB5_AUDIO_RATE,
              (unsigned)kRingFrames,
              (unsigned)kChunkFrames,
@@ -483,11 +615,12 @@ extern "C" int tab5_audio_init(void)
 
 static void audio_enqueue_mixed(const int16_t *samples, size_t frames)
 {
-    if (!s_started || !samples || !frames)
+if (!s_started || !samples || !frames)
         return;
 
-    /* Estimate how much emulated PCM is actually produced per wall second.
-     * A 250 ms window is long enough to ignore per-frame burstiness. */
+#if PX68K_TAB5_R57E63_AUDIO_AUDIT || PX68K_TAB5_RELEASE_DIAGNOSTICS
+    /* Diagnostic-only producer wall-rate estimator. R57E68 release quiet
+     * compiles this entire wall-clock/critical-section probe out. */
     {
         const int64_t now_us = esp_timer_get_time();
         portENTER_CRITICAL(&s_mux);
@@ -507,7 +640,9 @@ static void audio_enqueue_mixed(const int16_t *samples, size_t frames)
         }
         portEXIT_CRITICAL(&s_mux);
     }
+#endif
 
+#if PX68K_TAB5_RELEASE_DIAGNOSTICS
     if (!s_nonzero_announced)
     {
         const size_t probe = std::min(frames * 2, (size_t)512);
@@ -521,6 +656,7 @@ static void audio_enqueue_mixed(const int16_t *samples, size_t frames)
             }
         }
     }
+#endif
 
     size_t accepted = 0;
     portENTER_CRITICAL(&s_mux);
@@ -572,11 +708,17 @@ extern "C" void tab5_audio_flush(void)
     ++s_reset_seq;
     s_min_queued = UINT32_MAX;
     s_max_queued = 0;
+#if PX68K_TAB5_R57E63_AUDIO_AUDIT || PX68K_TAB5_RELEASE_DIAGNOSTICS
     s_rate_window_frames = 0;
     s_rate_window_start_us = 0;
+#endif
+#if PX68K_TAB5_R57E63_AUDIO_AUDIT || PX68K_TAB5_RELEASE_DIAGNOSTICS
     s_producer_rate_hz = PX68K_TAB5_AUDIO_RATE;
+#endif
     s_speaker_rate_hz = PX68K_TAB5_AUDIO_RATE;
+#if PX68K_TAB5_R57E63_AUDIO_AUDIT || PX68K_TAB5_RELEASE_DIAGNOSTICS
     s_rate_valid = false;
+#endif
     s_quality_22k_requested = false;
     s_quality_22k_active = false;
     portEXIT_CRITICAL(&s_mux);
@@ -606,10 +748,21 @@ extern "C" void tab5_audio_get_stats(tab5_audio_stats_t *out)
     out->play_buffers_internal = s_playbuf_internal;
     out->speaker_queued_frames = s_speaker_queued_frames;
     out->speaker_full_waits = s_speaker_full_waits;
+#if PX68K_TAB5_R57E63_AUDIO_AUDIT || PX68K_TAB5_RELEASE_DIAGNOSTICS
     out->producer_rate_hz = s_producer_rate_hz;
+#else
+    out->producer_rate_hz = 0;
+#endif
     out->speaker_rate_hz = s_speaker_rate_hz;
     out->rate_servo_active = s_quality_22k_active ? 1u : 0u;
     out->rate_changes = s_rate_changes;
+#if PX68K_TAB5_RELEASE_DIAGNOSTICS
+    out->cpu0_mix_work_us = s_cpu0_mix_work_us;
+    out->cpu0_speaker_work_us = s_cpu0_speaker_work_us;
+#else
+    out->cpu0_mix_work_us = 0;
+    out->cpu0_speaker_work_us = 0;
+#endif
     portEXIT_CRITICAL(&s_mux);
 }
 
@@ -641,4 +794,9 @@ extern "C" int tab5_audio_step_volume(int direction)
 extern "C" int tab5_audio_get_volume(void)
 {
     return (int)M5.Speaker.getVolume();
+}
+
+extern "C" uint32_t tab5_audio_stack_highwater(void)
+{
+    return s_task ? (uint32_t)uxTaskGetStackHighWaterMark(s_task) : 0u;
 }

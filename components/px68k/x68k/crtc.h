@@ -44,6 +44,7 @@ uint8_t CRTC_DebugRasterCopySrc(void);
 uint8_t CRTC_DebugRasterCopyDst(void);
 uint8_t CRTC_DebugRasterCopyPlanes(void);
 uint8_t CRTC_DebugRasterCopyMode(void);
+void CRTC_Tab5DirtyPruneStatsTake(uint32_t *suppressed_irq, uint32_t *suppressed_ctl);
 #endif
 
 #endif /* _WINX68K_CRTC_H */

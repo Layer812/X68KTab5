@@ -247,6 +247,15 @@ extern "C" void tab5_media_ui_draw_browser(const tab5_media_ui_entry_t *items,
     M5.Display.setCursor(lcd_w - 300, 45);
     M5.Display.print(page_text);
 
+    /* PX68K_R56S2_PSRAM_UI_STRING_BRIDGE
+     * R23 intentionally keeps the cold media catalog in PSRAM. Keep that
+     * memory policy, but do not hand PSRAM-backed C strings directly to the
+     * M5GFX Print path on ESP32-P4. Stage only the currently drawn row into
+     * this function's internal stack first. Selection/filtering still uses
+     * the original catalog and is behavior-identical. */
+    char r56s2_path_buf[TAB5_MEDIA_UI_PATH_MAX];
+    char r56s2_name_buf[128];
+
     const size_t first = page * TAB5_MEDIA_UI_ROWS_PER_PAGE;
     for (int r = 0; r < TAB5_MEDIA_UI_ROWS_PER_PAGE; ++r) {
         const size_t fidx = first + (size_t)r;
@@ -265,13 +274,22 @@ extern "C" void tab5_media_ui_draw_browser(const tab5_media_ui_entry_t *items,
         M5.Display.setTextColor(TFT_WHITE, badge_fill);
         M5.Display.setCursor(empty ? 60 : 65, y + 23);
         M5.Display.print(empty ? "----" : badge_for(e->type));
+        const char *r56s2_name = "Empty / eject";
+        const char *r56s2_path = "Leave this slot empty";
+        if (!empty) {
+            std::snprintf(r56s2_path_buf, sizeof(r56s2_path_buf), "%s", e->path);
+            std::snprintf(r56s2_name_buf, sizeof(r56s2_name_buf), "%s",
+                          tab5_media_ui_basename(r56s2_path_buf));
+            r56s2_name = r56s2_name_buf;
+            r56s2_path = r56s2_path_buf;
+        }
         M5.Display.setTextColor(TFT_WHITE, fill);
         M5.Display.setCursor(150, y + 11);
-        M5.Display.print(empty ? "Empty / eject" : tab5_media_ui_basename(e->path));
+        M5.Display.print(r56s2_name);
         M5.Display.setTextSize(1);
         M5.Display.setTextColor(0x8C71, fill);
         M5.Display.setCursor(151, y + 42);
-        M5.Display.print(empty ? "Leave this slot empty" : e->path);
+        M5.Display.print(r56s2_path);
     }
 
     const bool has_prev = page > 0;

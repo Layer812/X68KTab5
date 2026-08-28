@@ -46,6 +46,7 @@ void FASTCALL MFP_Write(uint32_t adr, uint8_t data);
  * there is no state change at all, so skip the cross-TU call. */
 extern uint8_t MFP_TimerActiveMask;
 void FASTCALL MFP_TimerSlow(int32_t clock);
+void MFP_Tab5TimerFastStats(uint32_t *exact_bc, uint32_t *fallback);
 static inline __attribute__((always_inline)) void MFP_Timer(int32_t clock)
 {
     if (__builtin_expect(MFP_TimerActiveMask != 0, 0))

@@ -96,6 +96,13 @@ extern void m68ki_build_opcode_table(void);
 #define PX68K_TAB5_SKIP_DEAD_BERR_ROLLBACK 1
 #endif
 
+/* Build 6.15h17R27 A/B: disable only the R22 ZERO-RUN outer batching call.
+ * Keep the implementation and its IRAM/data footprint linked so R26a vs R27
+ * compares execution behavior rather than changing the memory layout. */
+#ifndef PX68K_TAB5_MDX622_ZERO_RUN_AB
+#define PX68K_TAB5_MDX622_ZERO_RUN_AB 0
+#endif
+
 /* Build 5.56a: P4 XespV copies the 64-byte D0-D7/A0-A7 bus-error snapshot
  * with three 128-bit loads + three 128-bit stores.  The arrays are explicitly
  * from the native Musashi layout.  The global CPU object is 16-byte aligned;
@@ -284,6 +291,8 @@ static void tab5_backedge613_reset(void)
     s_tab5_prev_pc613_valid = 0;
 }
 
+static inline uint16_t tab5_dyn613c_fetch16(uint32_t pc);
+
 static void tab5_backedge613_dump(void)
 {
     enum { TOPN = 16 };
@@ -327,6 +336,18 @@ static void tab5_backedge613_dump(void)
                (unsigned)top_span[i], (unsigned long)top_count[i],
                (unsigned long)(pct_x100 / 100u),
                (unsigned long)(pct_x100 % 100u));
+        if (i < 4u) {
+            const uint32_t start = top_to[i];
+            const uint32_t end = top_from[i] + 2u;
+            printf("PX68K_DYN613D: LOOP%02u words", i + 1u);
+            unsigned col = 0u;
+            for (uint32_t pc = start; pc < end && pc - start <= 64u; pc += 2u) {
+                if ((col & 7u) == 0u) printf("\nPX68K_DYN613D:   $%06lX:", (unsigned long)pc);
+                printf(" %04X", (unsigned)tab5_dyn613c_fetch16(pc));
+                ++col;
+            }
+            printf("\n");
+        }
     }
 }
 
@@ -434,12 +455,23 @@ uint32_t m68k_tab5_profile_storage_bytes(void)
  * remains the optional next CPU pass after the low-overhead dispatch A/B. */
 
 #define TAB5_DYN613C_ARENA_HEAD       64u
+#if PX68K_TAB5_DYNAREC
 #define TAB5_DYN613C_BLOCK_SLOTS      64u
 #define TAB5_DYN613C_CAND_SLOTS       256u
-#define TAB5_DYN613C_CAND_PROBES      16u
-#define TAB5_DYN613C_CAND_EPOCH_MISSES 65536u
 #define TAB5_DYN613C_BLOCK_L0_SLOTS     64u
 #define TAB5_DYN613C_EDGE_MEMO_SLOTS   128u
+#else
+/* R23: production JIT is hard-disabled. Keep one compile-only sentinel slot so
+ * the archived diagnostic code still type-checks, instead of allocating the
+ * old 16,128-byte dead tables. These sentinels live in external BSS and are
+ * never touched by the production execution path. */
+#define TAB5_DYN613C_BLOCK_SLOTS       1u
+#define TAB5_DYN613C_CAND_SLOTS        1u
+#define TAB5_DYN613C_BLOCK_L0_SLOTS    1u
+#define TAB5_DYN613C_EDGE_MEMO_SLOTS   1u
+#endif
+#define TAB5_DYN613C_CAND_PROBES      16u
+#define TAB5_DYN613C_CAND_EPOCH_MISSES 65536u
 #define TAB5_DYN613C_HOT_THRESHOLD    16u
 #define TAB5_DYN613C_MAX_GUEST_BYTES  192u
 #define TAB5_DYN613C_MAX_INSNS        72u
@@ -597,10 +629,19 @@ static DRAM_ATTR uint8_t *s_dyn613c_arena = NULL;
 static DRAM_ATTR uint32_t s_dyn613c_arena_bytes = 0;
 static DRAM_ATTR uint32_t s_dyn613c_arena_used = TAB5_DYN613C_ARENA_HEAD;
 static DRAM_ATTR tab5_dyn613c_sync_fn_t s_dyn613c_sync = NULL;
-static DRAM_ATTR tab5_dyn613c_block_t s_dyn613c_blocks[TAB5_DYN613C_BLOCK_SLOTS];
-static DRAM_ATTR tab5_dyn613c_candidate_t s_dyn613c_cands[TAB5_DYN613C_CAND_SLOTS];
-static DRAM_ATTR tab5_dyn613c_block_l0_t s_dyn613c_block_l0[TAB5_DYN613C_BLOCK_L0_SLOTS];
-static DRAM_ATTR tab5_dyn613c_edge_memo_t s_dyn613c_edge_memo[TAB5_DYN613C_EDGE_MEMO_SLOTS];
+/* R23: generic JIT is production-disabled.  Full tables are compiled only
+ * when JIT is enabled. Production keeps four one-slot compile-only sentinels
+ * in external BSS, so the old 16,128-byte allocation disappears entirely
+ * from Internal SRAM and effectively from the runtime working set. */
+#if PX68K_TAB5_DYNAREC
+#define TAB5_DYN613C_META_ATTR DRAM_ATTR
+#else
+#define TAB5_DYN613C_META_ATTR EXT_RAM_BSS_ATTR
+#endif
+static TAB5_DYN613C_META_ATTR tab5_dyn613c_block_t s_dyn613c_blocks[TAB5_DYN613C_BLOCK_SLOTS];
+static TAB5_DYN613C_META_ATTR tab5_dyn613c_candidate_t s_dyn613c_cands[TAB5_DYN613C_CAND_SLOTS];
+static TAB5_DYN613C_META_ATTR tab5_dyn613c_block_l0_t s_dyn613c_block_l0[TAB5_DYN613C_BLOCK_L0_SLOTS];
+static TAB5_DYN613C_META_ATTR tab5_dyn613c_edge_memo_t s_dyn613c_edge_memo[TAB5_DYN613C_EDGE_MEMO_SLOTS];
 static DRAM_ATTR uint32_t s_dyn613c_active = 0;
 static DRAM_ATTR uint32_t s_dyn613c_compile_ok = 0;
 static DRAM_ATTR uint32_t s_dyn613c_compile_reject = 0;
@@ -639,10 +680,14 @@ static DRAM_ATTR uint32_t s_dyn613c_memo_miss_hits = 0;
 
 unsigned int m68k_tab5_dynarec_metadata_bytes(void)
 {
+#if PX68K_TAB5_DYNAREC
     /* Persistent JIT tables only.  The 4 KiB emitter and decode array are
      * transient CPU1 stack objects used only when a hot block is compiled. */
     return (uint32_t)(sizeof(s_dyn613c_blocks) + sizeof(s_dyn613c_cands) +
                       sizeof(s_dyn613c_block_l0) + sizeof(s_dyn613c_edge_memo));
+#else
+    return 0u;
+#endif
 }
 
 /* RV32 register numbers.  Keep a0/a1 as the C ABI cpu/MEM arguments and use
@@ -2006,7 +2051,7 @@ static void tab5_movew65b_dump(void)
 #define TAB5_M68K_DISPATCH_CACHE_SIZE (1u << TAB5_M68K_DISPATCH_CACHE_BITS)
 #define TAB5_M68K_DISPATCH_CACHE_MASK (TAB5_M68K_DISPATCH_CACHE_SIZE - 1u)
 /* Build 5.98g9: TCM L1 + internal-DRAM L2 avoids PSRAM metadata misses. */
-#define TAB5_M68K_DISPATCH_L2_BITS 9u
+#define TAB5_M68K_DISPATCH_L2_BITS 12u
 #define TAB5_M68K_DISPATCH_L2_SIZE (1u << TAB5_M68K_DISPATCH_L2_BITS)
 #define TAB5_M68K_DISPATCH_L2_MASK (TAB5_M68K_DISPATCH_L2_SIZE - 1u)
 
@@ -3551,6 +3596,540 @@ static inline __attribute__((always_inline)) void tab5_poll58_try(uint16_t branc
     }
 }
 
+/* Build 6.15h17R17: exact scheduler-bounded fast-forward for the tiny
+ * unsigned threshold-search loop measured inside the dominant MDX block:
+ *
+ *     loop: CMP.W (An)+,Dn
+ *           BHI.B loop          ; exact displacement -4 / opcode $62FC
+ *
+ * This helper is called only after one complete architectural iteration and
+ * taken BHI have already executed.  Future taken iterations are safe to fold
+ * only while the postincrement source remains ordinary, aligned X68000 RAM.
+ * The first not-taken comparison is deliberately left to normal Musashi, so
+ * exit PC/flags and all surrounding code retain the authoritative path.
+ *
+ * CMP leaves X unchanged.  At a scheduler boundary N/Z/V/C must however match
+ * the final elided CMP exactly, so those flags are reconstructed from the last
+ * folded subtraction.  REG_PC already points at loop_pc after the taken BHI and
+ * remains there after any number of additional taken iterations. */
+static DRAM_ATTR uint32_t s_tab5_cmphi617_calls = 0;
+static DRAM_ATTR uint64_t s_tab5_cmphi617_loops = 0;
+static DRAM_ATTR uint32_t s_tab5_cmphi617_maxbatch = 0;
+static DRAM_ATTR uint8_t s_tab5_cmphi617_announced = 0;
+
+static inline __attribute__((always_inline))
+void tab5_cmphi617_try(uint16_t branch_op)
+{
+    const uint32_t branch_pc = REG_PPC & 0x00ffffffu;
+    const uint32_t loop_pc = REG_PC & 0x00ffffffu;
+    uint16_t cmp_op;
+    unsigned areg, dreg;
+    uint32_t addr, dst, n = 0u, max_n, last_res = 0u, last_src = 0u;
+    int remain, loop_cycles;
+
+    if (FLAG_T1 || FLAG_T0) return;
+    if (branch_op != 0x62fcu) return;                /* BHI.B -4 only */
+    if (branch_pc != ((loop_pc + 2u) & 0x00ffffffu)) return;
+
+    cmp_op = tab5_poll58_fetch16(loop_pc);
+    if ((cmp_op & 0xf1f8u) != 0xb058u) return;       /* CMP.W (An)+,Dn */
+    if (tab5_poll58_fetch16(loop_pc + 2u) != branch_op) return;
+
+    areg = cmp_op & 7u;
+    dreg = (cmp_op >> 9) & 7u;
+    addr = REG_A[areg];
+    dst = REG_D[dreg] & 0xffffu;
+
+    /* Direct RAM folding is allowed only for the exact non-aliased ordinary
+     * RAM address space.  Odd, wrapped, MMIO, TVRAM/GVRAM and high aliases all
+     * stay on stock Musashi. */
+    if ((addr & 0xff000001u) || addr > 0x00bffffeu) return;
+
+    loop_cycles = (int)CYC_INSTRUCTION[cmp_op] + (int)CYC_INSTRUCTION[branch_op];
+    remain = GET_CYCLES();
+    if (loop_cycles <= 0 || remain < loop_cycles) return;
+    max_n = (uint32_t)(remain / loop_cycles);
+    if (!max_n) return;
+
+    while (n < max_n && addr <= 0x00bffffeu) {
+        uint16_t src16;
+        uint32_t src, res;
+        __builtin_memcpy(&src16, MEM + addr, sizeof(src16));
+        src = (uint32_t)src16;
+        res = dst - src;
+
+        /* BHI after CMP is exactly unsigned dst > src.  Do not consume the
+         * first not-taken iteration: normal Musashi will perform that CMP/BHI. */
+        if (dst <= src) break;
+
+        last_src = src;
+        last_res = res;
+        addr += 2u;
+        ++n;
+    }
+    if (!n) return;
+
+    REG_A[areg] = addr;
+    FLAG_N = NFLAG_16(last_res);
+    FLAG_Z = MASK_OUT_ABOVE_16(last_res);
+    FLAG_V = VFLAG_SUB_16(last_src, dst, last_res);
+    FLAG_C = CFLAG_16(last_res);
+    BusErrFlag = 0;
+    USE_CYCLES((int)(n * (uint32_t)loop_cycles));
+
+    ++s_tab5_cmphi617_calls;
+    s_tab5_cmphi617_loops += n;
+    if (n > s_tab5_cmphi617_maxbatch) s_tab5_cmphi617_maxbatch = n;
+    if (__builtin_expect(!s_tab5_cmphi617_announced, 0)) {
+        s_tab5_cmphi617_announced = 1;
+        printf("PX68K_CMPHI617: CMP.W (An)+ / BHI -4 RAM fast-forward ACTIVE pc=$%06lX D%u/A%u scheduler-bounded\n",
+               (unsigned long)loop_pc, dreg, areg);
+    }
+}
+
+void m68k_tab5_cmphi617_stats(unsigned int *calls, unsigned long long *loops, unsigned int *maxbatch)
+{
+    if (calls) *calls = (unsigned int)s_tab5_cmphi617_calls;
+    if (loops) *loops = (unsigned long long)s_tab5_cmphi617_loops;
+    if (maxbatch) *maxbatch = (unsigned int)s_tab5_cmphi617_maxbatch;
+}
+/* BAT162P: BE01 shell executor removed after BAT161 measured no speed gain.
+ * Keep the BAT158 CPU core authoritative.  The only BE01-related helper in
+ * this diagnostic build is an on-demand code snapshot called from CPU1 at a
+ * benchmark log boundary.  It has zero per-instruction overhead. */
+void m68k_tab5_be01_target_snapshot(unsigned short *out_words, unsigned int max_words)
+{
+    unsigned int i;
+    if (!out_words || !MEM) return;
+    if (max_words > 64u) max_words = 64u; /* $19D7F0 + 128 bytes */
+    for (i = 0; i < max_words; ++i) {
+        const unsigned int a = 0x0019d7f0u + i * 2u;
+        out_words[i] = (unsigned short)(((unsigned int)MEM[a] << 8) | MEM[a + 1u]);
+    }
+}
+
+/* Build 6.15h17R20: corrected exact MDX hot-block executor for the dominant RAM-resident
+ * loop measured by the R15 profiler.  This is deliberately not a new decoder
+ * and not a semantic reimplementation of the 68000 instructions.  The block
+ * only removes repeated opcode fetch/dispatch/classification: each non-branch
+ * instruction still runs the authoritative Musashi generated handler.  Bcc
+ * and DBF reuse the already-validated inline cores above, and the inner
+ * CMP.W (An)+ / BHI search reuses CMPHI617.
+ *
+ * Exact code, including the DBF extension word:
+ *   $1993BC 3019 672E 337C 0000 FFFE 4A2E 12FA 670C
+ *   $1993CC 7200 122A 0001 D241 D074 1000 204B B058
+ *   $1993DC 62FC 2008 908B E248 5340 B02A 0001 6502
+ *   $1993EC 1480 5C8A 51CF FFCA
+ *
+ * Safety gates:
+ *   - exact 56-byte signature in ordinary X68000 RAM on every entry;
+ *   - T0/T1 trace disabled;
+ *   - cycles checked after every architectural instruction;
+ *   - generated handlers remain authoritative for all data accesses/errors;
+ *   - maximum 64 outer iterations per host invocation, then return to the
+ *     ordinary execute loop even if the DBF continues.
+ */
+#define TAB5_MDX619_PC_START 0x001993bcu
+#define TAB5_MDX619_PC_END   0x001993f4u
+#define TAB5_MDX619_MAX_OUTER 64u
+
+typedef struct {
+    uint16_t op;
+    uint8_t cycles;
+    uint8_t _pad;
+    tab5_m68k_handler_t handler;
+} tab5_mdx619_fixed_t;
+
+enum {
+    MDX619_3019 = 0, MDX619_337C, MDX619_4A2E, MDX619_7200,
+    MDX619_122A, MDX619_D241, MDX619_D074, MDX619_204B,
+    MDX619_B058, MDX619_2008, MDX619_908B, MDX619_E248,
+    MDX619_5340, MDX619_B02A, MDX619_1480, MDX619_5C8A,
+    MDX619_FIXED_COUNT
+};
+
+static DRAM_ATTR tab5_mdx619_fixed_t s_tab5_mdx619_fixed[MDX619_FIXED_COUNT];
+static DRAM_ATTR uint8_t s_tab5_mdx619_cache_ready = 0;
+static DRAM_ATTR uint8_t s_tab5_mdx619_announced = 0;
+static DRAM_ATTR uint32_t s_tab5_mdx619_calls = 0;
+static DRAM_ATTR uint64_t s_tab5_mdx619_outer = 0;
+static DRAM_ATTR uint64_t s_tab5_mdx619_fixed_insn = 0;
+static DRAM_ATTR uint32_t s_tab5_mdx619_maxbatch = 0;
+static DRAM_ATTR uint8_t s_tab5_mdx619_cyc_672e = 0;
+static DRAM_ATTR uint8_t s_tab5_mdx619_cyc_670c = 0;
+static DRAM_ATTR uint8_t s_tab5_mdx619_cyc_62fc = 0;
+static DRAM_ATTR uint8_t s_tab5_mdx619_cyc_6502 = 0;
+static DRAM_ATTR uint8_t s_tab5_mdx619_cyc_51cf = 0;
+
+static DRAM_ATTR const uint16_t s_tab5_mdx619_signature[28] = {
+    0x3019u,0x672eu,0x337cu,0x0000u,0xfffeu,0x4a2eu,0x12fau,0x670cu,
+    0x7200u,0x122au,0x0001u,0xd241u,0xd074u,0x1000u,0x204bu,0xb058u,
+    0x62fcu,0x2008u,0x908bu,0xe248u,0x5340u,0xb02au,0x0001u,0x6502u,
+    0x1480u,0x5c8au,0x51cfu,0xffcau
+};
+
+static inline __attribute__((always_inline))
+void tab5_mdx619_cache_init(void)
+{
+    static const uint16_t ops[MDX619_FIXED_COUNT] = {
+        0x3019u,0x337cu,0x4a2eu,0x7200u,0x122au,0xd241u,0xd074u,0x204bu,
+        0xb058u,0x2008u,0x908bu,0xe248u,0x5340u,0xb02au,0x1480u,0x5c8au
+    };
+    unsigned i;
+    if (s_tab5_mdx619_cache_ready) return;
+    for (i = 0; i < MDX619_FIXED_COUNT; ++i) {
+        const uint16_t op = ops[i];
+        s_tab5_mdx619_fixed[i].op = op;
+        s_tab5_mdx619_fixed[i].cycles = (uint8_t)CYC_INSTRUCTION[op];
+        s_tab5_mdx619_fixed[i].handler = m68ki_instruction_jump_table[op];
+    }
+    s_tab5_mdx619_cyc_672e = (uint8_t)CYC_INSTRUCTION[0x672eu];
+    s_tab5_mdx619_cyc_670c = (uint8_t)CYC_INSTRUCTION[0x670cu];
+    s_tab5_mdx619_cyc_62fc = (uint8_t)CYC_INSTRUCTION[0x62fcu];
+    s_tab5_mdx619_cyc_6502 = (uint8_t)CYC_INSTRUCTION[0x6502u];
+    s_tab5_mdx619_cyc_51cf = (uint8_t)CYC_INSTRUCTION[0x51cfu];
+    s_tab5_mdx619_cache_ready = 1;
+}
+
+static inline __attribute__((always_inline))
+uint8_t tab5_mdx619_bcc_cycles(uint16_t op)
+{
+    if (op == 0x672eu) return s_tab5_mdx619_cyc_672e;
+    if (op == 0x670cu) return s_tab5_mdx619_cyc_670c;
+    if (op == 0x62fcu) return s_tab5_mdx619_cyc_62fc;
+    if (op == 0x6502u) return s_tab5_mdx619_cyc_6502;
+    return (uint8_t)CYC_INSTRUCTION[op];
+}
+
+static inline __attribute__((always_inline))
+int tab5_mdx619_ram8(uint32_t a)
+{
+    return ((a & 0xff000000u) == 0u && a <= 0x00bfffffu);
+}
+
+static inline __attribute__((always_inline))
+int tab5_mdx619_ram16(uint32_t a)
+{
+    return ((a & 0xff000001u) == 0u && a <= 0x00bffffeu);
+}
+
+static inline __attribute__((always_inline))
+int tab5_mdx619_code_overlap(uint32_t a, uint32_t bytes)
+{
+    const uint32_t e = a + bytes;
+    return !(e <= TAB5_MDX619_PC_START || a >= TAB5_MDX619_PC_END);
+}
+
+/* Build 6.15h17R22: dominant zero-entry run accelerator.
+ *
+ * R20 profiling showed the exact $1993BC block averaging only ~4.5 guest
+ * instructions per outer iteration.  The zero-entry path is exactly four:
+ *
+ *   MOVE.W (A1)+,D0 ; BEQ $1993EE ; ADDQ.L #6,A2 ; DBF D7,$1993BC
+ *
+ * Therefore well over 90% of measured outer iterations take this path.
+ * Execute complete zero iterations as one scheduler-safe host loop instead of
+ * re-entering four architectural handlers per item.  We never cross the
+ * current m68k_execute() cycle boundary: only iterations whose complete 36
+ * cycles (40 on terminal DBF) fit inside GET_CYCLES() are batched.  A partial
+ * final iteration is left to the exact R20/stock path.
+ */
+static DRAM_ATTR uint8_t  s_tab5_mdx622_announced = 0;
+static DRAM_ATTR uint32_t s_tab5_mdx622_calls = 0;
+static DRAM_ATTR uint64_t s_tab5_mdx622_loops = 0;
+static DRAM_ATTR uint32_t s_tab5_mdx622_maxbatch = 0;
+
+static inline __attribute__((always_inline)) uint16_t tab5_mdx622_load16(uint32_t a)
+{
+    uint16_t v;
+    __builtin_memcpy(&v, MEM + a, sizeof(v));
+    BusErrFlag = 0;
+    return v;
+}
+
+static IRAM_ATTR __attribute__((noinline, hot, optimize("O3")))
+int tab5_mdx622_zero_run_try(void)
+{
+    uint32_t batch = 0u;
+    int executed_any = 0;
+
+    if (CPU_TYPE != CPU_TYPE_000) return 0;
+    if (FLAG_T1 || FLAG_T0) return 0;
+    if ((REG_PC & 0x00ffffffu) != TAB5_MDX619_PC_START) return 0;
+    if (GET_CYCLES() <= 0) return 0;
+
+    /* Same self-modifying-code safety gate as R20. */
+    if (memcmp(MEM + TAB5_MDX619_PC_START, s_tab5_mdx619_signature,
+               sizeof(s_tab5_mdx619_signature)) != 0) return 0;
+
+    ++s_tab5_mdx622_calls;
+    m68ki_use_data_space();
+    m68ki_set_fc(FLAG_S | FUNCTION_CODE_USER_PROGRAM);
+
+    while (batch < TAB5_MDX619_MAX_OUTER &&
+           (REG_PC & 0x00ffffffu) == TAB5_MDX619_PC_START) {
+        const uint32_t a1 = REG_A[1];
+        const uint16_t d7 = (uint16_t)(REG_D[7] & 0xffffu);
+        const int iter_cycles = (d7 == 0u) ? 40 : 36;
+
+        /* Do not cross the scheduler boundary.  If the remaining budget cannot
+         * contain a whole zero iteration, leave it to R20/stock so the exact
+         * instruction at which the timeslice expires is preserved. */
+        if (GET_CYCLES() < iter_cycles)
+            break;
+        if (!tab5_mdx619_ram16(a1))
+            break;
+
+        const uint16_t w = tab5_mdx622_load16(a1);
+        if (w != 0u)
+            break;
+
+        /* MOVE.W (A1)+,D0 with zero result.  X is unaffected. */
+        REG_A[1] = a1 + 2u;
+        REG_D[0] = MASK_OUT_BELOW_16(REG_D[0]); /* low word = 0 */
+        FLAG_N = NFLAG_CLEAR;
+        FLAG_Z = 0u;
+        FLAG_V = VFLAG_CLEAR;
+        FLAG_C = CFLAG_CLEAR;
+
+        /* BEQ is taken. ADDQ.L #6,A2 targets An and therefore leaves CCR
+         * untouched.  DBF also leaves CCR untouched. */
+        REG_A[2] = MASK_OUT_ABOVE_32(REG_A[2] + 6u);
+        REG_D[7] = MASK_OUT_BELOW_16(REG_D[7]) |
+                   (uint32_t)((uint16_t)(d7 - 1u));
+
+        REG_PPC = 0x001993f0u;
+        REG_IR  = 0x51cfu;
+        REG_PC  = (d7 == 0u) ? TAB5_MDX619_PC_END : TAB5_MDX619_PC_START;
+        USE_CYCLES(iter_cycles);
+
+        executed_any = 1;
+        ++batch;
+        ++s_tab5_mdx622_loops;
+
+        if (d7 == 0u || GET_CYCLES() <= 0)
+            break;
+    }
+
+    if (batch > s_tab5_mdx622_maxbatch)
+        s_tab5_mdx622_maxbatch = batch;
+
+    if (__builtin_expect(executed_any && !s_tab5_mdx622_announced, 0)) {
+        s_tab5_mdx622_announced = 1;
+        printf("PX68K_MDX622: ZERO-RUN batch ACTIVE exact 3019/672E/5C8A/51CF path; full-iteration scheduler fence maxOuter=%u\\n",
+               (unsigned)TAB5_MDX619_MAX_OUTER);
+    }
+    return executed_any;
+}
+
+void m68k_tab5_mdx622_stats(unsigned int *calls,
+                            unsigned long long *loops,
+                            unsigned int *maxbatch)
+{
+    if (calls) *calls = (unsigned int)s_tab5_mdx622_calls;
+    if (loops) *loops = (unsigned long long)s_tab5_mdx622_loops;
+    if (maxbatch) *maxbatch = (unsigned int)s_tab5_mdx622_maxbatch;
+}
+
+/* Execute one fixed non-branch instruction exactly as the normal Musashi loop
+ * would after opcode fetch.  The opcode itself is signature-proven ordinary
+ * RAM, so skipping only that fetch cannot hide an address/bus error. */
+static inline __attribute__((always_inline))
+int tab5_mdx619_fixed_step(uint32_t pc, unsigned slot, uint32_t expected_next)
+{
+    const tab5_mdx619_fixed_t * const f = &s_tab5_mdx619_fixed[slot];
+    if (GET_CYCLES() <= 0) return 0;
+    m68ki_use_data_space();
+    m68ki_instr_hook(pc);
+    REG_PPC = pc;
+    m68ki_set_fc(FLAG_S | FUNCTION_CODE_USER_PROGRAM);
+    BusErrFlag = 0;
+    REG_IR = f->op;
+    REG_PC = pc + 2u;
+    f->handler();
+    USE_CYCLES((int)f->cycles);
+    ++s_tab5_mdx619_fixed_insn;
+    return ((REG_PC & 0x00ffffffu) == expected_next);
+}
+
+static inline __attribute__((always_inline))
+int tab5_mdx619_bcc_step(uint32_t pc, uint16_t op, int taken, uint32_t expected_next)
+{
+    if (GET_CYCLES() <= 0) return 0;
+    m68ki_use_data_space();
+    m68ki_instr_hook(pc);
+    REG_PPC = pc;
+    m68ki_set_fc(FLAG_S | FUNCTION_CODE_USER_PROGRAM);
+    BusErrFlag = 0;
+    REG_IR = op;
+    REG_PC = pc + 2u;
+    tab5_bcc598f_exec(op, taken);
+    USE_CYCLES((int)tab5_mdx619_bcc_cycles(op));
+    ++s_tab5_mdx619_fixed_insn;
+    return ((REG_PC & 0x00ffffffu) == expected_next);
+}
+
+static inline __attribute__((always_inline))
+int tab5_mdx619_dbf_step(uint32_t *next_pc)
+{
+    const uint32_t pc = 0x001993f0u;
+    const uint16_t op = 0x51cfu;
+    if (GET_CYCLES() <= 0) return 0;
+    m68ki_use_data_space();
+    m68ki_instr_hook(pc);
+    REG_PPC = pc;
+    m68ki_set_fc(FLAG_S | FUNCTION_CODE_USER_PROGRAM);
+    BusErrFlag = 0;
+    REG_IR = op;
+    REG_PC = pc + 2u;
+    (void)tab5_dbcc598f_exec(op);
+    USE_CYCLES((int)s_tab5_mdx619_cyc_51cf);
+    ++s_tab5_mdx619_fixed_insn;
+    *next_pc = REG_PC & 0x00ffffffu;
+    return (*next_pc == TAB5_MDX619_PC_START || *next_pc == TAB5_MDX619_PC_END);
+}
+
+static IRAM_ATTR __attribute__((noinline, hot, optimize("O3")))
+int tab5_mdx619_try(void)
+{
+    uint32_t outer_batch = 0u;
+    int executed_any = 0;
+
+    if (FLAG_T1 || FLAG_T0) return 0;
+    if ((REG_PC & 0x00ffffffu) != TAB5_MDX619_PC_START) return 0;
+    if (GET_CYCLES() <= 0) return 0;
+
+    /* Complete signature verification on every block entry.  The 56-byte
+     * memcmp is much cheaper than the opcode-dispatch traffic it replaces and
+     * ensures self-modifying or different guest code immediately falls back. */
+    if (memcmp(MEM + TAB5_MDX619_PC_START, s_tab5_mdx619_signature,
+               sizeof(s_tab5_mdx619_signature)) != 0) return 0;
+
+    tab5_mdx619_cache_init();
+    ++s_tab5_mdx619_calls;
+
+    while (outer_batch < TAB5_MDX619_MAX_OUTER && GET_CYCLES() > 0 &&
+           (REG_PC & 0x00ffffffu) == TAB5_MDX619_PC_START) {
+        uint32_t next_pc;
+        int taken;
+
+        /* MOVE.W (A1)+,D0.  R19 deliberately accelerates this block only
+         * while every measured data operand stays in ordinary X68000 RAM. */
+        if (!tab5_mdx619_ram16(REG_A[1])) return 0;
+        if (!tab5_mdx619_fixed_step(0x001993bcu, MDX619_3019, 0x001993beu)) return 1;
+        executed_any = 1;
+        if (GET_CYCLES() <= 0) return 1;
+
+        /* BEQ.B $1993EE */
+        taken = (FLAG_Z == 0u);
+        if (!tab5_mdx619_bcc_step(0x001993beu, 0x672eu, taken,
+                                  taken ? 0x001993eeu : 0x001993c0u)) return 1;
+        if (GET_CYCLES() <= 0) return 1;
+        if (!taken) {
+            {
+                const uint32_t wr = REG_A[1] - 2u;
+                if (!tab5_mdx619_ram16(wr) || tab5_mdx619_code_overlap(wr, 2u)) return 1;
+            }
+            if (!tab5_mdx619_fixed_step(0x001993c0u, MDX619_337C, 0x001993c6u)) return 1;
+            if (GET_CYCLES() <= 0) return 1;
+            if (!tab5_mdx619_ram8(REG_A[6] + 0x12fau)) return 1;
+            if (!tab5_mdx619_fixed_step(0x001993c6u, MDX619_4A2E, 0x001993cau)) return 1;
+            if (GET_CYCLES() <= 0) return 1;
+
+            /* BEQ.B $1993D8 */
+            taken = (FLAG_Z == 0u);
+            if (!tab5_mdx619_bcc_step(0x001993cau, 0x670cu, taken,
+                                      taken ? 0x001993d8u : 0x001993ccu)) return 1;
+            if (GET_CYCLES() <= 0) return 1;
+            if (!taken) {
+                if (!tab5_mdx619_fixed_step(0x001993ccu, MDX619_7200, 0x001993ceu)) return 1;
+                if (GET_CYCLES() <= 0) return 1;
+                if (!tab5_mdx619_ram8(REG_A[2] + 1u)) return 1;
+                if (!tab5_mdx619_fixed_step(0x001993ceu, MDX619_122A, 0x001993d2u)) return 1;
+                if (GET_CYCLES() <= 0) return 1;
+                if (!tab5_mdx619_fixed_step(0x001993d2u, MDX619_D241, 0x001993d4u)) return 1;
+                if (GET_CYCLES() <= 0) return 1;
+                {
+                    const uint32_t iea = REG_A[4] + (uint32_t)(int32_t)(int16_t)(REG_D[1] & 0xffffu);
+                    if (!tab5_mdx619_ram16(iea)) return 1;
+                }
+                if (!tab5_mdx619_fixed_step(0x001993d4u, MDX619_D074, 0x001993d8u)) return 1;
+                if (GET_CYCLES() <= 0) return 1;
+            }
+
+            if (!tab5_mdx619_ram16(REG_A[3])) return 1;
+            if (!tab5_mdx619_fixed_step(0x001993d8u, MDX619_204B, 0x001993dau)) return 1;
+            if (GET_CYCLES() <= 0) return 1;
+
+            /* Inner threshold scan: execute the first CMP/BHI architecturally,
+             * then let the proven CMPHI617 helper fold additional taken pairs. */
+            for (;;) {
+                if (!tab5_mdx619_fixed_step(0x001993dau, MDX619_B058, 0x001993dcu)) return 1;
+                if (GET_CYCLES() <= 0) return 1;
+                taken = tab5_bcc598f_taken(0x62fcu);
+                if (!tab5_mdx619_bcc_step(0x001993dcu, 0x62fcu, taken,
+                                          taken ? 0x001993dau : 0x001993deu)) return 1;
+                if (GET_CYCLES() <= 0) return 1;
+                if (!taken) break;
+                tab5_cmphi617_try(0x62fcu);
+                if (GET_CYCLES() <= 0) return 1;
+                if ((REG_PC & 0x00ffffffu) != 0x001993dau) return 1;
+            }
+
+            if (!tab5_mdx619_fixed_step(0x001993deu, MDX619_2008, 0x001993e0u)) return 1;
+            if (GET_CYCLES() <= 0) return 1;
+            if (!tab5_mdx619_fixed_step(0x001993e0u, MDX619_908B, 0x001993e2u)) return 1;
+            if (GET_CYCLES() <= 0) return 1;
+            if (!tab5_mdx619_fixed_step(0x001993e2u, MDX619_E248, 0x001993e4u)) return 1;
+            if (GET_CYCLES() <= 0) return 1;
+            if (!tab5_mdx619_fixed_step(0x001993e4u, MDX619_5340, 0x001993e6u)) return 1;
+            if (GET_CYCLES() <= 0) return 1;
+            if (!tab5_mdx619_ram8(REG_A[2] + 1u)) return 1;
+            if (!tab5_mdx619_fixed_step(0x001993e6u, MDX619_B02A, 0x001993eau)) return 1;
+            if (GET_CYCLES() <= 0) return 1;
+
+            /* BCS.B skips MOVE.B D0,(A2). */
+            taken = tab5_bcc598f_taken(0x6502u);
+            if (!tab5_mdx619_bcc_step(0x001993eau, 0x6502u, taken,
+                                      taken ? 0x001993eeu : 0x001993ecu)) return 1;
+            if (GET_CYCLES() <= 0) return 1;
+            if (!taken) {
+                if (!tab5_mdx619_ram8(REG_A[2]) || tab5_mdx619_code_overlap(REG_A[2], 1u)) return 1;
+                if (!tab5_mdx619_fixed_step(0x001993ecu, MDX619_1480, 0x001993eeu)) return 1;
+                if (GET_CYCLES() <= 0) return 1;
+            }
+        }
+
+        if (!tab5_mdx619_fixed_step(0x001993eeu, MDX619_5C8A, 0x001993f0u)) return 1;
+        if (GET_CYCLES() <= 0) return 1;
+        if (!tab5_mdx619_dbf_step(&next_pc)) return 1;
+        ++outer_batch;
+        ++s_tab5_mdx619_outer;
+        if (GET_CYCLES() <= 0) break;
+        if (next_pc != TAB5_MDX619_PC_START) break;
+    }
+
+    if (outer_batch > s_tab5_mdx619_maxbatch) s_tab5_mdx619_maxbatch = outer_batch;
+    if (__builtin_expect(executed_any && !s_tab5_mdx619_announced, 0)) {
+        s_tab5_mdx619_announced = 1;
+        printf("PX68K_MDX620: exact $1993BC-$1993F2 block executor ACTIVE; corrected DBF ext=$FFCA signature=56B maxOuter=%u CMPHI617 reused\n",
+               (unsigned)TAB5_MDX619_MAX_OUTER);
+    }
+    return executed_any;
+}
+
+void m68k_tab5_mdx619_stats(unsigned int *calls, unsigned long long *outer,
+                            unsigned long long *fixed_insn, unsigned int *maxbatch)
+{
+    if (calls) *calls = (unsigned int)s_tab5_mdx619_calls;
+    if (outer) *outer = (unsigned long long)s_tab5_mdx619_outer;
+    if (fixed_insn) *fixed_insn = (unsigned long long)s_tab5_mdx619_fixed_insn;
+    if (maxbatch) *maxbatch = (unsigned int)s_tab5_mdx619_maxbatch;
+}
+
+
+
 /* Build 5.98g11: collapse the exact sparse-clear loop measured in the g10
  * SFXVI profile.  One architectural iteration, including the taken BPL, has
  * already completed when this helper runs:
@@ -5084,6 +5663,42 @@ void m68k_set_cpu_type(unsigned int cpu_type)
 	}
 }
 
+#ifdef ESP_PLATFORM
+/* R57E65 slack prefetch.
+ *
+ * Pacing sometimes leaves ~100 us in which the guest must not execute yet.
+ * Spend a few cycles warming only semantically safe instruction-side data:
+ * the current RAM/IPL cache lines, the opcode jump-table entry and its handler.
+ * Actual execution always refetches the opcode, so self-modifying RAM remains
+ * authoritative.  MMIO/device regions are deliberately never touched. */
+unsigned int m68k_tab5_slack_prefetch_current(void)
+{
+    const uint32_t pc = REG_PC & 0x00ffffffu;
+    const uint8_t *p = 0;
+
+    if (pc <= 0x00bffffeu) {
+        p = MEM + pc;
+        __builtin_prefetch(p, 0, 3);
+        if (pc <= 0x00bfffdeu) __builtin_prefetch(p + 32u, 0, 2);
+        if (pc <= 0x00bfffbeu) __builtin_prefetch(p + 64u, 0, 1);
+    } else if (pc >= 0x00fc0000u && pc <= 0x00fffffeu) {
+        p = IPL + (pc & 0x0003ffffu);
+        __builtin_prefetch(p, 0, 3);
+        if ((pc & 0x0003ffffu) <= 0x0003ffdeu) __builtin_prefetch(p + 32u, 0, 2);
+        if ((pc & 0x0003ffffu) <= 0x0003ffbeu) __builtin_prefetch(p + 64u, 0, 1);
+    } else {
+        return 0u;
+    }
+
+    /* PX68K RAM/IPL is word-swapped for the little-endian host; the same
+     * native 16-bit load used by the production opcode fetch yields REG_IR. */
+    uint16_t op;
+    __builtin_memcpy(&op, p, sizeof(op));
+    __builtin_prefetch(&m68ki_instruction_jump_table[op], 0, 3);
+    return 1u;
+}
+#endif
+
 /* Execute some instructions until we use up num_cycles clock cycles */
 /* ASG: removed per-instruction interrupt checks */
 #ifdef ESP_PLATFORM
@@ -5118,6 +5733,13 @@ int m68k_execute(int num_cycles)
 		m68ki_check_bus_error_trap();
 #endif
 
+		/* R57E62 production: MEM/IPL roots are TCM-pinned and stable for one
+		 * m68k_execute() slice.  Hoist them out of the per-instruction fetch. */
+#ifdef ESP_PLATFORM
+		uint8_t * const tab5_mem_fetch_base = MEM;
+		uint8_t * const tab5_ipl_fetch_base = IPL;
+#endif
+
 		/* Main loop.  Keep going until we run out of clock cycles */
 		do
 		{
@@ -5126,6 +5748,25 @@ int m68k_execute(int num_cycles)
 
 			/* Set the address space for reads */
 			m68ki_use_data_space(); /* auto-disable (see m68kcpu.h) */
+
+#ifdef ESP_PLATFORM
+			/* Build 6.15h17R22: most MDX outer iterations are the four-op zero
+			 * path.  Batch complete zero iterations first; fall through to the
+			 * exact R20 handler block for non-zero entries / cycle-boundary
+			 * tails, then to stock Musashi for anything else. */
+			if (__builtin_expect((REG_PC & 0x00ffffffu) == TAB5_MDX619_PC_START, 0)) {
+#if PX68K_TAB5_MDX622_ZERO_RUN_AB
+				if (tab5_mdx622_zero_run_try()) {
+					m68ki_exception_if_trace();
+					continue;
+				}
+#endif
+				if (tab5_mdx619_try()) {
+					m68ki_exception_if_trace();
+					continue;
+				}
+			}
+#endif
 
 			/* Call external hook to peek at CPU */
 			m68ki_instr_hook(REG_PC); /* auto-disable (see m68kcpu.h) */
@@ -5168,14 +5809,14 @@ int m68k_execute(int num_cycles)
 				tab5_fetch_pc = ADDRESS_68K(tab5_fetch_pc);
 
 				if (__builtin_expect(tab5_fetch_pc <= 0x00bffffeu, 1)) {
-					__builtin_memcpy(&tab5_fetch_word, MEM + tab5_fetch_pc,
+					__builtin_memcpy(&tab5_fetch_word, tab5_mem_fetch_base + tab5_fetch_pc,
 					                 sizeof(tab5_fetch_word));
 					BusErrFlag = 0;
 					REG_IR = (uint32_t)tab5_fetch_word;
 				} else if (__builtin_expect(tab5_fetch_pc >= 0x00fc0000u &&
 				                               tab5_fetch_pc <= 0x00fffffeu, 0)) {
 					__builtin_memcpy(&tab5_fetch_word,
-					                 IPL + (tab5_fetch_pc & 0x0003ffffu),
+					                 tab5_ipl_fetch_base + (tab5_fetch_pc & 0x0003ffffu),
 					                 sizeof(tab5_fetch_word));
 					BusErrFlag = 0;
 					REG_IR = (uint32_t)tab5_fetch_word;
@@ -5318,6 +5959,13 @@ int m68k_execute(int num_cycles)
 					if (__builtin_expect((post_flags & TAB5_POST598F_BNE_FAST) &&
 					                     ((op & 0x00ffu) == 0xfau) && FLAG_Z != 0u, 0))
 						tab5_clear598g6_try_cmpa_bne(op);
+
+					/* Build 6.15h17R17: accelerate the measured CMP.W (An)+ / BHI -4
+					 * ordinary-RAM search only after the current BHI has completed. */
+					if (__builtin_expect((post_flags & TAB5_POST598F_BCC_FAST) &&
+					                     op == 0x62fcu &&
+					                     ((REG_PC & 0x00ffffffu) < (REG_PPC & 0x00ffffffu)), 0))
+						tab5_cmphi617_try(op);
 
 					/* Build 5.98g11: the measured sparse-clear loop ends in the
 					 * exact BPL.B -10 opcode $6AF6.  The helper verifies the full
@@ -5467,6 +6115,12 @@ void m68k_init(void)
 		printf("PX68K_BRANCH598F: Bcc.B/Bcc.W + DBcc inline via existing dispatch metadata gate; exact cycles/extension fetch retained\n");
 		printf("PX68K_CORE598F: measured register-only fast paths ACTIVE: MOVE.W/L rr, MOVEQ, ADD.W rr, AND rr/imm, TST.W, SWAP, ADDQ/SUBQ.W, ASR.W/L\n");
 		printf("PX68K_CPU598G10: g9 hot paths + MOVE.L (An)+,(Am)+ / BTST #imm,Dn / CLR.L (An)+ / EXT.L Dn inline armed; generated-handler semantics retained\n");
+		printf("PX68K_CPUHOT_R57E47: NW16 wide inline pack RETIRED; NW14 execute loop restored; NW15-measured FLASH hot handlers use IRAM12 placement only\n");
+#if PX68K_TAB5_MDX622_ZERO_RUN_AB
+		printf("PX68K_CPU615H22: no-JIT + L2=4096 + R20 MDX block + ZERO-RUN outer batching armed\n");
+#else
+		printf("PX68K_CPU615H29: R28 proven IRAM11 + profile-driven IRAM64 total handlers; ZERO-RUN=OFF, device exact paths retained\n");
+#endif
 		printf("PX68K_LOOP598G11: exact CLR.W(A0)+ x2 / SUBQ.W D0 / ADDQ #4,A0 / BPL -10 ordinary-RAM batch armed; scheduler boundary + final exit preserved\n");
 		printf("PX68K_DISPATCH598G9: TCM L1=%u entries + internal-DRAM L2=%u entries (%u bytes) armed before PSRAM metadata fallback\n",
 		       (unsigned)TAB5_M68K_DISPATCH_CACHE_SIZE, (unsigned)TAB5_M68K_DISPATCH_L2_SIZE,

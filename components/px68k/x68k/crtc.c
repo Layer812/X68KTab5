@@ -13,8 +13,22 @@
 #include	"m68000.h"
 #include	"crtc.h"
 
+#ifndef PX68K_TAB5_RELEASE_DIAGNOSTICS
+#define PX68K_TAB5_RELEASE_DIAGNOSTICS 0
+#endif
+#if PX68K_TAB5_RELEASE_DIAGNOSTICS
+#define TAB5_RELEASE_DIAG_INC(v) (++(v))
+#define TAB5_RELEASE_DIAG_ADD(v,n) ((v) += (n))
+#define TAB5_RELEASE_DIAG_ATOMIC_ADD(ptr,n) __atomic_add_fetch((ptr),(n),__ATOMIC_RELAXED)
+#else
+#define TAB5_RELEASE_DIAG_INC(v) ((void)0)
+#define TAB5_RELEASE_DIAG_ADD(v,n) ((void)0)
+#define TAB5_RELEASE_DIAG_ATOMIC_ADD(ptr,n) ((void)0)
+#endif
+
 #ifdef ESP_PLATFORM
 #include "esp_attr.h"
+#include "tab5_guest_video_state.h"
 #ifdef TCM_DRAM_ATTR
 #define PX68K_CRTCHOT TCM_DRAM_ATTR
 #else
@@ -104,7 +118,10 @@ int CRTC_StateAction(StateMem *sm, int load, int data_only)
 }
 
 #ifdef ESP_PLATFORM
+extern void tab5_guest_bus_post_tvram_raster_copy(uint8_t src_line,uint8_t dst_line,uint8_t planes);
 static uint32_t s_tab5_raster_copy_count;
+static uint32_t s_tab5_dirty_prune_irq;
+static uint32_t s_tab5_dirty_prune_ctl;
 static uint8_t s_tab5_raster_copy_src;
 static uint8_t s_tab5_raster_copy_dst;
 static uint8_t s_tab5_raster_copy_planes;
@@ -115,6 +132,13 @@ uint8_t CRTC_DebugRasterCopySrc(void) { return s_tab5_raster_copy_src; }
 uint8_t CRTC_DebugRasterCopyDst(void) { return s_tab5_raster_copy_dst; }
 uint8_t CRTC_DebugRasterCopyPlanes(void) { return s_tab5_raster_copy_planes; }
 uint8_t CRTC_DebugRasterCopyMode(void) { return s_tab5_raster_copy_mode; }
+void CRTC_Tab5DirtyPruneStatsTake(uint32_t *suppressed_irq, uint32_t *suppressed_ctl)
+{
+    if (suppressed_irq)
+        *suppressed_irq = __atomic_exchange_n(&s_tab5_dirty_prune_irq, 0u, __ATOMIC_RELAXED);
+    if (suppressed_ctl)
+        *suppressed_ctl = __atomic_exchange_n(&s_tab5_dirty_prune_ctl, 0u, __ATOMIC_RELAXED);
+}
 #endif
 
 void CRTC_RasterCopy(void)
@@ -146,6 +170,11 @@ void CRTC_RasterCopy(void)
 		TextDirtyLine[line] = 1;
 		line = (line + 1) & 0x3ff;
 	}
+#ifdef ESP_PLATFORM
+    /* R57e: direct CRTC memmove bypasses TVRAM_Write, so mirror it as one
+     * ordered journal event instead of posting 512 byte writes per plane. */
+    tab5_guest_bus_post_tvram_raster_copy(CRTC_Regs[0x2c],CRTC_Regs[0x2d],CRTC_Regs[0x2b]&0x0f);
+#endif
 }
 
 	TVRAM_RCUpdate();
@@ -181,7 +210,11 @@ void FASTCALL VCtrl_Write(uint32_t adr, uint8_t data)
       if (VCReg0[adr&1] != data)
       {
          VCReg0[adr&1] = data;
-         TVRAM_SetAllDirty();
+#ifdef ESP_PLATFORM
+         if ((adr & 1u) != 0u)
+            tab5_guest_video_state_note_vctrl0(data);
+#endif
+         TVRAM_SetAllDirtyReason(TAB5_DIRTY_ALL_VCTRL);
       }
    }
    else if (adr < 0x00e82600)
@@ -189,7 +222,7 @@ void FASTCALL VCtrl_Write(uint32_t adr, uint8_t data)
       if (VCReg1[adr&1] != data)
       {
          VCReg1[adr&1] = data;
-         TVRAM_SetAllDirty();
+         TVRAM_SetAllDirtyReason(TAB5_DIRTY_ALL_VCTRL);
       }
    }
    else if (adr < 0x00e82700)
@@ -197,7 +230,7 @@ void FASTCALL VCtrl_Write(uint32_t adr, uint8_t data)
       if (VCReg2[adr&1] != data)
       {
          VCReg2[adr&1] = data;
-         TVRAM_SetAllDirty();
+         TVRAM_SetAllDirtyReason(TAB5_DIRTY_ALL_VCTRL);
       }
    }
 }
@@ -274,7 +307,22 @@ void FASTCALL CRTC_Write(uint32_t adr, uint8_t data)
       if ( reg>=0x30 ) return;
       if (CRTC_Regs[reg]==data) return;
       CRTC_Regs[reg] = data;
+#ifdef ESP_PLATFORM
+      if (reg == 0x29u)
+         tab5_guest_video_state_note_crtc(reg, data);
+
+      /* BAT177NW5/R57E35: CRTC raster-interrupt compare and memory-operation
+       * control registers do not change current pixels by themselves. */
+      if ((reg == 0x12u) || (reg == 0x13u)) {
+         TAB5_RELEASE_DIAG_ATOMIC_ADD(&s_tab5_dirty_prune_irq, 1u);
+      } else if (reg >= 0x2au) {
+         TAB5_RELEASE_DIAG_ATOMIC_ADD(&s_tab5_dirty_prune_ctl, 1u);
+      } else {
+         TVRAM_SetAllDirtyReason(TAB5_DIRTY_ALL_CRTC);
+      }
+#else
       TVRAM_SetAllDirty();
+#endif
       switch(reg)
       {
          case 0x00:
@@ -321,7 +369,7 @@ void FASTCALL CRTC_Write(uint32_t adr, uint8_t data)
             CRTC_ScreenChanged();
             break;
          case 0x28:
-            TVRAM_SetAllDirty();
+            /* Already invalidated by the visual-register gate above. */
             break;
          case 0x29:
             HSYNC_CLK = ((CRTC_Regs[0x29]&0x10)?VSYNC_HIGH:VSYNC_NORM)/VLINE_TOTAL;

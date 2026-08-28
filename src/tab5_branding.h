@@ -4,4 +4,4 @@
 #define X68K_TAB_APP_NAME "X68K Tab"
 #define X68K_TAB_SUBTITLE "X68000 Emulator for M5Stack TAB5"
 #define X68K_TAB_CREDIT "Developed by Layer812  |  Based on PX68K  |  68000 core: Musashi"
-#define X68K_TAB_BUILD "6.15"
+#define X68K_TAB_BUILD "6.15h17-dbfb"

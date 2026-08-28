@@ -54,6 +54,9 @@ set(PX68K_C_SOURCES
     libretro/timer.c
     libretro/dswin.c
     libretro/windraw.c
+    libretro/tab5_video_cpu1.c
+    libretro/tab5_video_flow.c
+    libretro/tab5_guest_video_state.c
     libretro/winui.c
     libretro/dosio.c
     libretro/fake.c
@@ -122,17 +125,22 @@ endif()
 message(STATUS "PX68K: PSRAM enabled")
 message(STATUS "PX68K: external BSS enabled")
 
-# PX68K Makefile.common ‚Ì•W€ Musashi \¬
+# PX68K Makefile.common ï¿½Ì•Wï¿½ï¿½ Musashi ï¿½\ï¿½ï¿½
 target_compile_definitions(
     ${COMPONENT_LIB}
     PRIVATE
         HAVE_MUSASHI=1
 )
 
-# ŒÃ‚¢C++ƒR[ƒh‚ğESP-IDF/GCC 14‚Å‚Ü‚¸’Ê‚·‚½‚ßB
-# •K—v‚È‰ÓŠ‚¾‚¯Œã‚Å³í‰»‚·‚éB
+# ï¿½Ã‚ï¿½C++ï¿½Rï¿½[ï¿½hï¿½ï¿½ESP-IDF/GCC 14ï¿½Å‚Ü‚ï¿½ï¿½Ê‚ï¿½ï¿½ï¿½ï¿½ßB
+# ï¿½Kï¿½vï¿½È‰Óï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Åï¿½ï¿½í‰»ï¿½ï¿½ï¿½ï¿½B
 target_compile_options(
     ${COMPONENT_LIB}
     PRIVATE
         $<$<COMPILE_LANGUAGE:CXX>:-fpermissive>
 )
+
+# PX68K_NATIVE55_WARNING_BRIDGE_V24
+# Diagnostics remain visible; only promotion to errors is disabled for known migration warnings.
+target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-error=stringop-truncation -Wno-error=format-truncation -Wno-error=maybe-uninitialized -Wno-error=multistatement-macros -Wno-error=shift-count-overflow -Wno-error=overflow -Wno-error=deprecated-declarations -Wno-error=discarded-qualifiers -Wno-error=incompatible-pointer-types -Wno-error=int-conversion)
+

@@ -17,6 +17,9 @@
 #include <string.h>
 
 #include "esp_heap_caps.h"
+#include "esp_attr.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/portmacro.h"
 
 #define P4BLEND_MAX_WIDTH 800u
 
@@ -214,41 +217,31 @@ extern void tab5_piegfx_copy16_blocks(void *dst, const void *src, uint32_t block
 
 __asm__(
     ".section .iram1,\"ax\",@progbits\n"
-    ".global tab5_piegfx_fill16_blocks\n"
-    ".type tab5_piegfx_fill16_blocks, @function\n"
+    ".global tab5_piegfx_zero16_blocks\n"
+    ".type tab5_piegfx_zero16_blocks, @function\n"
     ".balign 4\n"
-    "tab5_piegfx_fill16_blocks:\n"
-    "beqz a2, 2f\n"
-    "esp.vldbc.16.ip q0, a1, 0\n"
+    "tab5_piegfx_zero16_blocks:\n"
+    "beqz a1, 2f\n"
+    "esp.zero.q q0\n"
     "1:\n"
     "esp.vst.128.ip q0, a0, 16\n"
-    "addi a2, a2, -1\n"
-    "bnez a2, 1b\n"
+    "addi a1, a1, -1\n"
+    "bnez a1, 1b\n"
     "2:\n"
     "ret\n"
-    ".size tab5_piegfx_fill16_blocks, .-tab5_piegfx_fill16_blocks\n"
+    ".size tab5_piegfx_zero16_blocks, .-tab5_piegfx_zero16_blocks\n"
     ".previous\n"
 );
-extern void tab5_piegfx_fill16_blocks(uint16_t *dst, const uint16_t *value, uint32_t blocks8);
+extern void tab5_piegfx_zero16_blocks(void *dst, uint32_t blocks16);
 
-__asm__(
-    ".section .iram1,\"ax\",@progbits\n"
-    ".global tab5_piegfx_fill8_blocks\n"
-    ".type tab5_piegfx_fill8_blocks, @function\n"
-    ".balign 4\n"
-    "tab5_piegfx_fill8_blocks:\n"
-    "beqz a2, 2f\n"
-    "esp.vldbc.8.ip q0, a1, 0\n"
-    "1:\n"
-    "esp.vst.128.ip q0, a0, 16\n"
-    "addi a2, a2, -1\n"
-    "bnez a2, 1b\n"
-    "2:\n"
-    "ret\n"
-    ".size tab5_piegfx_fill8_blocks, .-tab5_piegfx_fill8_blocks\n"
-    ".previous\n"
-);
-extern void tab5_piegfx_fill8_blocks(uint8_t *dst, const uint8_t *value, uint32_t blocks16);
+/* R57E12b3/BAT134:
+ * Do not use the task stack as PIE scratch.  The earlier RTC-stack crash came
+ * from vector stores to SP-backed memory.  BAT133 attempted a register-only
+ * MAX.U32.A reduction, but the IDF 5.5.4 assembler rejects the destination
+ * operand used there.  Use one tiny, explicitly INTERNAL/16-byte-aligned
+ * scratch block per CPU instead.  PIE still performs the 128-bit XOR/store;
+ * scalar code only OR-reduces the four scratch words. */
+static DRAM_ATTR __attribute__((aligned(16))) uint32_t s_piegfx_diff_reduce[2][4];
 
 __asm__(
     ".section .iram1,\"ax\",@progbits\n"
@@ -256,48 +249,43 @@ __asm__(
     ".type tab5_piegfx_diff16_blocks, @function\n"
     ".balign 4\n"
     "tab5_piegfx_diff16_blocks:\n"
-    "addi sp, sp, -16\n"
     "beqz a2, 3f\n"
     "1:\n"
     "esp.vld.128.ip q0, a0, 16\n"
     "esp.vld.128.ip q1, a1, 16\n"
     "esp.xorq q2, q0, q1\n"
-    /* GCC 14.2 / ESP-IDF 5.4.2 assembler rejects ESP.MAX.U32.A q2,t0.
-       Keep the vector XOR and reduce through one aligned 128-bit store through an a-register cursor plus
-       four ordinary 32-bit ORs.  The RISC-V ABI guarantees 16-byte SP alignment. */
-    "mv a3, sp\n"
+    /* a3 points only to s_piegfx_diff_reduce[core], never to SP/task stack. */
     "esp.vst.128.ip q2, a3, 16\n"
-    "lw t0, 0(sp)\n"
-    "lw t1, 4(sp)\n"
+    "lw t0, -16(a3)\n"
+    "lw t1, -12(a3)\n"
     "or t0, t0, t1\n"
-    "lw t1, 8(sp)\n"
+    "lw t1, -8(a3)\n"
     "or t0, t0, t1\n"
-    "lw t1, 12(sp)\n"
+    "lw t1, -4(a3)\n"
     "or t0, t0, t1\n"
+    "addi a3, a3, -16\n"
     "bnez t0, 2f\n"
     "addi a2, a2, -1\n"
     "bnez a2, 1b\n"
     "3:\n"
     "li a0, 0\n"
-    "addi sp, sp, 16\n"
     "ret\n"
     "2:\n"
     "li a0, 1\n"
-    "addi sp, sp, 16\n"
     "ret\n"
     ".size tab5_piegfx_diff16_blocks, .-tab5_piegfx_diff16_blocks\n"
     ".previous\n"
 );
-extern int tab5_piegfx_diff16_blocks(const void *a, const void *b, uint32_t blocks16);
+extern int tab5_piegfx_diff16_blocks(const void *a, const void *b, uint32_t blocks16,
+                                     uint32_t *reduce_scratch);
 #else
 static void tab5_piegfx_copy16_blocks(void *dst, const void *src, uint32_t blocks16)
 { memcpy(dst, src, (size_t)blocks16 * 16u); }
-static void tab5_piegfx_fill16_blocks(uint16_t *dst, const uint16_t *value, uint32_t blocks8)
-{ for (uint32_t i=0;i<blocks8*8u;++i) dst[i]=*value; }
-static void tab5_piegfx_fill8_blocks(uint8_t *dst, const uint8_t *value, uint32_t blocks16)
-{ for (uint32_t i=0;i<blocks16*16u;++i) dst[i]=*value; }
-static int tab5_piegfx_diff16_blocks(const void *a, const void *b, uint32_t blocks16)
-{ return memcmp(a,b,(size_t)blocks16*16u)!=0; }
+static void tab5_piegfx_zero16_blocks(void *vdst, uint32_t blocks16)
+{ memset(vdst, 0, (size_t)blocks16 * 16u); }
+static int tab5_piegfx_diff16_blocks(const void *a, const void *b, uint32_t blocks16,
+                                     uint32_t *reduce_scratch)
+{ (void)reduce_scratch; return memcmp(a,b,(size_t)blocks16*16u)!=0; }
 #endif
 
 void tab5_pie_graphics_copy(void *vdst, const void *vsrc, uint32_t bytes)
@@ -316,46 +304,62 @@ void tab5_pie_graphics_copy(void *vdst, const void *vsrc, uint32_t bytes)
 void tab5_pie_graphics_fill16(uint16_t *dst, uint16_t value, uint32_t pixels)
 {
     if (!dst || !pixels) return;
-    if (!s_piegfx_fill_ok || pixels < 32u) { for(uint32_t i=0;i<pixels;++i) dst[i]=value; return; }
+    /* R57E12b2: every current hot WinDraw fill is zero.  Keep arbitrary
+     * nonzero callers exact via scalar code instead of PIE broadcast-loading
+     * a scalar from an unknown task-stack memory class. */
+    if (!s_piegfx_fill_ok || value != 0u || pixels < 32u) { for(uint32_t i=0;i<pixels;++i) dst[i]=value; return; }
     uintptr_t da=(uintptr_t)dst & 15u;
     uint32_t pre=da ? (uint32_t)((16u-da)>>1) : 0u; if(pre>pixels) pre=pixels;
     for(uint32_t i=0;i<pre;++i) dst[i]=value;
     dst+=pre; pixels-=pre;
     const uint32_t blocks=pixels>>3, vec=blocks<<3;
-    if (blocks) { tab5_piegfx_fill16_blocks(dst,&value,blocks); }
+    if (blocks) { tab5_piegfx_zero16_blocks(dst,blocks); }
     for(uint32_t i=vec;i<pixels;++i) dst[i]=value;
 }
 
 void tab5_pie_graphics_fill8(uint8_t *dst, uint8_t value, uint32_t bytes)
 {
     if (!dst || !bytes) return;
-    if (!s_piegfx_fill_ok || bytes < 64u) {
+    if (!s_piegfx_fill_ok || value != 0u || bytes < 64u) {
         memset(dst, value, bytes); return;
     }
     uintptr_t da=(uintptr_t)dst & 15u;
     uint32_t pre=da ? 16u-(uint32_t)da : 0u; if(pre>bytes) pre=bytes;
     if(pre) { memset(dst,value,pre); dst+=pre; bytes-=pre; }
     const uint32_t blocks=bytes>>4, vec=blocks<<4;
-    if(blocks) { tab5_piegfx_fill8_blocks(dst,&value,blocks); }
+    if(blocks) { tab5_piegfx_zero16_blocks(dst,blocks); }
     if(vec!=bytes) memset(dst+vec,value,bytes-vec);
 }
 
 int tab5_pie_graphics_diff(const void *va, const void *vb, uint32_t bytes)
 {
     const uint8_t *a=(const uint8_t *)va, *b=(const uint8_t *)vb;
-    if (!a || !b) return a!=b; if (!bytes) return 0;
+    if (!a || !b)
+        return a != b;
+    if (!bytes)
+        return 0;
     uintptr_t aa=(uintptr_t)a & 15u, ba=(uintptr_t)b & 15u;
     if (!s_piegfx_diff_ok || aa!=ba || bytes<64u) { return memcmp(a,b,bytes)!=0; }
     uint32_t pre=aa ? 16u-(uint32_t)aa : 0u; if(pre>bytes) pre=bytes;
-    if (pre && memcmp(a,b,pre)!=0) return 1; a+=pre; b+=pre; bytes-=pre;
+    if (pre && memcmp(a, b, pre) != 0)
+        return 1;
+    a += pre;
+    b += pre;
+    bytes -= pre;
     const uint32_t blocks=bytes>>4, vec=blocks<<4;
-    if (blocks) { if(tab5_piegfx_diff16_blocks(a,b,blocks)) return 1; }
+    if (blocks) {
+        const unsigned core = ((unsigned)xPortGetCoreID()) & 1u;
+        if (tab5_piegfx_diff16_blocks(a, b, blocks, s_piegfx_diff_reduce[core]))
+            return 1;
+    }
     return vec==bytes ? 0 : (memcmp(a+vec,b+vec,bytes-vec)!=0);
 }
 
 void tab5_pie_graphics_init(void)
 {
-    if (s_piegfx_init_done) return; s_piegfx_init_done=1;
+    if (s_piegfx_init_done)
+        return;
+    s_piegfx_init_done = 1;
 
     /* Build 5.98g6: self-check scratch no longer occupies scarce internal
      * SRAM for the lifetime of the emulator.  PIE already operates on PSRAM
@@ -378,27 +382,65 @@ void tab5_pie_graphics_init(void)
     for(uint32_t i=0;i<256u;++i) src[i]=(uint8_t)(i*29u+7u);
     memset(dst,0,256u); tab5_piegfx_copy16_blocks(dst,src,16u);
     s_piegfx_copy_ok = memcmp(dst,src,256u)==0;
-    for(uint32_t i=0;i<128u;++i) fill[i]=0;
-    const uint16_t fv=0x5aa5u; tab5_piegfx_fill16_blocks(fill,&fv,16u);
-    s_piegfx_fill_ok=1; for(uint32_t i=0;i<128u;++i) if(fill[i]!=fv){s_piegfx_fill_ok=0;break;}
-    memset(fill8,0,256u); { const uint8_t f8=0xa5u; tab5_piegfx_fill8_blocks(fill8,&f8,16u);
-        for(uint32_t i=0;i<256u;++i) if(fill8[i]!=f8){s_piegfx_fill_ok=0;break;} }
+    /* R57E12b2: validate the production zero-fill path.  The old generic PIE
+     * fill broadcast-loaded &value from the task stack; when that stack is in
+     * RTCRAM, the PIE load is not a safe memory operation. */
+    memset(fill,0xa5,256u);
+    tab5_piegfx_zero16_blocks(fill,16u);
+    s_piegfx_fill_ok=1; for(uint32_t i=0;i<128u;++i) if(fill[i]!=0u){s_piegfx_fill_ok=0;break;}
+    memset(fill8,0xa5,256u); tab5_piegfx_zero16_blocks(fill8,16u);
+    for(uint32_t i=0;i<256u;++i) if(fill8[i]!=0u){s_piegfx_fill_ok=0;break;}
+
+    /* R57E12b3: diff reduction uses per-core INTERNAL scratch, never SP. */
+    const unsigned core = ((unsigned)xPortGetCoreID()) & 1u;
     memcpy(eq,src,256u);
-    const int deq=tab5_piegfx_diff16_blocks(src,eq,16u);
-    eq[137]^=0x40u; const int dne=tab5_piegfx_diff16_blocks(src,eq,16u);
+    const int deq=tab5_piegfx_diff16_blocks(src,eq,16u,s_piegfx_diff_reduce[core]);
+    eq[137]^=0x40u;
+    const int dne=tab5_piegfx_diff16_blocks(src,eq,16u,s_piegfx_diff_reduce[core]);
     s_piegfx_diff_ok = (deq==0 && dne==1);
     const int keyok = pie_synthetic_selfcheck();
     heap_caps_free(scratch);
-    printf("PX68K_PIEGFX598G6: self-check COPY=%s FILL8/16=%s DIFF=%s KEY0=%s; primitives armed; scratch=PSRAM-temporary\n",
+    printf("PX68K_PIEGFX_R57E12B3: self-check COPY=%s FILL0-8/16=%s DIFF=%s KEY0=%s; STACKFREE PIE helpers armed; diffScratch=INTERNAL-per-core; scratch=PSRAM-temporary\n",
            s_piegfx_copy_ok?"PASS":"FAIL", s_piegfx_fill_ok?"PASS":"FAIL",
            s_piegfx_diff_ok?"PASS":"FAIL", keyok?"PASS":"FAIL");
 }
 
 
+static void *s_framebuffer_raw_alloc;
+
 void *tab5_ppa_alloc_framebuffer(size_t bytes)
 {
-    /* Kept ABI name: this is now simply the aligned PSRAM framebuffer allocator. */
-    return heap_caps_aligned_alloc(128, bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    /* Build 6.15h17-r4: keep the 128-byte alignment invariant even when
+     * heap_caps_aligned_alloc() cannot satisfy a fragmented PSRAM heap.
+     * A normal SPIRAM allocation succeeded in the failing h17 log, so use an
+     * over-allocation + manual alignment fallback instead of returning an
+     * unaligned calloc buffer to the PIE/async compositor. */
+    s_framebuffer_raw_alloc = NULL;
+    void *p = heap_caps_aligned_alloc(128, bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (p) return p;
+
+    uint8_t *raw = (uint8_t *)heap_caps_malloc(bytes + 127u,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!raw) return NULL;
+    uintptr_t aligned = ((uintptr_t)raw + 127u) & ~(uintptr_t)127u;
+    s_framebuffer_raw_alloc = raw;
+    printf("PX68K_GFX615H17R4: aligned_alloc fragmented; manual PSRAM align raw=%p aligned=%p bytes=%u\n",
+           (void *)raw, (void *)aligned, (unsigned)bytes);
+    return (void *)aligned;
+}
+
+void tab5_ppa_free_framebuffer(void *ptr)
+{
+    if (!ptr) return;
+    if (s_framebuffer_raw_alloc)
+    {
+        heap_caps_free(s_framebuffer_raw_alloc);
+        s_framebuffer_raw_alloc = NULL;
+    }
+    else
+    {
+        heap_caps_free(ptr);
+    }
 }
 
 int tab5_p4blend_key0_overlay(uint16_t *frame_base, uint32_t frame_w,

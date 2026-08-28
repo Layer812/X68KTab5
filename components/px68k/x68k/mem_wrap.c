@@ -43,10 +43,12 @@
 #define PX68K_MEMHOT
 #endif
 
-uint8_t *IPL;
-uint8_t *MEM;
+/* R57E62 production: keep only the 12-byte guest-memory roots in TCM/SPM.
+ * Backing RAM/ROM/font storage remains in PSRAM. */
+PX68K_MEMHOT uint8_t *IPL;
+PX68K_MEMHOT uint8_t *MEM;
 static uint8_t *OP_ROM;
-uint8_t *FONT;
+PX68K_MEMHOT uint8_t *FONT;
 
 PX68K_MEMHOT uint32_t BusErrFlag = 0;
 PX68K_MEMHOT uint32_t BusErrHandling = 0;
@@ -179,22 +181,19 @@ static void wm_opm(uint32_t addr, uint8_t val)
 	uint8_t t = addr & 3;
 	if (t == 1 || t == 3)
 	{
-		/*
-		 * YM2151 port 0 only selects CurReg and does not change audible state.
-		 * Flush pending PCM only before the data-port write (port 1), where the
-		 * selected register actually changes.  This preserves ordering while
-		 * avoiding a redundant FMGEN Mix() for every register-select write.
-		 */
-		if (t == 3)
-			DSound_FlushPending();
-		OPM_Write((t == 1) ? 0 : 1, val);
+		/* Build 6.15b: OPM and ADPCM have independent audible state.  Dense
+		 * MDX register traffic must not force CPU1 to run ADPCM_Update() for
+		 * every YM2151 data write.  DSound_OPMWrite() timestamps the FM write
+		 * against the pending guest-audio frames and sends render+write as one
+		 * ordered CPU0 event. */
+		DSound_OPMWrite((t == 1) ? 0 : 1, val);
 	}
 }
 
 static void wm_adpcm(uint32_t addr, uint8_t val)
 {
-	/* Same ordering rule for MSM6258 control/data writes. */
-	DSound_FlushPending();
+	/* MSM6258 writes only require the ADPCM timeline to reach this boundary. */
+	DSound_FlushADPCMPending();
 	ADPCM_Write(addr, val);
 }
 

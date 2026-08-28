@@ -25,6 +25,7 @@
 #ifdef ESP_PLATFORM
 #include "esp_attr.h"
 #include "esp_heap_caps.h"
+#include "esp_memory_utils.h"
 #else
 #ifndef IRAM_ATTR
 #define IRAM_ATTR
@@ -64,10 +65,14 @@ struct VgmM5YM2151 {
     uint32_t output_tick_counter;
 
     uint8_t pan_l[YM_CH], pan_r[YM_CH];
-    uint8_t algo[YM_CH], fb_shift[YM_CH];
+    uint8_t algo[YM_CH], fb_shift[YM_CH], fb_rshift[YM_CH];
     int32_t fb_memory[YM_CH][2];
     int32_t mem_value[YM_CH];
     uint8_t kc[YM_CH], kf[YM_CH], pms[YM_CH], ams[YM_CH];
+    /* R56o: values derived only from OPM registers.  Cache them when the
+     * register is written instead of decoding/table-loading per channel for
+     * every 44.1-kHz sample.  Zero-init exactly represents register value 0. */
+    int32_t pm_scale[YM_CH], am_scale[YM_CH];
     YMOp ops[YM_OPS];
     uint32_t freq_tab[13][64];
 
@@ -89,6 +94,29 @@ static DRAM_ATTR uint32_t s_rate[128];
 static DRAM_ATTR int8_t s_lfo_pm[4][256];
 static DRAM_ATTR uint8_t s_lfo_am[4][256];
 static DRAM_ATTR int s_tables_ready = 0;
+
+#ifndef PX68K_TAB5_RELEASE_DIAGNOSTICS
+#define PX68K_TAB5_RELEASE_DIAGNOSTICS 0
+#endif
+
+/* R57E13E/BAT156: cold operator-semantic sampler on the LP-safe BAT154
+ * synthesis graph.  BAT155's zero-mod specialization is deliberately absent.
+ * No cycle counter and no hot-path duplication: one state snapshot per 64
+ * render calls, outside the output-frame loop.  The sampler itself stays in
+ * flash so diagnostic code does not consume scarce Internal/IRAM space. */
+typedef struct {
+    uint32_t render_calls;
+    uint32_t samples;
+    uint32_t active_ch_sum;
+    uint32_t active_op_sum;
+    uint32_t audible_op_sum;
+    uint32_t phase_only_op_sum;
+    uint32_t fb_zero_ch_sum;
+    uint32_t noise_samples;
+    uint32_t zero_mod_samples;
+    uint32_t algo_ch_sum[8];
+} ym_semantic_stats_t;
+static DRAM_ATTR volatile ym_semantic_stats_t s_semantic = {};
 
 /*
  * Build 5.42: these are touched for every active channel of every 44.1 kHz
@@ -199,11 +227,18 @@ static IRAM_ATTR __attribute__((noinline,optimize("O3"))) void update_envelopes(
 
 static IRAM_ATTR __attribute__((always_inline,optimize("O3"))) inline int32_t feedback(const VgmM5YM2151 *e,int ch)
 {
-    uint32_t f=e->fb_shift[ch]&7u; if(!f)return 0;
-    return (e->fb_memory[ch][0]+e->fb_memory[ch][1]) >> (9u-f);
+    const uint32_t sh=e->fb_rshift[ch]; if(!sh)return 0;
+    return (e->fb_memory[ch][0]+e->fb_memory[ch][1]) >> sh;
 }
 
-static IRAM_ATTR __attribute__((always_inline,optimize("O3"))) inline int32_t calc_op(
+/* R57E13F/BAT157: hot zero-mod graph + cold exact generic fallback.
+ * BAT154 measured PM=AM=0 in every sampled active channel. BAT155 attempted
+ * to specialize this by invoking the same always-inline synth graph from two
+ * branches, which duplicated ~8.6 KiB into Internal/IRAM and collapsed the
+ * CPU path.  BAT157 instead keeps exactly ONE zero-mod graph in IRAM and
+ * moves the non-zero PM/AM fallback to flash/noinline.  The fallback is the
+ * BAT154 arithmetic/order verbatim; correctness is retained for LFO users. */
+static __attribute__((always_inline,optimize("O3"))) inline int32_t calc_op_modulated_cold(
     VgmM5YM2151 *e,YMOp *p,int32_t mod,int32_t pm,int32_t am,int noise)
 {
     if(p->env_state==EG_OFF)return 0;
@@ -231,13 +266,34 @@ static IRAM_ATTR __attribute__((always_inline,optimize("O3"))) inline int32_t ca
     return neg?-out:out;
 }
 
-/* Build 5.42: YM2151-only algorithm routing.
- * 5.40/5.41 mirrored vgmM5's generic six-bus implementation: clear bus[6],
- * perform five routing-table lookups, then indexed loads/stores for every
- * active channel of every output sample.  PX68K only needs OPM, so expand the
- * eight hardware algorithms directly.  The arithmetic/order below is exactly
- * the same as the previous bus routing, just with dead buses removed. */
-static IRAM_ATTR __attribute__((always_inline,optimize("O3"))) inline int32_t synth_channel(
+static IRAM_ATTR __attribute__((always_inline,optimize("O3"))) inline int32_t calc_op_zero_mod(
+    VgmM5YM2151 *e,YMOp *p,int32_t mod,int noise)
+{
+    if(p->env_state==EG_OFF)return 0;
+    mod*=2;
+    p->phase+=p->phase_step;
+    int32_t atten=(p->env_level>>EG_FRACTION_BITS)+p->tl_atten;
+    if(atten>=3840)return 0;
+    uint32_t ph=p->phase>>20;
+    uint32_t wi=(ph+(uint32_t)mod)&0xfffu;
+    if(noise) {
+        int32_t nv=((int32_t)(e->noise_rng&0x7fffu)-16384)>>1;
+        nv=(nv*3)>>2;
+        uint32_t ex=s_exp[(uint32_t)atten&255u] >> ((uint32_t)atten>>8);
+        return (nv*(int32_t)ex)>>14;
+    }
+    uint32_t si=wi&0x3ffu; if(wi&0x400u)si=1023u-si;
+    int neg=(wi&0x800u)!=0;
+    int32_t ta=atten+(int32_t)s_sin[si];
+    if(ta<0)ta=0;
+    if(ta>=3840)return 0;
+    int32_t out=(int32_t)(s_exp[(uint32_t)ta&255u] >> ((uint32_t)ta>>8));
+    return neg?-out:out;
+}
+
+/* Exact BAT154 non-zero modulation routing, deliberately cold/noinline so it
+ * cannot be cloned into the scarce IRAM hot graph. */
+static __attribute__((noinline,optimize("O3"))) int32_t synth_channel_modulated_cold(
     VgmM5YM2151 *e,int ch,int32_t pm,int32_t am)
 {
     YMOp *p=&e->ops[ch*4];
@@ -245,65 +301,112 @@ static IRAM_ATTR __attribute__((always_inline,optimize("O3"))) inline int32_t sy
     const int noise=(ch==7 && e->noise_enable);
     const int algo=e->algo[ch]&7;
 
-    const int32_t o0=calc_op(e,&p[0],feedback(e,ch),pm,am,0);
+    const int32_t o0=calc_op_modulated_cold(e,&p[0],feedback(e,ch),pm,am,0);
     e->fb_memory[ch][0]=e->fb_memory[ch][1];
     e->fb_memory[ch][1]=o0;
 
     int32_t o1,o2,o3,out;
     switch(algo) {
     case 0:
-        o1=calc_op(e,&p[1],mem,pm,am,0);
-        o2=calc_op(e,&p[2],o0,pm,am,0);
-        o3=calc_op(e,&p[3],o1,pm,am,noise);
-        e->mem_value[ch]=o2;
-        out=o3;
-        break;
+        o1=calc_op_modulated_cold(e,&p[1],mem,pm,am,0);
+        o2=calc_op_modulated_cold(e,&p[2],o0,pm,am,0);
+        o3=calc_op_modulated_cold(e,&p[3],o1,pm,am,noise);
+        e->mem_value[ch]=o2; out=o3; break;
     case 1:
-        o1=calc_op(e,&p[1],mem,pm,am,0);
-        o2=calc_op(e,&p[2],0,pm,am,0);
-        o3=calc_op(e,&p[3],o1,pm,am,noise);
-        e->mem_value[ch]=o0+o2;
-        out=o3;
-        break;
+        o1=calc_op_modulated_cold(e,&p[1],mem,pm,am,0);
+        o2=calc_op_modulated_cold(e,&p[2],0,pm,am,0);
+        o3=calc_op_modulated_cold(e,&p[3],o1,pm,am,noise);
+        e->mem_value[ch]=o0+o2; out=o3; break;
     case 2:
-        o1=calc_op(e,&p[1],mem,pm,am,0);
-        o2=calc_op(e,&p[2],0,pm,am,0);
-        o3=calc_op(e,&p[3],o0+o1,pm,am,noise);
-        e->mem_value[ch]=o2;
-        out=o3;
-        break;
+        o1=calc_op_modulated_cold(e,&p[1],mem,pm,am,0);
+        o2=calc_op_modulated_cold(e,&p[2],0,pm,am,0);
+        o3=calc_op_modulated_cold(e,&p[3],o0+o1,pm,am,noise);
+        e->mem_value[ch]=o2; out=o3; break;
     case 3:
-        o1=calc_op(e,&p[1],0,pm,am,0);
-        o2=calc_op(e,&p[2],o0,pm,am,0);
-        o3=calc_op(e,&p[3],mem+o1,pm,am,noise);
-        e->mem_value[ch]=o2;
-        out=o3;
-        break;
+        o1=calc_op_modulated_cold(e,&p[1],0,pm,am,0);
+        o2=calc_op_modulated_cold(e,&p[2],o0,pm,am,0);
+        o3=calc_op_modulated_cold(e,&p[3],mem+o1,pm,am,noise);
+        e->mem_value[ch]=o2; out=o3; break;
     case 4:
-        o1=calc_op(e,&p[1],0,pm,am,0);
-        o2=calc_op(e,&p[2],o0,pm,am,0);
-        o3=calc_op(e,&p[3],o1,pm,am,noise);
-        out=o2+o3;
-        break;
+        o1=calc_op_modulated_cold(e,&p[1],0,pm,am,0);
+        o2=calc_op_modulated_cold(e,&p[2],o0,pm,am,0);
+        o3=calc_op_modulated_cold(e,&p[3],o1,pm,am,noise);
+        out=o2+o3; break;
     case 5:
-        o1=calc_op(e,&p[1],mem,pm,am,0);
-        o2=calc_op(e,&p[2],o0,pm,am,0);
-        o3=calc_op(e,&p[3],o0,pm,am,noise);
-        e->mem_value[ch]=o0;
-        out=o1+o2+o3;
-        break;
+        o1=calc_op_modulated_cold(e,&p[1],mem,pm,am,0);
+        o2=calc_op_modulated_cold(e,&p[2],o0,pm,am,0);
+        o3=calc_op_modulated_cold(e,&p[3],o0,pm,am,noise);
+        e->mem_value[ch]=o0; out=o1+o2+o3; break;
     case 6:
-        o1=calc_op(e,&p[1],0,pm,am,0);
-        o2=calc_op(e,&p[2],o0,pm,am,0);
-        o3=calc_op(e,&p[3],0,pm,am,noise);
-        out=o1+o2+o3;
-        break;
-    default: /* 7 */
-        o1=calc_op(e,&p[1],0,pm,am,0);
-        o2=calc_op(e,&p[2],0,pm,am,0);
-        o3=calc_op(e,&p[3],0,pm,am,noise);
-        out=o0+o1+o2+o3;
-        break;
+        o1=calc_op_modulated_cold(e,&p[1],0,pm,am,0);
+        o2=calc_op_modulated_cold(e,&p[2],o0,pm,am,0);
+        o3=calc_op_modulated_cold(e,&p[3],0,pm,am,noise);
+        out=o1+o2+o3; break;
+    default:
+        o1=calc_op_modulated_cold(e,&p[1],0,pm,am,0);
+        o2=calc_op_modulated_cold(e,&p[2],0,pm,am,0);
+        o3=calc_op_modulated_cold(e,&p[3],0,pm,am,noise);
+        out=o0+o1+o2+o3; break;
+    }
+    return out;
+}
+
+/* One and only one hot synthesis graph. PM/AM work is absent, but phase,
+ * envelope, feedback, noise and all eight YM2151 algorithms remain exact. */
+static IRAM_ATTR __attribute__((always_inline,optimize("O3"))) inline int32_t synth_channel_zero_mod(
+    VgmM5YM2151 *e,int ch)
+{
+    YMOp *p=&e->ops[ch*4];
+    const int32_t mem=e->mem_value[ch];
+    const int noise=(ch==7 && e->noise_enable);
+    const int algo=e->algo[ch]&7;
+
+    const int32_t o0=calc_op_zero_mod(e,&p[0],feedback(e,ch),0);
+    e->fb_memory[ch][0]=e->fb_memory[ch][1];
+    e->fb_memory[ch][1]=o0;
+
+    int32_t o1,o2,o3,out;
+    switch(algo) {
+    case 0:
+        o1=calc_op_zero_mod(e,&p[1],mem,0);
+        o2=calc_op_zero_mod(e,&p[2],o0,0);
+        o3=calc_op_zero_mod(e,&p[3],o1,noise);
+        e->mem_value[ch]=o2; out=o3; break;
+    case 1:
+        o1=calc_op_zero_mod(e,&p[1],mem,0);
+        o2=calc_op_zero_mod(e,&p[2],0,0);
+        o3=calc_op_zero_mod(e,&p[3],o1,noise);
+        e->mem_value[ch]=o0+o2; out=o3; break;
+    case 2:
+        o1=calc_op_zero_mod(e,&p[1],mem,0);
+        o2=calc_op_zero_mod(e,&p[2],0,0);
+        o3=calc_op_zero_mod(e,&p[3],o0+o1,noise);
+        e->mem_value[ch]=o2; out=o3; break;
+    case 3:
+        o1=calc_op_zero_mod(e,&p[1],0,0);
+        o2=calc_op_zero_mod(e,&p[2],o0,0);
+        o3=calc_op_zero_mod(e,&p[3],mem+o1,noise);
+        e->mem_value[ch]=o2; out=o3; break;
+    case 4:
+        o1=calc_op_zero_mod(e,&p[1],0,0);
+        o2=calc_op_zero_mod(e,&p[2],o0,0);
+        o3=calc_op_zero_mod(e,&p[3],o1,noise);
+        out=o2+o3; break;
+    case 5:
+        o1=calc_op_zero_mod(e,&p[1],mem,0);
+        o2=calc_op_zero_mod(e,&p[2],o0,0);
+        o3=calc_op_zero_mod(e,&p[3],o0,noise);
+        e->mem_value[ch]=o0; out=o1+o2+o3; break;
+    case 6:
+        o1=calc_op_zero_mod(e,&p[1],0,0);
+        o2=calc_op_zero_mod(e,&p[2],o0,0);
+        o3=calc_op_zero_mod(e,&p[3],0,noise);
+        out=o1+o2+o3; break;
+    default:
+        o1=calc_op_zero_mod(e,&p[1],0,0);
+        o2=calc_op_zero_mod(e,&p[2],0,0);
+        o3=calc_op_zero_mod(e,&p[3],0,noise);
+        out=o0+o1+o2+o3; break;
     }
     return out;
 }
@@ -314,15 +417,23 @@ static IRAM_ATTR __attribute__((noinline,optimize("O3"))) void synth(VgmM5YM2151
     const int32_t gpm=e->cached_pm;
     const int32_t gam=e->cached_am;
     const uint8_t active=e->active_ch_mask;
-    for(int ch=0;ch<YM_CH;ch++) {
-        if((active&(uint8_t)(1u<<ch))==0) continue;
-        const uint8_t pms=e->pms[ch]&7u;
-        const uint8_t ams=e->ams[ch]&3u;
-        const int32_t pm=(gpm&&pms)?((gpm*s_pms_mult[pms])>>4):0;
-        const int32_t am=(gam&&ams)?((gam*s_ams_mult[ams])>>2):0;
-        const int32_t co=synth_channel(e,ch,pm,am);
-        if(e->pan_l[ch]) l+=co;
-        if(e->pan_r[ch]) r+=co;
+
+    if((gpm|gam)==0) {
+        for(int ch=0;ch<YM_CH;ch++) {
+            if((active&(uint8_t)(1u<<ch))==0) continue;
+            const int32_t co=synth_channel_zero_mod(e,ch);
+            if(e->pan_l[ch]) l+=co;
+            if(e->pan_r[ch]) r+=co;
+        }
+    } else {
+        for(int ch=0;ch<YM_CH;ch++) {
+            if((active&(uint8_t)(1u<<ch))==0) continue;
+            const int32_t pm=(gpm * e->pm_scale[ch]) >> 4;
+            const int32_t am=(gam * e->am_scale[ch]) >> 2;
+            const int32_t co=synth_channel_modulated_cold(e,ch,pm,am);
+            if(e->pan_l[ch]) l+=co;
+            if(e->pan_r[ch]) r+=co;
+        }
     }
     *ml=l;*mr=r;
 }
@@ -379,7 +490,7 @@ extern "C" VgmM5YM2151 *vgmm5_ym2151_create(uint32_t clock,uint32_t sr)
 #else
     VgmM5YM2151 *e=(VgmM5YM2151*)calloc(1,sizeof(VgmM5YM2151));
 #endif
-    if(e)init_state(e,clock,sr,16384);
+    if(e){ memset((void*)&s_semantic,0,sizeof(s_semantic)); init_state(e,clock,sr,16384); }
     return e;
 }
 extern "C" void vgmm5_ym2151_destroy(VgmM5YM2151 *e){if(!e)return;
@@ -389,7 +500,7 @@ extern "C" void vgmm5_ym2151_destroy(VgmM5YM2151 *e){if(!e)return;
     free(e);
 #endif
 }
-extern "C" void vgmm5_ym2151_reset(VgmM5YM2151 *e){if(!e)return;uint32_t c=e->clock,s=e->sample_rate;int32_t v=e->volume_q14;init_state(e,c,s,v);}
+extern "C" void vgmm5_ym2151_reset(VgmM5YM2151 *e){if(!e)return;uint32_t c=e->clock,s=e->sample_rate;int32_t v=e->volume_q14;memset((void*)&s_semantic,0,sizeof(s_semantic));init_state(e,c,s,v);}
 extern "C" void vgmm5_ym2151_set_px_volume(VgmM5YM2151 *e,uint8_t vol){if(!e)return;int v=vol?((16-(int)vol)*4):192;if(v>=192)e->volume_q14=0;else e->volume_q14=(int32_t)(16384.0f*powf(10.0f,-(float)v/40.0f));}
 
 extern "C" void vgmm5_ym2151_write(VgmM5YM2151 *e,uint8_t a,uint8_t d)
@@ -401,10 +512,10 @@ extern "C" void vgmm5_ym2151_write(VgmM5YM2151 *e,uint8_t a,uint8_t d)
     if(a==0x18){float f=(float)(d+1)*0.15f;e->lfo_step=(uint32_t)(f*e->phase_step_factor);return;}
     if(a==0x19){if(d&0x80)e->amd=d&0x7f;else e->pmd=d&0x7f;return;}
     if(a==0x1b){e->lfo_wave=d&3;return;}
-    if(a>=0x20&&a<=0x27){int ch=a&7;e->pan_l[ch]=(d>>7)&1;e->pan_r[ch]=(d>>6)&1;e->fb_shift[ch]=(d>>3)&7;e->algo[ch]=d&7;return;}
+    if(a>=0x20&&a<=0x27){int ch=a&7;e->pan_l[ch]=(d>>7)&1;e->pan_r[ch]=(d>>6)&1;e->fb_shift[ch]=(d>>3)&7;e->fb_rshift[ch]=e->fb_shift[ch]?(uint8_t)(9u-e->fb_shift[ch]):0;e->algo[ch]=d&7;return;}
     if(a>=0x28&&a<=0x2f){int ch=a&7;e->kc[ch]=d;update_phase(e,ch);update_rates(e,ch);return;}
     if(a>=0x30&&a<=0x37){int ch=a&7;e->kf[ch]=d;update_phase(e,ch);return;}
-    if(a>=0x38&&a<=0x3f){int ch=a&7;e->pms[ch]=(d>>4)&7;e->ams[ch]=d&3;return;}
+    if(a>=0x38&&a<=0x3f){int ch=a&7;e->pms[ch]=(d>>4)&7;e->ams[ch]=d&3;e->pm_scale[ch]=s_pms_mult[e->pms[ch]];e->am_scale[ch]=s_ams_mult[e->ams[ch]];return;}
     if(a>=0x40){int ch=a&7;int ot=(a>>3)&3;YMOp *p=&e->ops[ch*4+ot];switch(a&0xe0){
         case 0x40:p->mul=d&15;p->dt1=(d>>4)&7;update_phase(e,ch);break;
         case 0x60:p->tl_atten=(d&0x7f)*32;break;
@@ -426,9 +537,44 @@ extern "C" void vgmm5_ym2151_csm_pulse(VgmM5YM2151 *e)
     }
 }
 
+static __attribute__((noinline,optimize("Os"))) void semantic_sample(VgmM5YM2151 *e)
+{
+    const uint8_t active=e->active_ch_mask;
+    uint32_t chn=0, ops=0, audible=0, phase_only=0, fb0=0;
+    const int32_t gam=e->cached_am;
+    for(int ch=0;ch<YM_CH;ch++) {
+        const uint8_t bit=(uint8_t)(1u<<ch);
+        if((active&bit)==0) continue;
+        chn++;
+        s_semantic.algo_ch_sum[e->algo[ch]&7u]++;
+        fb0 += (e->fb_rshift[ch]==0);
+        const int32_t am=(gam * e->am_scale[ch]) >> 2;
+        const YMOp *p=&e->ops[ch*4];
+        for(int o=0;o<4;o++) {
+            if(p[o].env_state==EG_OFF) continue;
+            ops++;
+            int32_t atten=(p[o].env_level>>EG_FRACTION_BITS)+p[o].tl_atten;
+            if(p[o].am_enable && am) atten+=am;
+            if(atten>=3840) phase_only++; else audible++;
+        }
+    }
+    s_semantic.samples++;
+    s_semantic.active_ch_sum+=chn;
+    s_semantic.active_op_sum+=ops;
+    s_semantic.audible_op_sum+=audible;
+    s_semantic.phase_only_op_sum+=phase_only;
+    s_semantic.fb_zero_ch_sum+=fb0;
+    s_semantic.noise_samples+=(e->noise_enable!=0);
+    s_semantic.zero_mod_samples+=((e->cached_pm|e->cached_am)==0);
+}
+
 extern "C" IRAM_ATTR __attribute__((noinline,optimize("O3"))) void vgmm5_ym2151_render(VgmM5YM2151 *e,int16_t *dst,uint32_t frames)
 {
     if(!e||!dst)return;
+#if PX68K_TAB5_RELEASE_DIAGNOSTICS
+    const uint32_t sem_call=++s_semantic.render_calls;
+    if((sem_call&63u)==0u) semantic_sample(e);
+#endif
     int32_t vol=e->volume_q14;
     for(uint32_t i=0;i<frames;i++){
         int32_t l,r;tick(e,&l,&r);
@@ -439,4 +585,51 @@ extern "C" IRAM_ATTR __attribute__((noinline,optimize("O3"))) void vgmm5_ym2151_
         if(r>32767)r=32767;else if(r<-32768)r=-32768;
         dst[i*2]=(int16_t)l;dst[i*2+1]=(int16_t)r;
     }
+}
+
+extern "C" int vgmm5_ym2151_memory_internal(const VgmM5YM2151 *ym)
+{
+#ifdef ESP_PLATFORM
+    const void *ptrs[] = {
+        ym, s_sin, s_exp, s_rate, s_lfo_pm, s_lfo_am,
+        &s_tables_ready, s_pms_mult, s_ams_mult
+    };
+    for (unsigned i = 0; i < sizeof(ptrs) / sizeof(ptrs[0]); ++i)
+        if (!ptrs[i] || !esp_ptr_internal(ptrs[i]) || esp_ptr_external_ram(ptrs[i]))
+            return 0;
+    return 1;
+#else
+    (void)ym;
+    return 1;
+#endif
+}
+
+/* R57E12B4/BAT136 baseline compatibility:
+ * Keep the R57E12 public profile API so main/fmg_wrap remain byte-for-byte
+ * on the BAT134 lineage, but do not duplicate a profiled YM synthesis graph
+ * into IRAM.  The purpose of this build is a one-variable A/B against BAT134.
+ * FMHOT_R57E12 will therefore report zeros; after the memory/speed baseline is
+ * recovered, a cold/non-duplicating profiler can be reintroduced separately. */
+extern "C" void vgmm5_ym2151_profile_get(const VgmM5YM2151 *ym, vgmm5_ym2151_profile_t *out)
+{
+    (void)ym;
+    if (!out) return;
+    /* R57E13E/BAT156 semantic mapping over retained profile ABI:
+     * sampled=samples, total=activeCh, envelope=activeOp, lfo_noise=audibleOp,
+     * channel_prep=phaseOnlyOp, operator=fbZeroCh, routing_pan=noiseSamples. */
+    out->sampled_frames=s_semantic.samples;
+    out->total_cycles=s_semantic.active_ch_sum;
+    out->envelope_cycles=s_semantic.active_op_sum;
+    out->lfo_noise_cycles=s_semantic.audible_op_sum;
+    out->channel_prep_cycles=s_semantic.phase_only_op_sum;
+    out->operator_cycles=s_semantic.fb_zero_ch_sum;
+    out->routing_pan_cycles=s_semantic.noise_samples;
+    out->post_cycles=s_semantic.zero_mod_samples;
+}
+
+extern "C" void vgmm5_ym2151_semantic_algo_get(const VgmM5YM2151 *ym,uint32_t out[8])
+{
+    (void)ym;
+    if(!out)return;
+    for(int i=0;i<8;i++)out[i]=s_semantic.algo_ch_sum[i];
 }

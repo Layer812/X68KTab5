@@ -198,6 +198,19 @@ static uint32_t get_be32(const uint8_t *p)
            (uint32_t)p[3];
 }
 
+/*
+ * BAT177NW2 / R57E32: SDMMC DMA-safe SCSI image read bridge.
+ *
+ * The ESP32-P4 guest task stack can legitimately land in RTC/internal memory
+ * when ordinary DRAM is fragmented.  FatFS/SDMMC may pass a caller buffer
+ * directly to esp_cache_msync()/DMA, and RTC stack addresses are not valid
+ * cache-sync/DMA targets.  Never expose an arbitrary caller pointer to the
+ * SDMMC path.  All SCSI file reads are staged through s_io_buf, which is the
+ * same ordinary-DRAM buffer already proven by SCSI_ProbeFirstBlock().
+ *
+ * This is deliberately a transport rule, not a guest/host synchronization
+ * rule: CPU1 never waits for CPU0 and no Screen/renderer ownership changes.
+ */
 static int scsi_image_read_at(int target, uint32_t offset, uint8_t *dst, size_t length)
 {
     if (!scsi_target_ready(target) || !dst || length == 0)
@@ -211,10 +224,42 @@ static int scsi_image_read_at(int target, uint32_t offset, uint8_t *dst, size_t 
     if (!fp)
         return 0;
 
-    const int ok = file_seek(fp, (long)offset, FSEEK_SET) == (size_t)offset &&
-                   file_lread(fp, dst, length) == length;
+    if (file_seek(fp, (long)offset, FSEEK_SET) != (size_t)offset)
+    {
+        file_close(fp);
+        return 0;
+    }
+
+    size_t done = 0;
+    while (done < length)
+    {
+        size_t chunk = length - done;
+        if (chunk > sizeof(s_io_buf))
+            chunk = sizeof(s_io_buf);
+
+        /* Direct read is safe only for our known ordinary-DRAM staging area. */
+        if (dst == s_io_buf && done == 0 && chunk == length)
+        {
+            if (file_lread(fp, s_io_buf, chunk) != chunk)
+            {
+                file_close(fp);
+                return 0;
+            }
+        }
+        else
+        {
+            if (file_lread(fp, s_io_buf, chunk) != chunk)
+            {
+                file_close(fp);
+                return 0;
+            }
+            memcpy(dst + done, s_io_buf, chunk);
+        }
+        done += chunk;
+    }
+
     file_close(fp);
-    return ok;
+    return 1;
 }
 
 static int scsi_image_copy_to_guest(int target, uint32_t offset,
@@ -577,6 +622,14 @@ int SCSI_MountImage(int target, const char *path, int readonly)
 
     if (size == (size_t)-1 || size < SCSI_BLOCK_SIZE)
         return 0;
+
+    static uint8_t s_dma_bounce_proof_logged;
+    if (!s_dma_bounce_proof_logged)
+    {
+        s_dma_bounce_proof_logged = 1u;
+        printf("PX68K_SCSI_R57E32: DMA-safe file-read bounce ACTIVE bytes=%u; caller stack/RTC pointers never reach SDMMC DMA\n",
+               (unsigned)sizeof(s_io_buf));
+    }
 
     SCSIImage *img = &s_images[target];
     memset(img, 0, sizeof(*img));

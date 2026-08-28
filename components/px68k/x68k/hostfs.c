@@ -410,7 +410,10 @@ static int hfs_resolve_case_path(const char *input, int allow_missing_leaf,
         {
             if (hfs_ascii_name_eq(de->d_name, component))
             {
-                snprintf(actual, sizeof(actual), "%s", de->d_name);
+                const size_t actual_len = strnlen(de->d_name, sizeof(actual));
+                if (actual_len >= sizeof(actual))
+                    continue;
+                memcpy(actual, de->d_name, actual_len + 1);
                 break;
             }
         }

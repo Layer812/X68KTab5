@@ -68,6 +68,7 @@
  * ABI here instead of including esp_timer.h.
  */
 extern int64_t esp_timer_get_time(void);
+extern void esp_rom_delay_us(uint32_t us);
 
 /* Build 5.43: scheduler/device profiler uses the local CPU cycle counter.
  * P4 runs at the configured 360 MHz here, and this is orders of magnitude
@@ -137,7 +138,7 @@ static uint32_t old_ram_size     = 0;
 static int old_clkdiv         = 0;
 
 static int oldrw=0,oldrh      = 0;
-static char RPATH[512];
+static char RPATH[MAX_PATH];
 static char RETRO_DIR[512];
 static const char *retro_save_directory;
 static const char *retro_system_directory;
@@ -637,6 +638,59 @@ static size_t handle_extension(char *path, char *ext)
    return 0;
 }
 
+
+/*
+ * Native IDF 5.5 / GCC14 safety helpers.
+ * Keep all libretro-side command/path buffers explicitly bounded.
+ */
+static bool px68k_copy_cstr(char *dst, size_t dst_size, const char *src)
+{
+   size_t len;
+
+   if (!dst || !src || dst_size == 0)
+      return false;
+
+   len = strlen(src);
+   if (len >= dst_size)
+      return false;
+
+   memcpy(dst, src, len + 1);
+   return true;
+}
+
+static bool px68k_join_path(char *dst, size_t dst_size,
+      const char *base, char slash, const char *leaf)
+{
+   size_t base_len;
+   size_t leaf_len;
+
+   if (!dst || !base || !leaf || dst_size == 0)
+      return false;
+
+   base_len = strlen(base);
+   leaf_len = strlen(leaf);
+
+   if (base_len + 1u + leaf_len + 1u > dst_size)
+      return false;
+
+   memcpy(dst, base, base_len);
+   dst[base_len] = slash;
+   memcpy(dst + base_len + 1u, leaf, leaf_len + 1u);
+   return true;
+}
+
+static bool px68k_push_arg(const char *arg)
+{
+   if (!arg || ARGUC >= (sizeof(ARGUV) / sizeof(ARGUV[0])))
+      return false;
+
+   if (!px68k_copy_cstr(ARGUV[ARGUC], sizeof(ARGUV[ARGUC]), arg))
+      return false;
+
+   ARGUC++;
+   return true;
+}
+
 static void parse_cmdline(const char *argv)
 {
    char *p, *p2, *start_of_word;
@@ -735,9 +789,18 @@ static bool read_m3u(const char *file)
          size_t len = 0;
 
          if (is_path_absolute(line))
-            strncpy(name, line, sizeof(name));
-         else
-            snprintf(name, sizeof(name), "%s%c%s", base_dir, SLASH, line);
+         {
+            if (!px68k_copy_cstr(name, sizeof(name), line))
+            {
+               fclose(f);
+               return false;
+            }
+         }
+         else if (!px68k_join_path(name, sizeof(name), base_dir, SLASH, line))
+         {
+            fclose(f);
+            return false;
+         }
 
          custom_label = strchr(name, '|');
          if (custom_label)
@@ -806,10 +869,16 @@ static int retro_load_game_internal(const char *argv)
          {
             if (!is_path_absolute(ARGUV[i]))
             {
-               char tmp[2048] = { 0 };
-               strcpy(tmp, ARGUV[i]);
-               ARGUV[i][0] = '\0';
-               sprintf(ARGUV[i], "%s%c%s", base_dir, SLASH, tmp);
+               char tmp[sizeof(ARGUV[i])];
+
+               if (!px68k_copy_cstr(tmp, sizeof(tmp), ARGUV[i]) ||
+                   !px68k_join_path(ARGUV[i], sizeof(ARGUV[i]), base_dir, SLASH, tmp))
+               {
+                  if (log_cb)
+                     log_cb(RETRO_LOG_ERROR,
+                           "[libretro]: command path is too long: %s\n", tmp);
+                  return 0;
+               }
             }
          }
       }
@@ -822,16 +891,26 @@ static int retro_load_game_internal(const char *argv)
             return 0;
          }
 
-         if(disk.total_images > 1)
+         /*
+          * Do not rebuild a textual command line in RPATH here.
+          * RPATH is the original content path and may be much smaller than
+          * two MAX_PATH disk image paths.  Populate ARGUV directly instead.
+          */
+         ARGUC = 0;
+
+         if (!px68k_push_arg("px68k") ||
+             !px68k_push_arg(disk.path[0]) ||
+             (disk.total_images > 1 && !px68k_push_arg(disk.path[1])))
          {
-            sprintf((char*)argv, "%s \"%s\" \"%s\"", "px68k", disk.path[0], disk.path[1]);
-            disk.inserted[1] = true;
+            if (log_cb)
+               log_cb(RETRO_LOG_ERROR,
+                     "%s\n", "[libretro]: m3u path is too long for command arguments");
+            return 0;
          }
-         else
-            sprintf((char*)argv, "%s \"%s\"", "px68k", disk.path[0]);
 
          disk.inserted[0] = true;
-         parse_cmdline(argv);
+         if (disk.total_images > 1)
+            disk.inserted[1] = true;
       }
    }
 
@@ -2127,7 +2206,14 @@ bool retro_load_game(const struct retro_game_info *info)
    {
       const char *full_path = info->path;
       no_content            = 0;
-      strcpy(RPATH, full_path);
+
+      if (!px68k_copy_cstr(RPATH, sizeof(RPATH), full_path))
+      {
+         if (log_cb)
+            log_cb(RETRO_LOG_ERROR, "%s\n", "[libretro]: content path is too long");
+         return false;
+      }
+
       extract_directory(base_dir, info->path, sizeof(base_dir));
 
       if (!retro_load_game_internal(RPATH))
@@ -2738,7 +2824,7 @@ static void WinX68k_Exec(void)
             CRTC_FastClr = 1;
          else
             CRTC_FastClr = 2;
-         TVRAM_SetAllDirty();
+         TVRAM_SetAllDirtyReason(TAB5_DIRTY_ALL_FASTCLR);
          GVRAM_FastClear();
       }
    }
@@ -2988,6 +3074,84 @@ uint32_t WinX68k_GetVideoPitchPixels(void)
     return 800;
 }
 
+/* R46: expose the producer-side dirty debt.  R39 deliberately advances the
+ * LCD generation only after a real ScrBuf write, so TextDirtyLine is the
+ * authoritative indication that a final source row is still owed. */
+uint32_t WinX68k_GetDirtyLineCount(void)
+{
+    uint32_t h = TextDotY;
+    if (h > 600u) h = 600u;
+    uint32_t n = 0u;
+    for (uint32_t y = 0u; y < h; ++y)
+        n += TextDirtyLine[y] ? 1u : 0u;
+    return n;
+}
+
+uint32_t WinX68k_GetRasterHeight(void)
+{
+    uint32_t h = TextDotY;
+    return h > 600u ? 600u : h;
+}
+
+void WinX68k_MarkAllVideoDirty(void)
+{
+    /* Same producer-visible invalidation used by the native CRTC/video-mode
+     * paths.  R46 uses it only after host-visible geometry changes so every
+     * ScrBuf row in the new layout is rebuilt before the first full present. */
+    TVRAM_SetAllDirty();
+}
+
+/* R47: source-completion epoch. Dirty debt is not a valid completion test on
+ * animated screens because a line can become dirty again immediately after a
+ * correct render.  Track instead whether each visible row has completed at
+ * least one real final composition since the barrier was armed. */
+static volatile uint8_t s_source_barrier_pending_line[600];
+static volatile uint32_t s_source_barrier_pending_count = 0u;
+static volatile uint32_t s_source_barrier_height = 0u;
+/* R48: every source barrier owns a monotonic epoch.  A late CPU0 65K job
+ * submitted before a geometry/scene transition must never satisfy the new
+ * barrier merely because it has the same Y coordinate. */
+static volatile uint32_t s_source_barrier_epoch = 1u;
+
+void WinX68k_SourceBarrierArm(void)
+{
+    uint32_t e = __atomic_add_fetch(&s_source_barrier_epoch, 1u, __ATOMIC_ACQ_REL);
+    if (!e) {
+        __atomic_store_n(&s_source_barrier_epoch, 1u, __ATOMIC_RELEASE);
+    }
+    uint32_t h = TextDotY;
+    if (h > 600u) h = 600u;
+    for (uint32_t y = 0u; y < 600u; ++y)
+        __atomic_store_n(&s_source_barrier_pending_line[y], y < h ? 1u : 0u, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_source_barrier_height, h, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_source_barrier_pending_count, h, __ATOMIC_RELEASE);
+}
+
+uint32_t WinX68k_SourceBarrierEpoch(void)
+{
+    return __atomic_load_n(&s_source_barrier_epoch, __ATOMIC_ACQUIRE);
+}
+
+void WinX68k_SourceBarrierLineDoneEpoch(uint32_t y, uint32_t epoch)
+{
+    if (epoch != __atomic_load_n(&s_source_barrier_epoch, __ATOMIC_ACQUIRE))
+        return;
+    const uint32_t h = __atomic_load_n(&s_source_barrier_height, __ATOMIC_ACQUIRE);
+    if (y >= h || y >= 600u) return;
+    if (__atomic_exchange_n(&s_source_barrier_pending_line[y], 0u, __ATOMIC_ACQ_REL))
+        (void)__atomic_sub_fetch(&s_source_barrier_pending_count, 1u, __ATOMIC_ACQ_REL);
+}
+
+void WinX68k_SourceBarrierLineDone(uint32_t y)
+{
+    WinX68k_SourceBarrierLineDoneEpoch(y, WinX68k_SourceBarrierEpoch());
+}
+
+uint32_t WinX68k_SourceBarrierPending(void)
+{
+    return __atomic_load_n(&s_source_barrier_pending_count, __ATOMIC_ACQUIRE);
+}
+
 /*
  * ESP32-P4 standalone startup path.
  *
@@ -3175,6 +3339,27 @@ uint32_t WinX68k_AudioProducedFrames(void)
     return DSound_HostProducedFrames();
 }
 
+void WinX68k_VideoPerfGetR57E40(uint32_t *gbt_us, uint32_t *commit_us,
+                                 uint32_t *gbt_calls, uint32_t *commit_calls,
+                                 uint32_t *arm_count, uint32_t *active)
+{
+    WinDraw_PerfGetR57E40(gbt_us, commit_us, gbt_calls, commit_calls, arm_count, active);
+}
+
+void WinX68k_VideoPerfGetR57E44(uint32_t *fused_lines, uint32_t *fallback_lines,
+                                 uint32_t *cache_rebuilds, uint32_t *cache_failures)
+{
+    WinDraw_PerfGetR57E44(fused_lines, fallback_lines, cache_rebuilds, cache_failures);
+}
+
+void WinX68k_VideoPerfGetR57E48(uint32_t *direct_lines, uint32_t *fallback_lines,
+                                 uint32_t *text_reject, uint32_t *bg_reject,
+                                 uint32_t *final_reject)
+{
+    WinDraw_PerfGetR57E48(direct_lines, fallback_lines, text_reject,
+                          bg_reject, final_reject);
+}
+
 void WinX68k_AudioPerfGetLast(uint32_t *adpcm_us, uint32_t *opm_us, uint32_t *mix_calls, uint32_t *mix_frames)
 {
     DSound_PerfGetLast(adpcm_us, opm_us, mix_calls, mix_frames);
@@ -3194,6 +3379,284 @@ void WinX68k_SetHostRenderEnabled(int enabled)
 {
     s_tab5_host_render_enabled = enabled ? 1 : 0;
 }
+
+/* R57E64: expose the configured X68000 CPU clock to the Tab5 wall-clock
+ * governor.  Keep the fallback identical to the execution path below. */
+static inline uint32_t tab5_guest_clock_hz_inline(void)
+{
+    int mhz = Config.clockmhz;
+    if (mhz <= 0) mhz = 10;
+    return (uint32_t)mhz * 1000000u;
+}
+
+uint32_t WinX68k_GetGuestClockHz(void)
+{
+    return tab5_guest_clock_hz_inline();
+}
+
+#ifdef ESP_PLATFORM
+/* R57E67: phase-reservoir guest-time governor with bounded catch-up.
+ *
+ * R57E65 checked pacing at every 200-cycle scheduler slice.  The timing was
+ * mathematically conservative, but the hot-path bookkeeping/trim and very
+ * frequent waits consumed enough CPU1 time to pull real MDX throughput down
+ * to roughly 9 MHz.  R57E67 leaves the existing 200-cycle
+ * scheduler slices intact for device timing, but performs wall-clock pacing
+ * only after a coarse guest-cycle quantum (normally ~2 ms at 10 MHz).
+ *
+ * The phase accumulator still has an exact long-term Config.clockmhz slope.
+ * Positive phase is a bounded future reservoir; modest negative phase is preserved
+ * as catch-up credit so a short host stall can be recovered by CPU1's spare
+ * execution headroom.  Only a genuinely long lag is rebased, so ordinary
+ * jitter is not converted into permanent slowdown.
+ *
+ * Slack prefetch is charged *inside* the wait budget: after the safe RAM/IPL
+ * prefetch, the host cycle counter is sampled again and only the residual
+ * lead is delayed.  Prefetch therefore replaces dead wait time instead of
+ * extending it. */
+typedef struct {
+    uint32_t enabled;
+    uint32_t target_hz;
+    uint32_t host_hz;
+    uint32_t lead_max_us;
+    uint32_t lead_keep_us;
+    uint32_t lag_resync_us;
+    uint32_t check_guest_cycles;
+    uint32_t pending_guest_cycles;
+    uint32_t last_ccount;
+    uint64_t host_per_guest_q16;
+    int64_t lead_host_q16;
+    int64_t lead_max_q16;
+    int64_t lead_keep_q16;
+    int64_t lag_resync_q16;
+#if PX68K_TAB5_R57E63_AUDIO_AUDIT
+    uint64_t max_lead_q16;
+    uint64_t max_lag_q16;
+    uint64_t guest_cycles;
+    uint32_t check_events;
+    uint32_t catchup_checks;
+    uint32_t wait_events;
+    uint64_t wait_us;
+    uint32_t max_wait_us;
+    uint32_t resyncs;
+    uint32_t prefetch_events;
+#endif
+} tab5_guest_pace_t;
+
+static tab5_guest_pace_t s_tab5_guest_pace;
+
+static inline uint32_t tab5_guest_pace_host_hz(void)
+{
+    const uint32_t mhz = (uint32_t)CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ;
+    return mhz ? mhz * 1000000u : 360000000u;
+}
+
+static inline int64_t tab5_guest_pace_us_q16(uint32_t us, uint32_t host_hz)
+{
+    const uint64_t host_cycles = ((uint64_t)us * host_hz + 999999ULL) / 1000000ULL;
+    return (int64_t)(host_cycles << 16);
+}
+
+static inline uint32_t tab5_guest_pace_q16_to_us(uint64_t host_q16, uint32_t host_hz)
+{
+    if (!host_hz) return 0u;
+    const uint64_t host_cycles = (host_q16 + 0xffffULL) >> 16;
+    return (uint32_t)((host_cycles * 1000000ULL + host_hz - 1ULL) / host_hz);
+}
+
+static inline uint32_t tab5_guest_pace_quantum(uint32_t guest_hz)
+{
+    /* One wall-clock decision per ~2 ms of guest time.  Keep bounds sane for
+     * legal non-10-MHz modes while avoiding pacing math in the 200-cycle hot
+     * scheduler loop. */
+    uint32_t q = guest_hz / 500u;
+    if (q < 4000u) q = 4000u;
+    if (q > 48000u) q = 48000u;
+    return q;
+}
+
+static inline void tab5_guest_pace_set_clock(tab5_guest_pace_t *p,
+                                              uint32_t guest_hz,
+                                              uint32_t ccount)
+{
+    p->target_hz = guest_hz;
+    p->host_hz = tab5_guest_pace_host_hz();
+    p->host_per_guest_q16 = guest_hz
+        ? (((uint64_t)p->host_hz << 16) + guest_hz / 2u) / guest_hz : 0u;
+    p->lead_max_q16 = tab5_guest_pace_us_q16(p->lead_max_us, p->host_hz);
+    p->lead_keep_q16 = tab5_guest_pace_us_q16(p->lead_keep_us, p->host_hz);
+    p->lag_resync_q16 = tab5_guest_pace_us_q16(p->lag_resync_us, p->host_hz);
+    p->check_guest_cycles = tab5_guest_pace_quantum(guest_hz);
+    p->pending_guest_cycles = 0u;
+    p->lead_host_q16 = 0;
+    p->last_ccount = ccount;
+#if PX68K_TAB5_R57E63_AUDIO_AUDIT
+    ++p->resyncs;
+#endif
+}
+
+void WinX68k_GuestPaceConfigure(uint32_t lead_max_us,
+                                uint32_t lead_keep_us,
+                                uint32_t lag_resync_us)
+{
+    if (lead_max_us < 100u) lead_max_us = 100u;
+    if (lead_max_us > 20000u) lead_max_us = 20000u;
+    if (lead_keep_us >= lead_max_us) lead_keep_us = lead_max_us / 3u;
+    if (lag_resync_us < lead_max_us * 2u) lag_resync_us = lead_max_us * 2u;
+
+    memset(&s_tab5_guest_pace, 0, sizeof(s_tab5_guest_pace));
+    s_tab5_guest_pace.enabled = 1u;
+    s_tab5_guest_pace.lead_max_us = lead_max_us;
+    s_tab5_guest_pace.lead_keep_us = lead_keep_us;
+    s_tab5_guest_pace.lag_resync_us = lag_resync_us;
+    tab5_guest_pace_set_clock(&s_tab5_guest_pace, tab5_guest_clock_hz_inline(),
+                              (uint32_t)esp_cpu_get_cycle_count());
+}
+
+static inline void tab5_guest_pace_wall_update(tab5_guest_pace_t *p,
+                                                uint32_t ccount)
+{
+    const uint32_t delta = ccount - p->last_ccount; /* wrap-safe */
+    p->last_ccount = ccount;
+    p->lead_host_q16 -= ((int64_t)(uint64_t)delta << 16);
+}
+
+static void tab5_guest_pace_after_slice(int executed)
+{
+    tab5_guest_pace_t * const p = &s_tab5_guest_pace;
+    if (executed <= 0 || !p->enabled)
+        return;
+
+#if PX68K_TAB5_R57E63_AUDIO_AUDIT
+    p->guest_cycles += (uint32_t)executed;
+#endif
+    p->pending_guest_cycles += (uint32_t)executed;
+    if (p->pending_guest_cycles < p->check_guest_cycles)
+        return;
+
+    const uint32_t guest_hz = tab5_guest_clock_hz_inline();
+    uint32_t cc = (uint32_t)esp_cpu_get_cycle_count();
+    if (guest_hz < 1000000u)
+        return;
+    if (guest_hz != p->target_hz || p->host_per_guest_q16 == 0u) {
+        tab5_guest_pace_set_clock(p, guest_hz, cc);
+        return;
+    }
+
+    tab5_guest_pace_wall_update(p, cc);
+    const uint32_t pending = p->pending_guest_cycles;
+    p->pending_guest_cycles = 0u;
+    p->lead_host_q16 += (int64_t)((uint64_t)pending * p->host_per_guest_q16);
+#if PX68K_TAB5_R57E63_AUDIO_AUDIT
+    ++p->check_events;
+#endif
+
+    /* Preserve ordinary lag as catch-up credit.  CPU1 may temporarily run at
+     * its natural >10-MHz capacity until the debt is repaid.  R57E67 keeps a
+     * bounded debt reservoir (normally 20 ms); larger stalls are clamped to
+     * that debt rather than rebased to zero. */
+    if (p->lead_host_q16 < 0) {
+#if PX68K_TAB5_R57E63_AUDIO_AUDIT
+        const uint64_t lag_q16_now = (uint64_t)(-p->lead_host_q16);
+        if (lag_q16_now > p->max_lag_q16) p->max_lag_q16 = lag_q16_now;
+#endif
+        if (p->lead_host_q16 < -p->lag_resync_q16) {
+            /* R57E67: do not erase all catch-up credit after a host stall.
+             * Clamp it to a bounded debt reservoir instead.  This prevents
+             * the old wait-now / discard-lag-later bias that pulled sustained
+             * MDX throughput below the configured 10 MHz. */
+            p->lead_host_q16 = -p->lag_resync_q16;
+#if PX68K_TAB5_R57E63_AUDIO_AUDIT
+            ++p->resyncs;
+            ++p->catchup_checks;
+#endif
+        } else {
+#if PX68K_TAB5_R57E63_AUDIO_AUDIT
+            ++p->catchup_checks;
+#endif
+        }
+        return;
+    }
+
+#if PX68K_TAB5_R57E63_AUDIO_AUDIT
+    if ((uint64_t)p->lead_host_q16 > p->max_lead_q16)
+        p->max_lead_q16 = (uint64_t)p->lead_host_q16;
+#endif
+
+    if (p->lead_host_q16 < p->lead_max_q16)
+        return;
+
+    /* The current-PC prefetch is useful work done during timing slack.  Charge
+     * its latency against that slack, then delay only the residual amount. */
+    uint32_t wait_us = tab5_guest_pace_q16_to_us(
+        (uint64_t)(p->lead_host_q16 - p->lead_keep_q16), p->host_hz);
+    if (wait_us >= 200u && m68k_tab5_slack_prefetch_current()) {
+#if PX68K_TAB5_R57E63_AUDIO_AUDIT
+        ++p->prefetch_events;
+#endif
+        cc = (uint32_t)esp_cpu_get_cycle_count();
+        tab5_guest_pace_wall_update(p, cc);
+        if (p->lead_host_q16 <= p->lead_keep_q16)
+            return;
+        wait_us = tab5_guest_pace_q16_to_us(
+            (uint64_t)(p->lead_host_q16 - p->lead_keep_q16), p->host_hz);
+    }
+
+    if (wait_us == 0u)
+        return;
+#if PX68K_TAB5_R57E63_AUDIO_AUDIT
+    ++p->wait_events;
+    p->wait_us += wait_us;
+    if (wait_us > p->max_wait_us) p->max_wait_us = wait_us;
+#endif
+    esp_rom_delay_us(wait_us);
+    cc = (uint32_t)esp_cpu_get_cycle_count();
+    tab5_guest_pace_wall_update(p, cc);
+}
+
+void WinX68k_GuestPaceGetStats(uint64_t *guest_cycles,
+                               uint32_t *target_hz,
+                               uint32_t *lead_max_us,
+                               uint32_t *lead_keep_us,
+                               uint32_t *wait_events,
+                               uint64_t *wait_us,
+                               uint32_t *max_wait_us,
+                               uint32_t *resyncs,
+                               uint32_t *max_lag_us,
+                               uint32_t *max_lead_us,
+                               uint32_t *check_events,
+                               uint32_t *catchup_checks,
+                               uint32_t *prefetch_events)
+{
+    const tab5_guest_pace_t * const p = &s_tab5_guest_pace;
+    if (target_hz) *target_hz = p->target_hz;
+    if (lead_max_us) *lead_max_us = p->lead_max_us;
+    if (lead_keep_us) *lead_keep_us = p->lead_keep_us;
+#if PX68K_TAB5_R57E63_AUDIO_AUDIT
+    if (guest_cycles) *guest_cycles = p->guest_cycles;
+    if (wait_events) *wait_events = p->wait_events;
+    if (wait_us) *wait_us = p->wait_us;
+    if (max_wait_us) *max_wait_us = p->max_wait_us;
+    if (resyncs) *resyncs = p->resyncs;
+    if (max_lag_us) *max_lag_us = tab5_guest_pace_q16_to_us(p->max_lag_q16, p->host_hz);
+    if (max_lead_us) *max_lead_us = tab5_guest_pace_q16_to_us(p->max_lead_q16, p->host_hz);
+    if (check_events) *check_events = p->check_events;
+    if (catchup_checks) *catchup_checks = p->catchup_checks;
+    if (prefetch_events) *prefetch_events = p->prefetch_events;
+#else
+    if (guest_cycles) *guest_cycles = 0;
+    if (wait_events) *wait_events = 0;
+    if (wait_us) *wait_us = 0;
+    if (max_wait_us) *max_wait_us = 0;
+    if (resyncs) *resyncs = 0;
+    if (max_lag_us) *max_lag_us = 0;
+    if (max_lead_us) *max_lead_us = 0;
+    if (check_events) *check_events = 0;
+    if (catchup_checks) *catchup_checks = 0;
+    if (prefetch_events) *prefetch_events = 0;
+#endif
+}
+#endif
 
 int WinX68k_ExecVideoProbeFrame(void)
 {
@@ -3337,7 +3800,6 @@ int WinX68k_ExecVideoProbeFrame(void)
             uint32_t perf_cpu_cc = 0u, perf_mfp_cc = 0u, perf_rtc_cc = 0u, perf_dma_cc = 0u;
             int request = (remaining > CLOCK_SLICE) ? CLOCK_SLICE : remaining;
             int executed;
-
             if (perf_sample)
             {
                 uint32_t t0 = tab5_perf_ccount();
@@ -3411,6 +3873,10 @@ int WinX68k_ExecVideoProbeFrame(void)
                 RTC_Timer(usedclk);
                 DMA_ExecActive012();
             }
+#ifdef ESP_PLATFORM
+            /* Pace only after CPU + same-slice device time have both advanced. */
+            tab5_guest_pace_after_slice(executed);
+#endif
         }
 
         if (perf_sample)
@@ -3536,7 +4002,7 @@ int WinX68k_ExecVideoProbeFrame(void)
         else
         {
             CRTC_FastClr = (CRTC_Regs[0x29] & 0x10) ? 1 : 2;
-            TVRAM_SetAllDirty();
+            TVRAM_SetAllDirtyReason(TAB5_DIRTY_ALL_FASTCLR);
             GVRAM_FastClear();
         }
     }

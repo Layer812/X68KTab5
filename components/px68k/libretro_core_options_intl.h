@@ -522,7 +522,7 @@ struct retro_core_option_v2_definition option_defs_fr[] = {
       "disabled"
    },
 
-   { NULL, NULL, NULL, NULL, NULL, NULL, { 0, 0 }, NULL },
+   { 0 },
 };
 
 struct retro_core_options_v2 options_fr = {

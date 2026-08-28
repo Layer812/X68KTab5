@@ -11,6 +11,11 @@ uint8_t FASTCALL ADPCM_Read(uint32_t adr);
 uint32_t ADPCM_DebugControlWriteCount(void);
 uint32_t ADPCM_DebugDataWriteCount(void);
 int ADPCM_DebugPlaying(void);
+/* ESP32-P4 R23 decode-staging SRAM diagnostics. */
+uint32_t ADPCM_Tab5BufferCapacity(void);
+uint32_t ADPCM_Tab5BufferHighWater(void);
+uint32_t ADPCM_Tab5BufferOverflows(void);
+int ADPCM_Tab5SpmStateOk(void);
 
 void ADPCM_SetVolume(uint8_t vol);
 void ADPCM_SetPan(int n);

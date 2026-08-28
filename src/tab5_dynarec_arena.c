@@ -20,6 +20,12 @@
 #include "esp_memory_utils.h"
 #include "esp_cache.h"
 
+#ifndef PX68K_TAB5_DYNAREC
+#define PX68K_TAB5_DYNAREC 1
+#endif
+
+#if PX68K_TAB5_DYNAREC
+
 #define TAB5_DYNAREC_ARENA_BYTES (32u * 1024u)
 #define TAB5_DYNAREC_ARENA_WORDS (TAB5_DYNAREC_ARENA_BYTES / sizeof(uint32_t))
 #define TAB5_DYNAREC_SYNC_BYTES 64u
@@ -173,3 +179,18 @@ int tab5_dynarec_arena_probe(void)
              s_tab5_dynarec_probe_ok ? "PASS" : "FAIL", result);
     return s_tab5_dynarec_probe_ok;
 }
+
+#else  /* PX68K_TAB5_DYNAREC == 0 */
+
+/* Build 6.15h17R17: production MDX traces compiled zero native blocks while
+ * still paying hot-backedge discovery/memo overhead.  Do not retain the
+ * 32 KiB `used` IRAM reservation when the generic JIT is disabled. */
+void *tab5_dynarec_arena_base(void) { return NULL; }
+size_t tab5_dynarec_arena_bytes(void) { return 0u; }
+int tab5_dynarec_arena_is_executable(void) { return 0; }
+int tab5_dynarec_arena_probe_ok(void) { return 0; }
+int tab5_dynarec_arena_sync(void *addr, unsigned int bytes)
+{ (void)addr; (void)bytes; return 0; }
+int tab5_dynarec_arena_probe(void) { return 0; }
+
+#endif /* PX68K_TAB5_DYNAREC */

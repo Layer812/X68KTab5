@@ -14,6 +14,7 @@
 
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "esp_vfs_fat.h"
 
 #include "driver/gpio.h"
@@ -29,10 +30,38 @@ static sdmmc_card_t *s_card = NULL;
 #define TAB5_SD_MAX_FLOPPY 64u
 #define TAB5_SD_PATH_MAX 512u
 
-static char s_xdf_catalog[TAB5_SD_MAX_XDF][TAB5_SD_PATH_MAX];
+/* R23 memory hierarchy: media path catalogs are cold data.  They are used only
+ * while scanning/selecting media, never in the 68000/audio/render hot path.
+ * Keep their 48 KiB payload out of scarce Internal SRAM. */
+static char (*s_xdf_catalog)[TAB5_SD_PATH_MAX] = NULL;
 static size_t s_xdf_count = 0;
-static char s_floppy_catalog[TAB5_SD_MAX_FLOPPY][TAB5_SD_PATH_MAX];
+static char (*s_floppy_catalog)[TAB5_SD_PATH_MAX] = NULL;
 static size_t s_floppy_count = 0;
+static void *s_catalog_psram = NULL;
+
+static int ensure_catalog_storage(void)
+{
+    if (s_xdf_catalog && s_floppy_catalog)
+        return 1;
+
+    const size_t xdf_bytes = TAB5_SD_MAX_XDF * TAB5_SD_PATH_MAX;
+    const size_t floppy_bytes = TAB5_SD_MAX_FLOPPY * TAB5_SD_PATH_MAX;
+    const size_t total = xdf_bytes + floppy_bytes;
+    s_catalog_psram = heap_caps_calloc(1, total, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_catalog_psram)
+    {
+        ESP_LOGE(TAG, "R23 cold media catalog PSRAM allocation failed (%u bytes); catalogs disabled",
+                 (unsigned)total);
+        return 0;
+    }
+
+    s_xdf_catalog = (char (*)[TAB5_SD_PATH_MAX])s_catalog_psram;
+    s_floppy_catalog = (char (*)[TAB5_SD_PATH_MAX])((uint8_t *)s_catalog_psram + xdf_bytes);
+    ESP_LOGI(TAG,
+             "PX68K_MEMR23: cold SD catalogs moved to PSRAM bytes=%u (XDF=%u boot-media=%u) ptr=%p",
+             (unsigned)total, (unsigned)xdf_bytes, (unsigned)floppy_bytes, s_catalog_psram);
+    return 1;
+}
 
 static int ascii_contains_nocase(const char *s, const char *needle)
 {
@@ -110,8 +139,10 @@ static void build_root_xdf_catalog(void)
 
     s_xdf_count = 0;
     s_floppy_count = 0;
-    memset(s_xdf_catalog, 0, sizeof(s_xdf_catalog));
-    memset(s_floppy_catalog, 0, sizeof(s_floppy_catalog));
+    if (!ensure_catalog_storage())
+        return;
+    memset(s_xdf_catalog, 0, TAB5_SD_MAX_XDF * TAB5_SD_PATH_MAX);
+    memset(s_floppy_catalog, 0, TAB5_SD_MAX_FLOPPY * TAB5_SD_PATH_MAX);
 
     dir = opendir(TAB5_SD_MOUNT);
     if (!dir)

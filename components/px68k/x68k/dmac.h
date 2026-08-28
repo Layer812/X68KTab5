@@ -45,6 +45,10 @@ void FASTCALL DMA_Write(uint32_t adr, uint8_t data);
 
 int FASTCALL DMA_Exec(int ch);
 int FASTCALL DMA_ExecActive012(void);
+/* R26: guarded exact MDX channel-3 RAM -> MSM6258 path measured by R25.
+ * Returns 1 when handled, 0 when authoritative generic DMA_Exec(3) is needed. */
+int FASTCALL DMA_Exec3ADPCMFast(void);
+void DMA_Tab5ADPCMFastStats(uint32_t *hits, uint32_t *fallbacks);
 void DMA_Init(void);
 int DMAC_StateAction(StateMem *sm, int load, int data_only);
 

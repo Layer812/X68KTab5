@@ -1,26 +1,10 @@
-# Build 6.00: production core split. app_main/host initialization stays on CPU0.
+# X68K Tab Build 6.15h16-directfb known-good HP-only ESP32-P4 configuration; DSI DirectFB is runtime-only
+# Restored from the stable 6.15g branch.  LP-core/ULP experiments are intentionally disabled.
 CONFIG_ESP_MAIN_TASK_AFFINITY_CPU0=y
-# CONFIG_ESP_MAIN_TASK_AFFINITY_CPU1 is not set
-# CONFIG_ESP_MAIN_TASK_AFFINITY_NO_AFFINITY is not set
 CONFIG_ESP_MAIN_TASK_AFFINITY=0x0
-
-# Build 6.12c: PAN filer/M5Unified host init exceeds ESP-IDF's small default main stack.
-# app_main deletes itself after worker creation, so this 12 KiB is temporary.
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=12288
-
-# Runtime task statistics were development-only and are disabled in RC builds.
-# CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS is not set
-# CONFIG_FREERTOS_USE_TRACE_FACILITY is not set
-
-# Keep TWDT enabled with the proven 15-second window.
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=15
-
-# RC USB stability: some HID devices require a longer post-reset recovery interval.
 CONFIG_USB_HOST_RESET_RECOVERY_MS=80
-
-# Build 6.11b: make a fresh source ZIP self-contained for M5Stack Tab5 PSRAM.
-# Tab5 uses 32 MiB HEX PSRAM at 200 MHz; PX68K also places large BSS tables
-# in external RAM and relies on the normal malloc()/heap_caps integration.
 CONFIG_IDF_EXPERIMENTAL_FEATURES=y
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_HEX=y
@@ -29,35 +13,43 @@ CONFIG_SPIRAM_BOOT_INIT=y
 CONFIG_SPIRAM_USE_MALLOC=y
 CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
 CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=32768
-
-# Build 6.13b2: experimental Dynarec research build. Runtime-generated RV32
-# code requires the same internal SRAM region to be writable and executable.
-# ESP-IDF 5.4.2 enables PMP/PMS instruction/data split protection by default;
-# disable both 5.x protection knobs for this research build.
-# SECURITY: this intentionally removes SRAM W^X hardening for X68K Tab.
+CONFIG_CACHE_L2_CACHE_128KB=y
+CONFIG_CACHE_L2_CACHE_SIZE=0x20000
+CONFIG_CACHE_L2_CACHE_LINE_64B=y
+CONFIG_CACHE_L2_CACHE_LINE_SIZE=64
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+# CONFIG_ESPTOOLPY_FLASHMODE_DIO is not set
+CONFIG_ESPTOOLPY_FLASHMODE="qio"
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+CONFIG_ESPTOOLPY_FLASHFREQ_VAL=80
+CONFIG_ESPTOOLPY_FLASHFREQ="80m"
 # CONFIG_ESP_SYSTEM_PMP_IDRAM_SPLIT is not set
 # CONFIG_ESP_SYSTEM_MEMPROT_FEATURE is not set
 # CONFIG_ESP_SYSTEM_MEMPROT_FEATURE_LOCK is not set
 
-# Build 6.13c14r2: pin the ESP32-P4 L2 cache to the exact layout used by the
-# known-good c13/c14 hardware runs.  On rev<3 P4 silicon, 512 KiB L2 consumes
-# the entire SRAM_HIGH window; 128 KiB L2 leaves the proven 384 KiB SRAM_HIGH
-# region available for .dram1 data and heap.
-CONFIG_CACHE_L2_CACHE_128KB=y
-# CONFIG_CACHE_L2_CACHE_256KB is not set
-# CONFIG_CACHE_L2_CACHE_512KB is not set
-CONFIG_CACHE_L2_CACHE_SIZE=0x20000
-CONFIG_CACHE_L2_CACHE_LINE_64B=y
-# CONFIG_CACHE_L2_CACHE_LINE_128B is not set
-CONFIG_CACHE_L2_CACHE_LINE_SIZE=64
 
-# Keep the generated ESP-IDF sdkconfig consistent with the Tab5 board setting.
-CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
-# CONFIG_ESPTOOLPY_FLASHSIZE_1MB is not set
-# CONFIG_ESPTOOLPY_FLASHSIZE_2MB is not set
-# CONFIG_ESPTOOLPY_FLASHSIZE_4MB is not set
-# CONFIG_ESPTOOLPY_FLASHSIZE_8MB is not set
-# CONFIG_ESPTOOLPY_FLASHSIZE_32MB is not set
-# CONFIG_ESPTOOLPY_FLASHSIZE_64MB is not set
-# CONFIG_ESPTOOLPY_FLASHSIZE_128MB is not set
-CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+# Native IDF probe: match PlatformIO custom partition table.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
+
+# Native IDF 5.5.4 / Tab5 original ESP32-P4 rev1.x compatibility.
+# The physical test unit is rev1.3; IDF 5.5 defaults to rev3.x unless this is selected.
+CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
+CONFIG_ESP32P4_REV_MIN_1=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_360=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=360
+
+# Match the PlatformIO release build. IDF's default is -Og; performance mode is -O2.
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# Native IDF 5.5 migration bridge: keep warnings visible, but do not fail solely on default warnings.
+CONFIG_COMPILER_DISABLE_DEFAULT_ERRORS=y
+CONFIG_ULP_COPROC_ENABLED=y
+CONFIG_ULP_COPROC_TYPE_LP_CORE=y
+CONFIG_ULP_COPROC_RESERVE_MEM=12288
+CONFIG_RTC_FAST_CLK_SRC_XTAL=y
+# CONFIG_ULP_COPROC_RUN_FROM_HP_MEM is not set
+# CONFIG_RTC_FAST_CLK_SRC_RC_FAST is not set

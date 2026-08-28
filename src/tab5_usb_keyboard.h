@@ -22,6 +22,7 @@ int tab5_usb_joypad_connected(void);
 int tab5_usb_joypad_recognized(void);
 uint32_t tab5_usb_joypad_report_count(void);
 uint32_t tab5_usb_joypad_event_count(void);
+void tab5_usb_keyboard_stack_highwater(uint32_t *lib_bytes, uint32_t *ctl_bytes);
 
 /*
  * Host-only hotkeys. These are consumed in the USB HID layer and are never
