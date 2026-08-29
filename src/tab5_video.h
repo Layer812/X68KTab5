@@ -29,6 +29,32 @@ typedef struct
     uint32_t pace_skipped_slots;
     uint32_t pace_last_interval_us;
     uint32_t cpu0_push_total_us; /* Build 6.15g cumulative LCD push work */
+    uint32_t managed_rows_scanned;
+    uint32_t managed_rows_skipped;
+    uint32_t managed_map_frames;
+    uint32_t managed_slot_sparse_frames;
+    uint32_t managed_slot_full_frames;
+    uint32_t managed_slot_rows_copied;
+    uint32_t managed_slot_rows_skipped;
+    uint32_t managed_slot_forcefull_rejects;
+    uint64_t managed_slot_bytes_copied;
+
+    /* R57E83: cumulative managed presenter phase attribution. */
+    uint64_t managed_slot_copy_us;
+    uint64_t managed_display_lock_us;
+    uint64_t managed_push_frame_us;
+    uint64_t managed_ppa_us;
+    uint64_t managed_refresh_wait_us;
+
+    /* R57E84: managed direct-native steady-state path. */
+    uint32_t managed_native_frames;
+    uint32_t managed_native_fallbacks;
+    uint32_t managed_native_tile_runs;
+    uint32_t managed_native_tiles;
+    uint64_t managed_native_wall_us;
+    uint64_t managed_native_sync_us;
+    uint64_t managed_native_source_pixels;
+    uint64_t managed_native_preserved_pixels;
 } tab5_video_async_stats_t;
 
 typedef struct
@@ -136,6 +162,7 @@ int tab5_video_present_px68k_managed(
     uint32_t width,
     uint32_t height,
     uint32_t pitch_pixels,
+    const uint32_t *dirty_tiles32,
     uint64_t screen_token
 );
 /* R48: invalidate queued/pacing LIVE requests from the previous source/geometry epoch. */

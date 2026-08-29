@@ -1,4 +1,7 @@
 #include "tab5_screen_manager.h"
+#include "tab5_screen_r57e89.h"
+
+extern int tab5_video_turbo_enabled(void);
 #include "tab5_video_flow.h"
 
 #ifndef PX68K_TAB5_RELEASE_DIAGNOSTICS
@@ -203,6 +206,7 @@ static uint32_t s_pending_height;
 static uint32_t s_pending_pitch;
 static uint32_t s_requested_actions;
 static uint64_t s_candidate_commits;
+static uint32_t *s_candidate_dirty_tiles; /* R57E74 PSRAM, exact 32px dirty since last submit */
 static uint8_t s_retry_line[SCREEN_MAX_HEIGHT];
 static uint64_t s_retry_debt_seq[SCREEN_MAX_HEIGHT];
 static uint32_t s_retry_debt_count;
@@ -318,6 +322,12 @@ static uint64_t s_tasklog_record_collisions;
 static uint64_t s_tasklog_present_unknown;
 static uint64_t s_tasklog_present_rejected;
 static uint64_t s_tasklog_present_out_of_order;
+#if PX68K_TAB5_RELEASE_DIAGNOSTICS
+/* R57E89 counter-only screen liveness attribution; measurement builds only. */
+static uint64_t s_r89_frame_requests,s_r89_frame_consumed,s_r89_present_opportunities,s_r89_present_consumed;
+static uint64_t s_r89_seal_armed,s_r89_seal_arm_rejected,s_r89_seal_tries,s_r89_seal_block_pending,s_r89_seal_block_retry,s_r89_seal_block_reset,s_r89_seal_nochange,s_r89_seal_epoch_drop;
+static uint64_t s_r89_presenter_calls,s_r89_presenter_rejects,s_r89_display_ok,s_r89_display_fail;
+#endif
 
 static inline uint32_t next_generation(uint32_t g)
 {
@@ -865,6 +875,7 @@ static void commit_result(uint8_t idx, uint64_t ticket)
             memcpy(dst + x0, slot->pixels + x0, (size_t)count * sizeof(uint16_t));
         }
         tab5_video_fb_line_write_end_changed_tiles32(y, 1, tile_mask, expected_width);
+        if (s_candidate_dirty_tiles) s_candidate_dirty_tiles[y] |= tile_mask;
         __atomic_add_fetch(&s_line_commit_seq[y], 1u, __ATOMIC_RELEASE); /* even */
     }
 
@@ -909,6 +920,9 @@ static void commit_result(uint8_t idx, uint64_t ticket)
 
 static void handle_display_complete(uint64_t present_token, int success)
 {
+#if PX68K_TAB5_RELEASE_DIAGNOSTICS
+    if (success) ++s_r89_display_ok; else ++s_r89_display_fail;
+#endif
     uint64_t screen_id = 0u;
     uint64_t retired_id = 0u;
     bool known = false;
@@ -1007,6 +1021,8 @@ static void process_reset(void)
      * untouched until a post-reset ScreenVersion is actually displayed. */
     memset(s_work, 0, SCREEN_MAX_WIDTH * SCREEN_MAX_HEIGHT * sizeof(uint16_t));
     memset(s_line_video_epoch_tag, 0, sizeof(s_line_video_epoch_tag));
+    if (s_candidate_dirty_tiles)
+        memset(s_candidate_dirty_tiles, 0, SCREEN_MAX_HEIGHT * sizeof(uint32_t));
 
     portENTER_CRITICAL(&s_mux);
     s_requested_actions |= TAB5_SCREEN_EMU_ACTION_MARK_ALL_DIRTY;
@@ -1060,6 +1076,8 @@ static void process_geometry_reset(void)
      * and resets the new construction before re-opening admission. */
     memset(s_work, 0, SCREEN_MAX_WIDTH * SCREEN_MAX_HEIGHT * sizeof(uint16_t));
     memset(s_line_video_epoch_tag, 0, sizeof(s_line_video_epoch_tag));
+    if (s_candidate_dirty_tiles)
+        memset(s_candidate_dirty_tiles, 0, SCREEN_MAX_HEIGHT * sizeof(uint32_t));
 
     portENTER_CRITICAL(&s_mux);
     s_requested_actions |= TAB5_SCREEN_EMU_ACTION_MARK_ALL_DIRTY;
@@ -1119,10 +1137,27 @@ static void try_seal_and_submit(void)
     bool seal_epoch_bad = false;
 
     portENTER_CRITICAL(&s_mux);
-    if (!s_seal_requested || s_geometry_reset_pending || s_reset_pending ||
-        s_pending_tickets != 0u || s_retry_debt_count != 0u) {
-        portEXIT_CRITICAL(&s_mux);
-        return;
+    if (!s_seal_requested) { portEXIT_CRITICAL(&s_mux); return; }
+#if PX68K_TAB5_RELEASE_DIAGNOSTICS
+    ++s_r89_seal_tries;
+#endif
+    if (s_geometry_reset_pending || s_reset_pending) {
+#if PX68K_TAB5_RELEASE_DIAGNOSTICS
+        ++s_r89_seal_block_reset;
+#endif
+        portEXIT_CRITICAL(&s_mux); return;
+    }
+    if (s_pending_tickets != 0u) {
+#if PX68K_TAB5_RELEASE_DIAGNOSTICS
+        ++s_r89_seal_block_pending;
+#endif
+        portEXIT_CRITICAL(&s_mux); return;
+    }
+    if (s_retry_debt_count != 0u) {
+#if PX68K_TAB5_RELEASE_DIAGNOSTICS
+        ++s_r89_seal_block_retry;
+#endif
+        portEXIT_CRITICAL(&s_mux); return;
     }
 
     id = s_candidate_id;
@@ -1171,6 +1206,9 @@ static void try_seal_and_submit(void)
     }
 
     if (seal_epoch_bad) {
+#if PX68K_TAB5_RELEASE_DIAGNOSTICS
+        ++s_r89_seal_epoch_drop;
+#endif
         portEXIT_CRITICAL(&s_mux);
         /* Do not submit stale/mixed pixels.  This is NOT a wait/fence on CPU1:
          * advance_candidate_without_present() rotates the logical offer epoch
@@ -1186,6 +1224,9 @@ static void try_seal_and_submit(void)
      * transition semantically without forcing a redundant LCD transaction. */
     const bool no_change = (commits == 0u && s_visible_id != 0u);
     if (no_change) {
+#if PX68K_TAB5_RELEASE_DIAGNOSTICS
+        ++s_r89_seal_nochange;
+#endif
         if (seal_transition_observed && s_epoch_transition_pending &&
             s_epoch_transition_target == seal_transition_target)
             s_epoch_transition_pending = 0u;
@@ -1200,11 +1241,18 @@ static void try_seal_and_submit(void)
 
     /* admission is closed and pending==0, so s_work is immutable for the
      * duration of this presenter snapshot copy. */
+#if PX68K_TAB5_RELEASE_DIAGNOSTICS
+    ++s_r89_presenter_calls;
+#endif
     if (!tab5_video_present_px68k_managed(s_work, w, h,
                                           SCREEN_BACKING_PITCH,
+                                          s_candidate_dirty_tiles,
                                           present_token)) {
         portENTER_CRITICAL(&s_mux);
         ++s_present_backpressure;
+#if PX68K_TAB5_RELEASE_DIAGNOSTICS
+        ++s_r89_presenter_rejects;
+#endif
         portEXIT_CRITICAL(&s_mux);
         return;
     }
@@ -1222,6 +1270,11 @@ static void try_seal_and_submit(void)
     }
     ++s_ready_count;
     ++s_present_submits;
+
+    /* The immutable pixels and exact dirty map now live in the presenter slot.
+     * Start a new delta map relative to that queued snapshot. */
+    if (s_candidate_dirty_tiles)
+        memset(s_candidate_dirty_tiles, 0, SCREEN_MAX_HEIGHT * sizeof(uint32_t));
 
     /* The immutable pixels now live in presenter-owned storage.  The same
      * manager-owned work surface becomes the base for the next construction. */
@@ -1299,6 +1352,7 @@ static int commit_flow_line(const tab5_video_flow_line_t *m, const uint16_t *pix
             memcpy(dst + x0, pixels + x0, (size_t)count * sizeof(uint16_t));
         }
         tab5_video_fb_line_write_end_changed_tiles32(y, 1, tile_mask, width);
+        if (s_candidate_dirty_tiles) s_candidate_dirty_tiles[y] |= tile_mask;
         __atomic_add_fetch(&s_line_commit_seq[y], 1u, __ATOMIC_RELEASE);
     }
 
@@ -1472,6 +1526,9 @@ static void consume_nowait_frame_request(void)
         return;
     const uint32_t delta = serial - s_nw_frame_seen;
     s_nw_frame_seen = serial;
+#if PX68K_TAB5_RELEASE_DIAGNOSTICS
+    s_r89_frame_consumed += delta ? delta : 1u;
+#endif
     const uint32_t width = __atomic_load_n(&s_nw_frame_width, __ATOMIC_RELAXED);
     const uint32_t height = __atomic_load_n(&s_nw_frame_height, __ATOMIC_RELAXED);
     const uint32_t pitch = __atomic_load_n(&s_nw_frame_pitch, __ATOMIC_RELAXED);
@@ -1535,6 +1592,9 @@ static void consume_nowait_present_request(void)
     if (serial == s_nw_present_seen)
         return;
     s_nw_present_seen = serial;
+#if PX68K_TAB5_RELEASE_DIAGNOSTICS
+    ++s_r89_present_consumed;
+#endif
     uint64_t cutoff = __atomic_load_n(&s_nw_present_cutoff, __ATOMIC_ACQUIRE);
     bool armed = false;
 
@@ -1547,7 +1607,13 @@ static void consume_nowait_present_request(void)
         s_candidate_cutoff_seq = cutoff;
         s_candidate_cutoff_guest_frame = s_guest_frame;
         armed = true;
+#if PX68K_TAB5_RELEASE_DIAGNOSTICS
+        ++s_r89_seal_armed;
+#endif
     }
+#if PX68K_TAB5_RELEASE_DIAGNOSTICS
+    if (!armed) ++s_r89_seal_arm_rejected;
+#endif
     portEXIT_CRITICAL(&s_mux);
     (void)armed;
 }
@@ -1661,11 +1727,15 @@ int tab5_screen_manager_init(void)
         64, SCREEN_MAX_WIDTH, sizeof(uint16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     s_flow_last_seq = (uint64_t *)heap_caps_calloc(
         SCREEN_MAX_HEIGHT, sizeof(uint64_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!s_flow_scratch || !s_flow_last_seq) {
+    s_candidate_dirty_tiles = (uint32_t *)heap_caps_calloc(
+        SCREEN_MAX_HEIGHT, sizeof(uint32_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_flow_scratch || !s_flow_last_seq || !s_candidate_dirty_tiles) {
         if (s_flow_scratch) heap_caps_free(s_flow_scratch);
         if (s_flow_last_seq) heap_caps_free(s_flow_last_seq);
+        if (s_candidate_dirty_tiles) heap_caps_free(s_candidate_dirty_tiles);
         s_flow_scratch = NULL;
         s_flow_last_seq = NULL;
+        s_candidate_dirty_tiles = NULL;
         tab5_ppa_free_framebuffer(s_work);
         s_work = NULL;
         return 0;
@@ -1778,6 +1848,11 @@ int tab5_screen_manager_init(void)
              "PX68K_SCREEN_R56K6: worker stdio=FORBIDDEN; task-context diagnostics are counters sampled by CPU1");
     ESP_LOGI(TAG,
              "PX68K_SCREEN_R57E31: CPU0 final-flow uses existing 64 bounded result slots; duplicate 800x600 CPU0 framebuffer=0 bytes; CPU1 cross-core flow remains latest-wins");
+    ESP_LOGI(TAG,
+             "PX68K_SCREEN_R57E74: exact candidate dirty map -> immutable presenter slot ACTIVE; PSRAM control map=2400B");
+    ESP_LOGI(TAG,
+             "PX68K_SCREEN_R57E75: mailbox rescue reserve bands REBASED 0<384 1<1024 3<2304 7<3072 15>=3072; edge-latch semantics unchanged");
+    ESP_LOGI(TAG, "PX68K_SCREEN_R57E106P: production screen measurement counters compiled OUT; Screen Manager behavior unchanged");
     ESP_LOGI(TAG,
              "PX68K_SCREEN_R57E6: LATEST-WINS TILE MAILBOX base retained tile=32px; seal requires pending=retry=0; R57E9 supersedes offer cadence with rescue epochs");
     ESP_LOGI(TAG,
@@ -2074,6 +2149,9 @@ void tab5_screen_video_frame_boundary(uint32_t width, uint32_t height,
     __atomic_store_n(&s_nw_frame_width, width, __ATOMIC_RELAXED);
     __atomic_store_n(&s_nw_frame_height, height, __ATOMIC_RELAXED);
     __atomic_store_n(&s_nw_frame_pitch, pitch, __ATOMIC_RELAXED);
+#if PX68K_TAB5_RELEASE_DIAGNOSTICS
+    __atomic_add_fetch(&s_r89_frame_requests, 1u, __ATOMIC_RELAXED);
+#endif
     __atomic_add_fetch(&s_nw_frame_serial, 1u, __ATOMIC_RELEASE);
     queue_wake();
 }
@@ -2089,15 +2167,27 @@ void tab5_screen_manager_audio_reserve_hint(uint32_t queued_frames,
         reserve += speaker_queued_frames;
 
     uint32_t limit;
-    if (submitted_frames < 4096u)
+    if (tab5_video_turbo_enabled()) {
+        /* R57E97T Turbo30: explicitly favor screen freshness.  Keep only a
+         * true near-empty safety cliff; otherwise allow the full latest-wins
+         * rescue budget.  Audio buffers are unchanged. */
+        if (submitted_frames < 4096u)
+            limit = SCREEN_MAILBOX_RESCUES_PER_REFRESH_MAX;
+        else if (reserve < 512u)
+            limit = 0u;
+        else if (reserve < 1024u)
+            limit = 3u;
+        else
+            limit = SCREEN_MAILBOX_RESCUES_PER_REFRESH_MAX;
+    } else if (submitted_frames < 4096u)
         limit = 3u;                 /* startup: responsive, but conservative */
-    else if (reserve < 2048u)
-        limit = 0u;                 /* audio deadline shield */
-    else if (reserve < 4096u)
+    else if (reserve < 384u)
+        limit = 0u;                 /* R57E75: true audio cliff */
+    else if (reserve < 1024u)
         limit = 1u;
-    else if (reserve < 8192u)
+    else if (reserve < 2304u)
         limit = 3u;
-    else if (reserve < 16384u)
+    else if (reserve < 3072u)
         limit = 7u;
     else
         limit = SCREEN_MAILBOX_RESCUES_PER_REFRESH_MAX;
@@ -2111,6 +2201,9 @@ void tab5_screen_present_opportunity(void)
 {
     if (!s_ready)
         return;
+#if PX68K_TAB5_RELEASE_DIAGNOSTICS
+    __atomic_add_fetch(&s_r89_present_opportunities, 1u, __ATOMIC_RELAXED);
+#endif
     __atomic_store_n(&s_nw_present_cutoff,
                      tab5_video_flow_guest_frontier(), __ATOMIC_RELAXED);
     __atomic_add_fetch(&s_nw_present_serial, 1u, __ATOMIC_RELEASE);
@@ -2169,6 +2262,47 @@ const uint16_t *tab5_screen_readonly_work_buffer(void)
 {
     return s_work;
 }
+
+void tab5_screen_r57e89_get_stats(tab5_screen_r57e89_stats_t *o)
+{
+    if (!o)
+        return;
+
+    memset(o, 0, sizeof(*o));
+#if PX68K_TAB5_RELEASE_DIAGNOSTICS
+    o->frame_requests = __atomic_load_n(&s_r89_frame_requests, __ATOMIC_RELAXED);
+    o->frame_consumed = s_r89_frame_consumed;
+    o->present_opportunities = __atomic_load_n(&s_r89_present_opportunities, __ATOMIC_RELAXED);
+    o->present_consumed = s_r89_present_consumed;
+    o->seal_armed = s_r89_seal_armed;
+    o->seal_arm_rejected = s_r89_seal_arm_rejected;
+    o->seal_tries = s_r89_seal_tries;
+    o->seal_block_pending = s_r89_seal_block_pending;
+    o->seal_block_retry = s_r89_seal_block_retry;
+    o->seal_block_reset = s_r89_seal_block_reset;
+    o->seal_nochange = s_r89_seal_nochange;
+    o->seal_epoch_drop = s_r89_seal_epoch_drop;
+    o->presenter_calls = s_r89_presenter_calls;
+    o->presenter_rejects = s_r89_presenter_rejects;
+    o->display_ok = s_r89_display_ok;
+    o->display_fail = s_r89_display_fail;
+    o->mailbox_posts = s_mailbox_posts;
+    o->mailbox_duplicates = s_mailbox_duplicate_posts;
+    o->mailbox_offer_suppressed = s_mailbox_offer_suppressed;
+    o->mailbox_claims = s_mailbox_refresh_claims;
+    o->mailbox_swaps = s_mailbox_buffer_swaps;
+    o->mailbox_edges = s_mailbox_edge_wakes;
+    o->rescue_try = s_mailbox_rescue_attempts;
+    o->rescue_ok = s_mailbox_rescue_swaps;
+    o->rescue_busy = s_mailbox_rescue_skip_busy;
+    o->rescue_budget = s_mailbox_rescue_skip_budget;
+    o->pending_tickets = s_pending_tickets;
+    o->retry_debt = s_retry_debt_count;
+    o->seal_requested = s_seal_requested ? 1u : 0u;
+    o->admission_open = s_admission_open ? 1u : 0u;
+#endif
+}
+
 
 void tab5_screen_manager_get_stats(tab5_screen_manager_stats_t *out)
 {

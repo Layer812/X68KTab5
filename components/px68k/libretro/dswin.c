@@ -66,9 +66,11 @@ static int s_pending_opm_frames = 0;
  * consumer. This is a true SPSC ring: sample bytes are written before CPU1
  * release-publishes pbwp, and CPU0 finishes copy/mix before release-publishing
  * pbrp. No cross-core portMUX or retry is permitted on CPU1. */
-#if PX68K_TAB5_R57E63_AUDIO_AUDIT
+/* R57E76: always retain this single monotonic counter.  It is incremented
+ * once per already-batched guest audio publication and lets the silent
+ * flight recorder measure real producer rate without wall-clock probes or
+ * periodic UART. */
 static volatile uint32_t s_host_produced_frames = 0;
-#endif
 #if PX68K_TAB5_R57E63_AUDIO_AUDIT
 static volatile uint64_t s_r57e63_adpcm_generated_frames = 0;
 static volatile uint64_t s_r57e63_adpcm_probe_samples = 0;
@@ -201,9 +203,7 @@ static void sound_send_adpcm(int length)
       next_wp = pbsp + (next_wp - pbep);
 #ifdef ESP_PLATFORM
    pcm_store_wp(next_wp);
-#if PX68K_TAB5_R57E63_AUDIO_AUDIT
    __atomic_add_fetch(&s_host_produced_frames, (uint32_t)length, __ATOMIC_RELAXED);
-#endif
 #else
    pbwp = next_wp;
 #endif
@@ -257,9 +257,7 @@ static void sound_send_coupled(int length)
       next_wp = pbsp + (next_wp - pbep);
 #ifdef ESP_PLATFORM
    pcm_store_wp(next_wp);
-#if PX68K_TAB5_R57E63_AUDIO_AUDIT
    __atomic_add_fetch(&s_host_produced_frames, (uint32_t)length, __ATOMIC_RELAXED);
-#endif
 #else
    pbwp = next_wp;
 #endif
@@ -528,7 +526,7 @@ int DSound_HostFramesAvail(void)
 
 uint32_t DSound_HostProducedFrames(void)
 {
-#if defined(ESP_PLATFORM) && PX68K_TAB5_R57E63_AUDIO_AUDIT
+#ifdef ESP_PLATFORM
    return __atomic_load_n(&s_host_produced_frames, __ATOMIC_ACQUIRE);
 #else
    return 0;

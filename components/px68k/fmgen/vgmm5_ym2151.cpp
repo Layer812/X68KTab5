@@ -411,29 +411,41 @@ static IRAM_ATTR __attribute__((always_inline,optimize("O3"))) inline int32_t sy
     return out;
 }
 
-static IRAM_ATTR __attribute__((noinline,optimize("O3"))) void synth(VgmM5YM2151 *e,int32_t *ml,int32_t *mr)
+/* R57E70B: the render API already receives blocks (normally up to 256
+ * frames).  Hoist the common "LFO depth is zero" decision to the render-call
+ * boundary without duplicating the large operator/algorithm graph. */
+static IRAM_ATTR __attribute__((noinline,optimize("O3"))) void synth_zero_hot(
+    VgmM5YM2151 *e,int32_t *ml,int32_t *mr)
 {
     int32_t l=0,r=0;
+    const uint8_t active=e->active_ch_mask;
+    for(int ch=0;ch<YM_CH;ch++) {
+        if((active&(uint8_t)(1u<<ch))==0) continue;
+        const int32_t co=synth_channel_zero_mod(e,ch);
+        if(e->pan_l[ch]) l+=co;
+        if(e->pan_r[ch]) r+=co;
+    }
+    *ml=l;*mr=r;
+}
+
+static IRAM_ATTR __attribute__((noinline,optimize("O3"))) void synth(VgmM5YM2151 *e,int32_t *ml,int32_t *mr)
+{
     const int32_t gpm=e->cached_pm;
     const int32_t gam=e->cached_am;
-    const uint8_t active=e->active_ch_mask;
-
     if((gpm|gam)==0) {
-        for(int ch=0;ch<YM_CH;ch++) {
-            if((active&(uint8_t)(1u<<ch))==0) continue;
-            const int32_t co=synth_channel_zero_mod(e,ch);
-            if(e->pan_l[ch]) l+=co;
-            if(e->pan_r[ch]) r+=co;
-        }
-    } else {
-        for(int ch=0;ch<YM_CH;ch++) {
-            if((active&(uint8_t)(1u<<ch))==0) continue;
-            const int32_t pm=(gpm * e->pm_scale[ch]) >> 4;
-            const int32_t am=(gam * e->am_scale[ch]) >> 2;
-            const int32_t co=synth_channel_modulated_cold(e,ch,pm,am);
-            if(e->pan_l[ch]) l+=co;
-            if(e->pan_r[ch]) r+=co;
-        }
+        synth_zero_hot(e,ml,mr);
+        return;
+    }
+
+    int32_t l=0,r=0;
+    const uint8_t active=e->active_ch_mask;
+    for(int ch=0;ch<YM_CH;ch++) {
+        if((active&(uint8_t)(1u<<ch))==0) continue;
+        const int32_t pm=(gpm * e->pm_scale[ch]) >> 4;
+        const int32_t am=(gam * e->am_scale[ch]) >> 2;
+        const int32_t co=synth_channel_modulated_cold(e,ch,pm,am);
+        if(e->pan_l[ch]) l+=co;
+        if(e->pan_r[ch]) r+=co;
     }
     *ml=l;*mr=r;
 }
@@ -465,6 +477,36 @@ static IRAM_ATTR __attribute__((always_inline,optimize("O3"))) inline void tick(
     int32_t l=0,r=0;synth(e,&l,&r);
     l=(l+e->prev_l)/2;r=(r+e->prev_r)/2;e->prev_l=l;e->prev_r=r;
     *ol=l;*orr=r;
+}
+
+
+/* R57E70B zero-depth block tick. Register writes are timestamp-separated from
+ * render calls by fmg_wrap, so pmd/amd cannot change inside one render call.
+ * State-update order matches tick(): EG -> noise -> LFO phase -> synth ->
+ * output smoothing. Only the two depth tests/table path are removed. */
+static IRAM_ATTR __attribute__((always_inline,optimize("O3"))) inline void tick_zero_depth(
+    VgmM5YM2151 *e,int32_t *ol,int32_t *orr)
+{
+    if((e->output_tick_counter++&3u)==0u)update_envelopes(e);
+    if(e->noise_enable) {
+        e->noise_phase+=e->noise_step;
+        if(!e->noise_step)e->noise_step=0x00400000u;
+        if(e->noise_phase<e->noise_step) {
+            uint32_t bit=((e->noise_rng>>0)^(e->noise_rng>>3))&1u;
+            e->noise_rng=(e->noise_rng>>1)|(bit<<16); if(!e->noise_rng)e->noise_rng=1;
+        }
+    }
+    e->lfo_phase+=e->lfo_step;
+    e->cached_pm=0;
+    e->cached_am=0;
+    int32_t l=0,r=0;
+    synth_zero_hot(e,&l,&r);
+    l=(l+e->prev_l)/2;
+    r=(r+e->prev_r)/2;
+    e->prev_l=l;
+    e->prev_r=r;
+    *ol=l;
+    *orr=r;
 }
 
 static void init_state(VgmM5YM2151 *e,uint32_t clock,uint32_t sr,int32_t volume)
@@ -576,14 +618,26 @@ extern "C" IRAM_ATTR __attribute__((noinline,optimize("O3"))) void vgmm5_ym2151_
     if((sem_call&63u)==0u) semantic_sample(e);
 #endif
     int32_t vol=e->volume_q14;
-    for(uint32_t i=0;i<frames;i++){
-        int32_t l,r;tick(e,&l,&r);
-        if(l>65535)l=65535;else if(l<-65536)l=-65536;
-        if(r>65535)r=65535;else if(r<-65536)r=-65536;
-        l=(l*vol)>>14;r=(r*vol)>>14;
-        if(l>32767)l=32767;else if(l<-32768)l=-32768;
-        if(r>32767)r=32767;else if(r<-32768)r=-32768;
-        dst[i*2]=(int16_t)l;dst[i*2+1]=(int16_t)r;
+    if(__builtin_expect((e->pmd|e->amd)==0u,1)){
+        for(uint32_t i=0;i<frames;i++){
+            int32_t l,r;tick_zero_depth(e,&l,&r);
+            if(l>65535)l=65535;else if(l<-65536)l=-65536;
+            if(r>65535)r=65535;else if(r<-65536)r=-65536;
+            l=(l*vol)>>14;r=(r*vol)>>14;
+            if(l>32767)l=32767;else if(l<-32768)l=-32768;
+            if(r>32767)r=32767;else if(r<-32768)r=-32768;
+            dst[i*2]=(int16_t)l;dst[i*2+1]=(int16_t)r;
+        }
+    }else{
+        for(uint32_t i=0;i<frames;i++){
+            int32_t l,r;tick(e,&l,&r);
+            if(l>65535)l=65535;else if(l<-65536)l=-65536;
+            if(r>65535)r=65535;else if(r<-65536)r=-65536;
+            l=(l*vol)>>14;r=(r*vol)>>14;
+            if(l>32767)l=32767;else if(l<-32768)l=-32768;
+            if(r>32767)r=32767;else if(r<-32768)r=-32768;
+            dst[i*2]=(int16_t)l;dst[i*2+1]=(int16_t)r;
+        }
     }
 }
 

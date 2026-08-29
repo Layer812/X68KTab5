@@ -4,6 +4,7 @@
  * Layer8 Aug/17/2026
  */
 #include "tab5_audio.h"
+#include "tab5_audio_r57e91.h"
 
 #ifndef PX68K_TAB5_RELEASE_DIAGNOSTICS
 #define PX68K_TAB5_RELEASE_DIAGNOSTICS 0
@@ -56,15 +57,19 @@ static const char *TAG = "TAB5_AUDIO";
  */
 static constexpr size_t kRingFrames = 32768; /* R13: restore 128 KiB host ring; keep in PSRAM to preserve compositor Internal SRAM */
 static constexpr size_t kRingMask = kRingFrames - 1;
+/* R57E76 AUDIO DEADLINE:
+ * 512 source frames are only 11.61 ms at 44.1 kHz.  The feeder's historical
+ * one-tick sleep is 10 ms on this build, leaving almost no scheduling margin.
+ * Restore a 1024-source-frame speaker slot (23.22 ms) while keeping the
+ * established cold-start/resume reserve in absolute source-frame units. */
+/* R57E77: R76 proved the feeder can keep up, but a 1024-source-frame
+ * refill quantum makes a slow producer wait for too much data before each
+ * speaker submission.  Restore the proven 512-frame quantum while RETAINING
+ * R76's eager two-slot fill (no 10-ms sleep after the first slot). */
 static constexpr size_t kChunkFrames = 512;
-/* R57E57: halve feeder granularity so a real starvation recovers in ~23 ms
- * instead of ~46 ms, while keeping the original ~70 ms cold-start reserve. */
-static constexpr size_t kStartupWatermarkFrames = 6 * kChunkFrames; /* 69.7 ms */
-/* R57E67: recovery needs more than a single 23-ms cushion when guest
- * production is hovering around real time.  Resume with ~46 ms in hand;
- * normal steady playback latency is unchanged. */
-static constexpr size_t kResumeWatermarkFrames = 4 * kChunkFrames;  /* 46.4 ms */
-static constexpr size_t kLowWatermarkFrames = kChunkFrames;
+static constexpr size_t kStartupWatermarkFrames = 3072; /* 69.7 ms */
+static constexpr size_t kResumeWatermarkFrames = 2048;  /* 46.4 ms */
+static constexpr size_t kLowWatermarkFrames = 512;
 static constexpr size_t kPlayBuffers = 3;
 static constexpr int kSpeakerChannel = 0;
 static_assert((kRingFrames & (kRingFrames - 1)) == 0, "audio ring must be power-of-two");
@@ -99,6 +104,145 @@ static uint32_t s_max_queued = 0;
 static uint32_t s_playbuf_internal = 0;
 static uint32_t s_speaker_queued_frames = 0;
 static uint32_t s_speaker_full_waits = 0;
+
+#if PX68K_TAB5_RELEASE_DIAGNOSTICS
+/* R57E91: digital continuity forensics.  Recorder-only state: R89's
+ * 512-frame feeder and scheduling decisions are intentionally unchanged. */
+static volatile uint32_t s_r91_armed = 0;
+static tab5_audio_r57e91_stats_t s_r91 = {};
+static int16_t s_r92_out_prev_l = 0, s_r92_out_prev_r = 0;
+static bool s_r92_out_prev_valid = false;
+static uint32_t s_r92_out_zero_run = 0;
+static int16_t s_r91_submit_prev_l = 0, s_r91_submit_prev_r = 0;
+static bool s_r91_submit_prev_valid = false;
+static int64_t s_r91_submit_last_us = 0;
+
+static inline uint32_t r91_absdiff16(int16_t a, int16_t b)
+{
+    const int32_t d = (int32_t)a - (int32_t)b;
+    return (uint32_t)(d < 0 ? -d : d);
+}
+
+static inline uint32_t r91_stereo_jump(int16_t al, int16_t ar, int16_t bl, int16_t br)
+{
+    const uint32_t dl = r91_absdiff16(al, bl);
+    const uint32_t dr = r91_absdiff16(ar, br);
+    return dl > dr ? dl : dr;
+}
+
+static void r91_insert_pcm_top(uint32_t frame_pos, uint32_t jump, uint32_t local_ref)
+{
+    for (unsigned i = 0; i < TAB5_AUDIO_R57E91_TOP; ++i) {
+        if (jump <= s_r91.pcm_top[i].jump) continue;
+        for (unsigned j = TAB5_AUDIO_R57E91_TOP - 1; j > i; --j)
+            s_r91.pcm_top[j] = s_r91.pcm_top[j - 1];
+        s_r91.pcm_top[i].frame_pos = frame_pos;
+        s_r91.pcm_top[i].jump = jump;
+        s_r91.pcm_top[i].local_ref = local_ref;
+        break;
+    }
+}
+
+static void r91_insert_submit_top(uint32_t frame_pos, uint32_t gap_us,
+                                  uint32_t ring_after, uint32_t speaker_q,
+                                  uint32_t boundary_jump)
+{
+    for (unsigned i = 0; i < TAB5_AUDIO_R57E91_TOP; ++i) {
+        if (gap_us <= s_r91.submit_top[i].gap_us) continue;
+        for (unsigned j = TAB5_AUDIO_R57E91_TOP - 1; j > i; --j)
+            s_r91.submit_top[j] = s_r91.submit_top[j - 1];
+        s_r91.submit_top[i].frame_pos = frame_pos;
+        s_r91.submit_top[i].gap_us = gap_us;
+        s_r91.submit_top[i].ring_after_take = ring_after;
+        s_r91.submit_top[i].speaker_queue_before = speaker_q;
+        s_r91.submit_top[i].boundary_jump = boundary_jump;
+        break;
+    }
+}
+
+/* R57E92: observe the exact stereo PCM that is handed to M5.Speaker.playRaw().
+ * This sits after host-ring copy and after any pitch-safe 22.05-kHz decimation,
+ * so it cannot accidentally inspect an upstream staging buffer. */
+static void r92_observe_outpcm(const int16_t *samples, size_t frames)
+{
+    if (!samples || !frames || !__atomic_load_n(&s_r91_armed, __ATOMIC_RELAXED)) return;
+
+    const uint32_t base = s_r91.out_frames;
+    int16_t prev_l = s_r92_out_prev_l;
+    int16_t prev_r = s_r92_out_prev_r;
+    bool prev_valid = s_r92_out_prev_valid;
+    uint32_t zero_run = s_r92_out_zero_run;
+    uint32_t zero_max = s_r91.out_zero_run_max;
+    uint32_t gt4 = 0, gt8 = 0, gt16 = 0;
+    uint32_t adj_max = 0, adj_max_pos = base;
+    uint32_t boundary_jump = 0;
+    uint32_t zero16 = 0, zero64 = 0, nonzero = 0, peak = 0;
+
+    for (size_t i = 0; i < frames; ++i) {
+        const int16_t l = samples[i * 2u + 0u];
+        const int16_t r = samples[i * 2u + 1u];
+        const uint32_t al = (uint32_t)(l < 0 ? -(int32_t)l : (int32_t)l);
+        const uint32_t ar = (uint32_t)(r < 0 ? -(int32_t)r : (int32_t)r);
+        const uint32_t ap = al > ar ? al : ar;
+        if (ap) ++nonzero;
+        if (ap > peak) peak = ap;
+
+        if (prev_valid) {
+            const uint32_t j = r91_stereo_jump(l, r, prev_l, prev_r);
+            if (j > 4096u) ++gt4;
+            if (j > 8192u) ++gt8;
+            if (j > 16384u) ++gt16;
+            if (j > adj_max) { adj_max = j; adj_max_pos = base + (uint32_t)i; }
+            if (i == 0u) boundary_jump = j;
+        }
+
+        if (l == 0 && r == 0) {
+            ++zero_run;
+            if (zero_run == 16u) ++zero16;
+            if (zero_run == 64u) ++zero64;
+            if (zero_run > zero_max) zero_max = zero_run;
+        } else {
+            zero_run = 0;
+        }
+        prev_l = l; prev_r = r; prev_valid = true;
+    }
+
+    portENTER_CRITICAL(&s_mux);
+    ++s_r91.out_chunks;
+    s_r91.out_frames += (uint32_t)frames;
+    s_r91.out_adj_gt4k += gt4;
+    s_r91.out_adj_gt8k += gt8;
+    s_r91.out_adj_gt16k += gt16;
+    if (adj_max > s_r91.out_adj_max) {
+        s_r91.out_adj_max = adj_max;
+        s_r91.out_adj_max_frame = adj_max_pos;
+    }
+    s_r91.out_zero_run_max = zero_max;
+    s_r91.out_zero_runs_ge16 += zero16;
+    s_r91.out_zero_runs_ge64 += zero64;
+    s_r91.out_nonzero_frames += nonzero;
+    if (peak > s_r91.out_peak_abs) s_r91.out_peak_abs = peak;
+
+    if (s_r92_out_prev_valid) {
+        ++s_r91.out_boundaries;
+        if (boundary_jump > 4096u) ++s_r91.out_boundary_gt4k;
+        if (boundary_jump > 8192u) ++s_r91.out_boundary_gt8k;
+        if (boundary_jump > 16384u) ++s_r91.out_boundary_gt16k;
+        if (boundary_jump > s_r91.out_boundary_max) {
+            s_r91.out_boundary_max = boundary_jump;
+            s_r91.out_boundary_max_frame = base;
+        }
+    }
+    if (adj_max)
+        r91_insert_pcm_top(adj_max_pos, adj_max, adj_max_pos == base ? 1u : 0u);
+    portEXIT_CRITICAL(&s_mux);
+
+    s_r92_out_zero_run = zero_run;
+    s_r92_out_prev_l = prev_l;
+    s_r92_out_prev_r = prev_r;
+    s_r92_out_prev_valid = prev_valid;
+}
+#endif /* PX68K_TAB5_RELEASE_DIAGNOSTICS: R91/R92 forensics */
 /* Build 5.98g9b: producer-rate estimator + pitch-safe 44.1/22.05 kHz quality switch.
  * R57E68 keeps only the functional speaker-rate state in release; producer
  * wall-rate exists solely when focused audit/research diagnostics are enabled. */
@@ -118,6 +262,10 @@ static bool s_rate_valid = false;
 #endif
 static bool s_quality_22k_requested = false;
 static bool s_quality_22k_active = false;
+/* R57E95T: the on-screen N/A/Turbo control is the sole rate owner.  Keep this
+ * across guest flush/reset so the UI and audio path cannot silently diverge.
+ * No ring/chunk/prebuffer constant is changed by this mode. */
+static bool s_manual_turbo_22k = false;
 
 static void audio_enqueue_mixed(const int16_t *samples, size_t frames);
 
@@ -340,6 +488,8 @@ static void audio_task(void *)
 
         size_t take = 0;
 #if PX68K_TAB5_RELEASE_DIAGNOSTICS
+        uint32_t r91_ring_after_take = 0;
+        int16_t r91_first_l = 0, r91_first_r = 0, r91_last_l = 0, r91_last_r = 0;
         const int64_t speaker_work_t0 = esp_timer_get_time();
 #endif
         portENTER_CRITICAL(&s_mux);
@@ -353,6 +503,15 @@ static void audio_task(void *)
                 std::memcpy(dst + first * 2, s_ring, (take - first) * 2 * sizeof(int16_t));
             s_rd = (s_rd + take) & kRingMask;
             s_count -= take;
+#if PX68K_TAB5_RELEASE_DIAGNOSTICS
+            r91_ring_after_take = (uint32_t)s_count;
+            if (__atomic_load_n(&s_r91_armed, __ATOMIC_RELAXED) && take) {
+                r91_first_l = dst[0];
+                r91_first_r = dst[1];
+                r91_last_l = dst[(take - 1u) * 2u + 0u];
+                r91_last_r = dst[(take - 1u) * 2u + 1u];
+            }
+#endif
             if (s_count < kLowWatermarkFrames)
                 ++s_low_water_hits;
             note_queued_locked(s_count);
@@ -381,13 +540,10 @@ static void audio_task(void *)
             continue;
         }
 
-        /* Build 5.98g9b: GUARD/CRIT may trade bandwidth for quality, but
-         * NEVER trade pitch for continuity.  In 22.05-kHz mode consume the
-         * same 1024 source frames, low-pass/decimate 2:1 to 512 frames, then
-         * play those 512 frames at 22.05 kHz.  Chunk duration remains 23.2 ms,
-         * so voices keep their original pitch; only bandwidth is reduced.
-         * This intentionally does not pretend to fix a slow guest clock -- it
-         * merely halves downstream speaker/DMA sample work while overloaded. */
+        /* R57E95T: N/A/Turbo is manual only.  Turbo consumes the exact same
+         * source-frame chunk and ring policy, pair-averages 2:1, then submits
+         * at 22.05 kHz.  Source-time duration/pitch stay unchanged; downstream
+         * Speaker/I2S sample work is halved.  No buffer or watermark changes. */
         uint32_t play_rate = PX68K_TAB5_AUDIO_RATE;
         size_t play_frames = take;
         if (quality_22k_requested)
@@ -411,6 +567,18 @@ static void audio_task(void *)
         s_quality_22k_active = quality_22k_requested;
         s_speaker_rate_hz = play_rate;
         portEXIT_CRITICAL(&s_mux);
+#if PX68K_TAB5_RELEASE_DIAGNOSTICS
+        if (__atomic_load_n(&s_r91_armed, __ATOMIC_RELAXED) && play_frames) {
+            int16_t *obuf = s_play[play_index];
+            r91_first_l = obuf[0];
+            r91_first_r = obuf[1];
+            r91_last_l = obuf[(play_frames - 1u) * 2u + 0u];
+            r91_last_r = obuf[(play_frames - 1u) * 2u + 1u];
+            /* R57E94: the R92 full per-frame PCM walk proved chunk boundaries
+             * clean and is now retired.  Keep only first/last endpoints for
+             * the cheap JIT91 submit-boundary continuity check. */
+        }
+#endif
 if (M5.Speaker.playRaw(s_play[play_index],
                                play_frames * 2,
                                play_rate,
@@ -419,6 +587,51 @@ if (M5.Speaker.playRaw(s_play[play_index],
                                kSpeakerChannel,
                                false))
         {
+#if PX68K_TAB5_RELEASE_DIAGNOSTICS
+            if (__atomic_load_n(&s_r91_armed, __ATOMIC_RELAXED)) {
+                const int64_t now_us = esp_timer_get_time();
+                uint32_t gap_us = 0;
+                if (s_r91_submit_last_us > 0) {
+                    const uint64_t g = (uint64_t)(now_us - s_r91_submit_last_us);
+                    gap_us = g > UINT32_MAX ? UINT32_MAX : (uint32_t)g;
+                }
+                s_r91_submit_last_us = now_us;
+                const uint32_t boundary_jump = s_r91_submit_prev_valid
+                    ? r91_stereo_jump(r91_first_l, r91_first_r,
+                                      s_r91_submit_prev_l, s_r91_submit_prev_r)
+                    : 0u;
+
+                portENTER_CRITICAL(&s_mux);
+                ++s_r91.submit_count;
+                if (gap_us) {
+                    if (!s_r91.submit_gap_min_us || gap_us < s_r91.submit_gap_min_us)
+                        s_r91.submit_gap_min_us = gap_us;
+                    if (gap_us > s_r91.submit_gap_max_us)
+                        s_r91.submit_gap_max_us = gap_us;
+                    if (gap_us > 15000u) ++s_r91.submit_gap_gt15ms;
+                    if (gap_us > 20000u) ++s_r91.submit_gap_gt20ms;
+                    if (gap_us > 30000u) ++s_r91.submit_gap_gt30ms;
+                    r91_insert_submit_top(s_r91.submit_count * (uint32_t)kChunkFrames,
+                                          gap_us, r91_ring_after_take,
+                                          (uint32_t)speaker_queue, boundary_jump);
+                }
+                if (speaker_queue == 0 && playback_started)
+                    ++s_r91.submit_zeroq_refill;
+                if (boundary_jump > s_r91.submit_boundary_max) {
+                    s_r91.submit_boundary_max = boundary_jump;
+                    s_r91.submit_boundary_max_frame = s_r91.submit_count * (uint32_t)kChunkFrames;
+                }
+                if (s_r91.submit_count == 1u || r91_ring_after_take < s_r91.submit_ring_min)
+                    s_r91.submit_ring_min = r91_ring_after_take;
+                if (r91_ring_after_take > s_r91.submit_ring_max)
+                    s_r91.submit_ring_max = r91_ring_after_take;
+                portEXIT_CRITICAL(&s_mux);
+
+                s_r91_submit_prev_l = r91_last_l;
+                s_r91_submit_prev_r = r91_last_r;
+                s_r91_submit_prev_valid = true;
+            }
+#endif
             portENTER_CRITICAL(&s_mux);
             s_played += (uint32_t)take;
             portEXIT_CRITICAL(&s_mux);
@@ -437,8 +650,13 @@ if (M5.Speaker.playRaw(s_play[play_index],
         s_cpu0_speaker_work_us += (uint32_t)(esp_timer_get_time() - speaker_work_t0);
 #endif
 
-        /* Give the core's IDLE task a scheduling window. */
-        vTaskDelay(1);
+        /* R57E77: retain R76 eager second-slot refill with the original
+         * 512-source-frame quantum.  Two queued slots now represent about
+         * 23.2 ms of source time, but a refill only waits for 11.6 ms of new
+         * source data rather than 23.2 ms.  The full two-slot path remains the
+         * only place that sleeps one FreeRTOS tick. */
+        taskYIELD();
+        continue;
     }
 }
 
@@ -579,10 +797,11 @@ if (s_started)
 #if PX68K_TAB5_R57E63_AUDIO_AUDIT || PX68K_TAB5_RELEASE_DIAGNOSTICS
     s_rate_valid = false;
 #endif
+    s_manual_turbo_22k = false;
     s_quality_22k_requested = false;
     s_quality_22k_active = false;
     portEXIT_CRITICAL(&s_mux);
-    ESP_LOGI(TAG, "Build 6.00 CPU0-final-mix + pressure-relief + pitch-safe audio: NORMAL=%uHz GUARD/CRIT=%uHz pair-average 2:1; no clock stretching",
+    ESP_LOGI(TAG, "PX68K_AUDIO_R57E96T: manual N/A=%uHz Turbo=%uHz; ring=32768 chunk=512 startup=3072 resume=2048 unchanged",
              (unsigned)PX68K_TAB5_AUDIO_RATE,
              (unsigned)(PX68K_TAB5_AUDIO_RATE / 2u));
 
@@ -602,7 +821,7 @@ if (s_started)
 
     s_started = true;
     ESP_LOGI(TAG,
-             "PX68K_AUDIO_R57E67: continuity feeder ACTIVE; MDX quantum=256; CPU0 YM2151 prio=3, feeder=4, speaker=4; pressure-relief=ON; rate=%u ring=%u chunk=%u startup=%u resume=%u playbuf_internal=%u/%u",
+             "PX68K_AUDIO_R57E77: 512-frame eager feeder ACTIVE; R76 1024 quantum retired; MDX quantum=256; CPU0 YM2151 prio=3 feeder=4 speaker=4; rate=%u ring=%u chunk=%u startup=%u resume=%u playbuf_internal=%u/%u",
              (unsigned)PX68K_TAB5_AUDIO_RATE,
              (unsigned)kRingFrames,
              (unsigned)kChunkFrames,
@@ -610,6 +829,9 @@ if (s_started)
              (unsigned)kResumeWatermarkFrames,
              (unsigned)s_playbuf_internal,
              (unsigned)kPlayBuffers);
+    ESP_LOGI(TAG, "PX68K_AUDIO_R57E91: 512-frame behavior frozen; continuity recorder compiled OUT for production");
+    ESP_LOGI(TAG, "PX68K_AUDIO_R57E94: OUTPCM/submit/M5 continuity probes compiled OUT; functional audio path unchanged");
+    ESP_LOGI(TAG, "PX68K_AUDIO_R57E96T: automatic GUARD/CRIT sample-rate switching RETIRED; only N/A/Turbo UI selects rate");
     return 1;
 }
 
@@ -617,6 +839,8 @@ static void audio_enqueue_mixed(const int16_t *samples, size_t frames)
 {
 if (!s_started || !samples || !frames)
         return;
+
+    /* R57E92: upstream staging scan retired; exact observation is at playRaw(). */
 
 #if PX68K_TAB5_R57E63_AUDIO_AUDIT || PX68K_TAB5_RELEASE_DIAGNOSTICS
     /* Diagnostic-only producer wall-rate estimator. R57E68 release quiet
@@ -688,10 +912,11 @@ extern "C" void tab5_audio_kick(void)
 
 extern "C" void tab5_audio_set_high_load_22k(int enable)
 {
-    if (!s_started)
-        return;
+    /* ABI name retained; R57E95T makes this a MANUAL UI setter. */
+    const bool turbo = (enable != 0);
     portENTER_CRITICAL(&s_mux);
-    s_quality_22k_requested = (enable != 0);
+    s_manual_turbo_22k = turbo;
+    s_quality_22k_requested = turbo;
     portEXIT_CRITICAL(&s_mux);
     if (s_task)
         xTaskNotifyGive(s_task);
@@ -719,11 +944,41 @@ extern "C" void tab5_audio_flush(void)
 #if PX68K_TAB5_R57E63_AUDIO_AUDIT || PX68K_TAB5_RELEASE_DIAGNOSTICS
     s_rate_valid = false;
 #endif
-    s_quality_22k_requested = false;
+    s_quality_22k_requested = s_manual_turbo_22k;
     s_quality_22k_active = false;
     portEXIT_CRITICAL(&s_mux);
     if (s_task)
         xTaskNotifyGive(s_task);
+}
+
+extern "C" void tab5_audio_r57e91_reset_stats(void)
+{
+#if PX68K_TAB5_RELEASE_DIAGNOSTICS
+    __atomic_store_n(&s_r91_armed, 0u, __ATOMIC_RELEASE);
+    portENTER_CRITICAL(&s_mux);
+    std::memset(&s_r91, 0, sizeof(s_r91));
+    s_r92_out_prev_l = s_r92_out_prev_r = 0;
+    s_r92_out_prev_valid = false;
+    s_r92_out_zero_run = 0;
+    s_r91_submit_prev_l = s_r91_submit_prev_r = 0;
+    s_r91_submit_prev_valid = false;
+    s_r91_submit_last_us = 0;
+    portEXIT_CRITICAL(&s_mux);
+    __atomic_store_n(&s_r91_armed, 1u, __ATOMIC_RELEASE);
+#endif
+}
+
+extern "C" void tab5_audio_r57e91_get_stats(tab5_audio_r57e91_stats_t *out)
+{
+    if (!out) return;
+#if PX68K_TAB5_RELEASE_DIAGNOSTICS
+    __atomic_store_n(&s_r91_armed, 0u, __ATOMIC_RELEASE);
+    portENTER_CRITICAL(&s_mux);
+    *out = s_r91;
+    portEXIT_CRITICAL(&s_mux);
+#else
+    std::memset(out, 0, sizeof(*out));
+#endif
 }
 
 extern "C" void tab5_audio_get_stats(tab5_audio_stats_t *out)

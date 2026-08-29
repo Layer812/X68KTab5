@@ -102,6 +102,14 @@ static inline void tab5_touch_joy_publish(uint16_t joy)
 extern "C" void tab5_screen_manager_present_complete(uint64_t screen_token, int success);
 static bool s_present_started = false;
 static bool s_game_controls_enabled = false;
+/* R57E95T: false=N/A 44.1kHz, true=Turbo 22.05kHz.  Rate only: no buffer,
+ * watermark, task-priority or R94 guard changes are coupled to this button. */
+static bool s_turbo_audio_22k = false;
+
+extern "C" int tab5_video_turbo_enabled(void)
+{
+    return s_turbo_audio_22k ? 1 : 0;
+}
 static bool s_host_ui_exclusive = false;
 static bool s_panic_compat_enabled = false;
 
@@ -138,8 +146,10 @@ enum present_mode_t : uint8_t
 typedef struct
 {
     uint16_t *pixels;
+    uint32_t *managed_dirty_tiles;
     uint32_t width;
     uint32_t height;
+    uint8_t managed_sparse;
 } present_slot_t;
 
 typedef struct
@@ -151,6 +161,8 @@ typedef struct
     uint32_t height;
     uint32_t pitch_pixels;
     uint32_t live_epoch;
+    const uint32_t *managed_dirty_tiles;
+    uint8_t managed_sparse;
     uint64_t screen_token;
 } present_request_t;
 
@@ -217,6 +229,39 @@ static uint32_t s_dropped_frames = 0;
 static uint32_t s_last_copy_us = 0;
 static uint32_t s_last_push_us = 0;
 static uint32_t s_cpu0_push_total_us = 0;
+/* R57E74: managed immutable dirty-map effectiveness. */
+static uint32_t s_r74_managed_rows_scanned = 0;
+static uint32_t s_r74_managed_rows_skipped = 0;
+static uint32_t s_r74_managed_map_frames = 0;
+static uint32_t s_r82_slot_sparse_frames = 0;
+static uint32_t s_r82_slot_full_frames = 0;
+static uint32_t s_r82_slot_rows_copied = 0;
+static uint32_t s_r82_slot_rows_skipped = 0;
+static uint32_t s_r82_slot_forcefull_rejects = 0;
+static uint64_t s_r82_slot_bytes_copied = 0;
+static uint32_t s_r82_submit_w = 0;
+static uint32_t s_r82_submit_h = 0;
+/* R57E83: phase timers are cumulative and sampled only by the silent
+ * one-shot recorder.  No periodic UART is added. */
+static uint64_t s_r83_slot_copy_us = 0;
+static uint64_t s_r83_display_lock_us = 0;
+static uint64_t s_r83_push_frame_us = 0;
+static uint64_t s_r83_ppa_us = 0;
+static uint64_t s_r83_refresh_wait_us = 0;
+
+/* R57E84: managed immutable snapshots use the already-proven R42/R49
+ * direct-native front-buffer mechanism in steady state instead of PPA.
+ * Full/transition/recovery frames remain on the managed PPA path. */
+static uint32_t s_r84_native_frames = 0;
+static uint32_t s_r84_native_fallbacks = 0;
+static uint32_t s_r84_native_tile_runs = 0;
+static uint32_t s_r84_native_tiles = 0;
+static uint64_t s_r84_native_wall_us = 0;
+static uint64_t s_r84_native_sync_us = 0;
+static uint64_t s_r84_native_source_pixels = 0;
+static uint64_t s_r84_native_preserved_pixels = 0;
+
+static bool s_r74_managed_force_full_next = true;
 static uint32_t s_live_presented_frames = 0;
 static uint32_t s_live_row_retries = 0;
 static uint32_t s_live_unstable_rows = 0;
@@ -272,6 +317,11 @@ static uint8_t s_dsi_back_idx = 1;
  * memory therefore remains 720x1280 with a 720-pixel stride. */
 static constexpr uint32_t kDsiPhysWidth = 720;
 static constexpr uint32_t kDsiPhysHeight = 1280;
+
+/* R57E91K: A164 keyboard mounts the Tab5 in the opposite physical orientation.
+ * Keep the native DSI framebuffer geometry unchanged; only logical->native
+ * mapping flips from M5GFX rotation=1 to rotation=3 when the keyboard is detected. */
+static bool s_tab5_keyboard_orientation_180 = false;
 static constexpr uint32_t kDsiPhysStridePixels = kDsiPhysWidth;
 static uint32_t s_dsi_stride_pixels = 0;
 static bool s_dsi_double_live = false;
@@ -668,6 +718,13 @@ static void draw_game_controls_unlocked(void)
     /* Build 6.12o: software keyboard launcher in the unused left-side slot. */
     draw_panel_button(31, 207, 98, 68, "KEY", 0x1082, 0x8410, 2);
 
+    /* R57E95T: directly below KEY.  User wording is intentionally N/A/Turbo. */
+    draw_panel_button(31, 296, 98, 58,
+                      s_turbo_audio_22k ? "Turbo" : "N/A",
+                      s_turbo_audio_22k ? 0x03E0 : TFT_BLACK,
+                      s_turbo_audio_22k ? 0x07E0 : 0x8410,
+                      2);
+
     draw_dpad_button(53, 520, 54, 54, 'U');
     draw_dpad_button(17, 577, 56, 60, 'L');
     draw_dpad_button(87, 577, 56, 60, 'R');
@@ -691,6 +748,7 @@ enum : uint32_t {
     UTIL_VOLM     = 1u << 2,
     UTIL_VOLP     = 1u << 3,
     UTIL_KEYBOARD = 1u << 4,
+    UTIL_TURBO    = 1u << 5,
 };
 
 typedef struct
@@ -708,6 +766,7 @@ static game_touch_map_t map_game_touch_point(int x, int y, int display_w)
     if (point_in_rect(x,y,31,29,98,68)) m.util |= UTIL_PANIC;
     if (point_in_rect(x,y,31,118,98,68)) m.util |= UTIL_FILE;
     if (point_in_rect(x,y,31,207,98,68)) m.util |= UTIL_KEYBOARD;
+    if (point_in_rect(x,y,31,296,98,58)) m.util |= UTIL_TURBO;
     if (point_in_rect(x,y,53,520,54,54)) m.joy |= JOY_UP;
     if (point_in_rect(x,y,17,577,56,60)) m.joy |= JOY_LEFT;
     if (point_in_rect(x,y,87,577,56,60)) m.joy |= JOY_RIGHT;
@@ -991,6 +1050,10 @@ static void softkbd_buffer_key(const soft_key_t &k)
     soft_input_event_t &e=s_soft_input[s_soft_input_count++];
     e.scancode=k.scancode;
     e.modifiers=(uint8_t)((s_softkbd_shift?1u:0u) | (s_softkbd_ctrl?2u:0u));
+    /* R57E106P-U1: X68000 scan 0x34 is the physical underbar key, but
+     * Human68k produces '_' with SHIFT.  The on-screen key is labelled '_'
+     * semantically, so synthesize SHIFT just as the A164 bridge does. */
+    if (k.scancode == 0x34u) e.modifiers |= 1u;
     e.label=k.label;
     s_softkbd_redraw=true;
 }
@@ -1541,6 +1604,17 @@ static uint16_t poll_game_controls(uint8_t sample_reason)
      * ES8388/I2S stream while a game is running. */
     if (rising & UTIL_VOLP) (void)tab5_audio_step_volume(+1);
     if (rising & UTIL_VOLM) (void)tab5_audio_step_volume(-1);
+    if (rising & UTIL_TURBO) {
+        s_turbo_audio_22k = !s_turbo_audio_22k;
+        tab5_audio_set_high_load_22k(s_turbo_audio_22k ? 1 : 0);
+        s_force_game_redraw = true;
+        ESP_LOGI(TAG,
+                 "PX68K_TURBO_R57E97T: mode=%s sampleRate=%uHz videoBias=%s target=%s; buffers unchanged",
+                 s_turbo_audio_22k ? "Turbo" : "N/A",
+                 s_turbo_audio_22k ? 22050u : 44100u,
+                 s_turbo_audio_22k ? "AGGRESSIVE" : "AUDIO-SAFE",
+                 s_turbo_audio_22k ? "30fps" : "R94");
+    }
     if (rising & UTIL_KEYBOARD) {
         s_softkbd_active=true;
         s_softkbd_redraw=true;
@@ -1891,8 +1965,11 @@ static inline uint16_t *dbfb615h17r6_pixel_ptr(uint16_t *fb,
                                                uint32_t logical_x,
                                                uint32_t logical_y)
 {
-    return fb + (size_t)logical_x * kDsiPhysStridePixels +
-           (size_t)(kDsiPhysWidth - 1u - logical_y);
+    if (!s_tab5_keyboard_orientation_180)
+        return fb + (size_t)logical_x * kDsiPhysStridePixels +
+               (size_t)(kDsiPhysWidth - 1u - logical_y);
+    return fb + (size_t)(kDsiPhysHeight - 1u - logical_x) * kDsiPhysStridePixels +
+           (size_t)logical_y;
 }
 
 static bool dbfb615h17r6_c2m_aligned(void *ptr, size_t bytes)
@@ -1953,22 +2030,22 @@ static bool dbfb615h17_copy_front_to_back_rect(uint32_t x0, uint32_t y0,
         /* Logical rectangle -> native rectangle for rotation=1:
          * native rows [x0,x1), native columns [720-y1,720-y0).
          * Each native row is contiguous, so repair remains PIE-friendly. */
-        const uint32_t px0 = kDsiPhysWidth - y1;
-        const uint32_t px1 = kDsiPhysWidth - y0;
+        const uint32_t px0 = s_tab5_keyboard_orientation_180 ? y0 : (kDsiPhysWidth - y1);
+        const uint32_t px1 = s_tab5_keyboard_orientation_180 ? y1 : (kDsiPhysWidth - y0);
+        const uint32_t py0 = s_tab5_keyboard_orientation_180 ? (kDsiPhysHeight - x1) : x0;
+        const uint32_t py1 = s_tab5_keyboard_orientation_180 ? (kDsiPhysHeight - x0) : x1;
         const size_t row_bytes = (size_t)(px1 - px0) * sizeof(uint16_t);
-        bytes = (size_t)(x1 - x0) * row_bytes;
+        bytes = (size_t)(py1 - py0) * row_bytes;
 
-        for (uint32_t py = x0; py < x1; ++py)
+        for (uint32_t py = py0; py < py1; ++py)
         {
             uint16_t *src = front + (size_t)py * kDsiPhysStridePixels + px0;
             uint16_t *dst = back  + (size_t)py * kDsiPhysStridePixels + px0;
             tab5_pie_graphics_copy(dst, src, (uint32_t)row_bytes);
         }
 
-        /* Write back only the cache lines touched by the narrow native strip.
-         * A single bounding msync would unnecessarily write ~1.38 MiB even
-         * when only a few logical rows changed. */
-        for (uint32_t py = x0; py < x1; ++py)
+        /* Write back only the cache lines touched by the narrow native strip. */
+        for (uint32_t py = py0; py < py1; ++py)
         {
             uint16_t *dst = back + (size_t)py * kDsiPhysStridePixels + px0;
             if (!dbfb615h17r6_c2m_aligned(dst, row_bytes))
@@ -2356,25 +2433,43 @@ r35_swrot_tile8_packed(uint16_t *front, const uint16_t *packed,
                        uint32_t sx, uint32_t original_y)
 {
     uint16_t *t = s_r34_tile;
-    const uint16_t *s7 = packed + (size_t)7u * pic_w + sx;
-    const uint16_t *s6 = s7 - pic_w;
-    const uint16_t *s5 = s6 - pic_w;
-    const uint16_t *s4 = s5 - pic_w;
-    const uint16_t *s3 = s4 - pic_w;
-    const uint16_t *s2 = s3 - pic_w;
-    const uint16_t *s1 = s2 - pic_w;
-    const uint16_t *s0 = s1 - pic_w;
-
-    for (uint32_t x = 0; x < 8u; ++x)
+    if (!s_tab5_keyboard_orientation_180)
     {
-        uint16_t *o = t + (size_t)x * 8u;
-        o[0] = s7[x]; o[1] = s6[x]; o[2] = s5[x]; o[3] = s4[x];
-        o[4] = s3[x]; o[5] = s2[x]; o[6] = s1[x]; o[7] = s0[x];
+        const uint16_t *s7 = packed + (size_t)7u * pic_w + sx;
+        const uint16_t *s6 = s7 - pic_w;
+        const uint16_t *s5 = s6 - pic_w;
+        const uint16_t *s4 = s5 - pic_w;
+        const uint16_t *s3 = s4 - pic_w;
+        const uint16_t *s2 = s3 - pic_w;
+        const uint16_t *s1 = s2 - pic_w;
+        const uint16_t *s0 = s1 - pic_w;
+        for (uint32_t x = 0; x < 8u; ++x)
+        {
+            uint16_t *o = t + (size_t)x * 8u;
+            o[0] = s7[x]; o[1] = s6[x]; o[2] = s5[x]; o[3] = s4[x];
+            o[4] = s3[x]; o[5] = s2[x]; o[6] = s1[x]; o[7] = s0[x];
+        }
+        const uint32_t native_x0 = kDsiPhysWidth - (logical_y + original_y + 8u);
+        uint16_t *dst = front + (size_t)(logical_x + sx) * kDsiPhysStridePixels + native_x0;
+        tab5_r34_store8x8_native(dst, t);
     }
-
-    const uint32_t native_x0 = kDsiPhysWidth - (logical_y + original_y + 8u);
-    uint16_t *dst = front + (size_t)(logical_x + sx) * kDsiPhysStridePixels + native_x0;
-    tab5_r34_store8x8_native(dst, t);
+    else
+    {
+        /* rotation=3: native_x=logical_y, native_y=1279-logical_x.
+         * Build rows in ascending native memory order while preserving each
+         * logical 8x8 tile exactly. */
+        for (uint32_t r = 0; r < 8u; ++r)
+        {
+            uint16_t *o = t + (size_t)r * 8u;
+            const uint32_t src_x = 7u - r;
+            for (uint32_t j = 0; j < 8u; ++j)
+                o[j] = packed[(size_t)j * pic_w + sx + src_x];
+        }
+        const uint32_t native_y0 = kDsiPhysHeight - (logical_x + sx + 8u);
+        const uint32_t native_x0 = logical_y + original_y;
+        uint16_t *dst = front + (size_t)native_y0 * kDsiPhysStridePixels + native_x0;
+        tab5_r34_store8x8_native(dst, t);
+    }
 }
 
 static IRAM_ATTR __attribute__((hot, optimize("O3"))) uint32_t
@@ -2795,8 +2890,12 @@ static bool r32_direct_front_present(const uint16_t *stage,
         if (!band_h)
             continue;
 
-        const uint32_t native_x = kDsiPhysWidth - (logical_y + update_y1);
-        const uint32_t native_y = logical_x;
+        const uint32_t native_x = s_tab5_keyboard_orientation_180
+            ? (logical_y + update_y0)
+            : (kDsiPhysWidth - (logical_y + update_y1));
+        const uint32_t native_y = s_tab5_keyboard_orientation_180
+            ? (kDsiPhysHeight - (logical_x + pic_w))
+            : logical_x;
 
         ppa_srm_oper_config_t cfg = {};
         cfg.in.buffer = stage;
@@ -2814,7 +2913,7 @@ static bool r32_direct_front_present(const uint16_t *stage,
         cfg.out.block_offset_x = native_x;
         cfg.out.block_offset_y = native_y;
         cfg.out.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
-        cfg.rotation_angle = PPA_SRM_ROTATION_ANGLE_270;
+        cfg.rotation_angle = s_tab5_keyboard_orientation_180 ? PPA_SRM_ROTATION_ANGLE_90 : PPA_SRM_ROTATION_ANGLE_270;
         cfg.scale_x = 1.0f;
         cfg.scale_y = 1.0f;
         cfg.mirror_x = false;
@@ -2963,8 +3062,12 @@ static bool dbfb615h17r9_ppa_present(const uint16_t *stage,
         if (!band_h)
             continue;
 
-        const uint32_t native_x = kDsiPhysWidth - (logical_y + update_y1);
-        const uint32_t native_y = logical_x;
+        const uint32_t native_x = s_tab5_keyboard_orientation_180
+            ? (logical_y + update_y0)
+            : (kDsiPhysWidth - (logical_y + update_y1));
+        const uint32_t native_y = s_tab5_keyboard_orientation_180
+            ? (kDsiPhysHeight - (logical_x + pic_w))
+            : logical_x;
 
         ppa_srm_oper_config_t cfg = {};
         cfg.in.buffer = stage;
@@ -2982,7 +3085,7 @@ static bool dbfb615h17r9_ppa_present(const uint16_t *stage,
         cfg.out.block_offset_x = native_x;
         cfg.out.block_offset_y = native_y;
         cfg.out.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
-        cfg.rotation_angle = PPA_SRM_ROTATION_ANGLE_270;
+        cfg.rotation_angle = s_tab5_keyboard_orientation_180 ? PPA_SRM_ROTATION_ANGLE_90 : PPA_SRM_ROTATION_ANGLE_270;
         cfg.scale_x = 1.0f;
         cfg.scale_y = 1.0f;
         cfg.mirror_x = false;
@@ -3388,12 +3491,16 @@ static bool r40_sync_front_rect(uint16_t *front,
                                 uint32_t y0, uint32_t y1)
 {
     if (!front || x1 <= x0 || y1 <= y0) return true;
-    const uint32_t px0 = kDsiPhysWidth - (logical_y + y1);
-    const uint32_t px1 = kDsiPhysWidth - (logical_y + y0);
+    const uint32_t px0 = s_tab5_keyboard_orientation_180
+        ? (logical_y + y0) : (kDsiPhysWidth - (logical_y + y1));
+    const uint32_t px1 = s_tab5_keyboard_orientation_180
+        ? (logical_y + y1) : (kDsiPhysWidth - (logical_y + y0));
     if (px1 <= px0) return true;
     constexpr uint32_t kSyncNativeRows = 64u;
-    const uint32_t py_begin = logical_x + x0;
-    const uint32_t py_end = logical_x + x1;
+    const uint32_t py_begin = s_tab5_keyboard_orientation_180
+        ? (kDsiPhysHeight - (logical_x + x1)) : (logical_x + x0);
+    const uint32_t py_end = s_tab5_keyboard_orientation_180
+        ? (kDsiPhysHeight - (logical_x + x0)) : (logical_x + x1);
     for (uint32_t py0 = py_begin; py0 < py_end; py0 += kSyncNativeRows)
     {
         const uint32_t pend = std::min<uint32_t>(py0 + kSyncNativeRows, py_end);
@@ -3963,6 +4070,273 @@ static bool r38_direct_native_present(const present_request_t &req,
 }
 #endif
 
+
+/* R57E84
+ * --------
+ * Managed ScreenVersions are already immutable and carry an exact source
+ * 32-pixel dirty map.  R83 proved that rotating those sparse changes through
+ * blocking PPA dominates presenter time.  For steady sparse managed frames,
+ * update the physically scanned native FB0 in place with the proven R35/R42
+ * 8x8 native-store kernel.
+ *
+ * The source slot contains only dirty rows (R82), so an 8x8 destination tile
+ * can straddle clean source rows whose slot bytes are intentionally stale.
+ * For those pixels, preserve the current native-front value.  Dirty pixels
+ * are reconstructed from the immutable source snapshot.  This makes the
+ * sparse slot and sparse native store semantically exact without adding halo
+ * rows to the slot copy.
+ *
+ * Completion still waits for the *next* DSI refresh_done after all stores and
+ * C2M writebacks are finished.  Thus Screen Manager does not retire VISIBLE
+ * merely because CPU stores completed, while avoiding PPA and framebuffer
+ * swaps in steady state.
+ */
+static bool r84_managed_direct_native_present(const present_request_t &req,
+                                              uint32_t out_w, uint32_t out_h,
+                                              uint32_t logical_x, uint32_t logical_y)
+{
+#if !defined(CONFIG_IDF_TARGET_ESP32P4)
+    (void)req; (void)out_w; (void)out_h; (void)logical_x; (void)logical_y;
+    return false;
+#else
+    if (req.mode != PRESENT_MANAGED || !req.managed_sparse ||
+        !req.managed_dirty_tiles || !req.frame ||
+        !s_r32_direct_front || !s_r34_selfcheck_ok || !s_r35_pack8 ||
+        out_w != kAspectViewportWidth || out_h != kAspectViewportHeight ||
+        logical_x + out_w > kDsiPhysHeight ||
+        logical_y + out_h > kDsiPhysWidth ||
+        s_dsi_need_full_sync)
+        return false;
+
+    uint16_t *front = s_dsi_fb[s_dsi_front_idx];
+    if (!front)
+        return false;
+
+    /* R57E85: managed PPA is a distinct path from legacy R49 LIVE and may
+     * legally leave either physical framebuffer as the confirmed scanout
+     * front.  Direct-native therefore follows s_dsi_front_idx exactly.
+     * Host-UI transitions still repin/repair FB0 through the existing fence. */
+
+    if (!s_r34_front_cache_primed)
+    {
+        const uint32_t game_native_row0 = s_tab5_keyboard_orientation_180
+            ? (kDsiPhysHeight - (logical_x + out_w)) : logical_x;
+        uint16_t *game_native = front + (size_t)game_native_row0 * kDsiPhysStridePixels;
+        const size_t game_native_bytes =
+            (size_t)out_w * kDsiPhysStridePixels * sizeof(uint16_t);
+        if (esp_cache_msync(game_native, game_native_bytes,
+                            ESP_CACHE_MSYNC_FLAG_DIR_M2C |
+                            ESP_CACHE_MSYNC_FLAG_TYPE_DATA) != ESP_OK)
+            return false;
+        s_r34_front_cache_primed = true;
+    }
+
+    const int64_t wall0 = esp_timer_get_time();
+    std::memset(s_r41_tile_mask, 0, sizeof(s_r41_tile_mask));
+
+    /* Convert exact source-row 32px dirty masks into destination 8x8 tiles. */
+    uint32_t dy = 0u;
+    while (dy < out_h)
+    {
+        const uint32_t sy = s_aspect_ymap[dy];
+        uint32_t dy_end = dy + 1u;
+        while (dy_end < out_h && s_aspect_ymap[dy_end] == sy)
+            ++dy_end;
+
+        const uint32_t src_mask = req.managed_dirty_tiles[sy];
+        if (src_mask != 0u)
+        {
+            const uint32_t b0 = dy >> 3;
+            const uint32_t b1 = (dy_end - 1u) >> 3;
+            const uint32_t src_tiles = (req.width + 31u) >> 5;
+            const uint32_t useful_mask = (src_tiles >= 32u)
+                ? 0xffffffffu
+                : (src_tiles ? ((1u << src_tiles) - 1u) : 0u);
+            uint32_t m = (src_mask == 0xffffffffu)
+                ? useful_mask : (src_mask & useful_mask);
+
+            while (m)
+            {
+                const uint32_t bit = (uint32_t)__builtin_ctz(m);
+                m &= m - 1u;
+                const uint32_t sx0 = bit << 5;
+                const uint32_t sx1 = std::min<uint32_t>(req.width, sx0 + 32u);
+                uint32_t dx0 = 0u, dx1 = out_w;
+                r40_source_span_to_dest(req.width, out_w, sx0, sx1, &dx0, &dx1);
+                for (uint32_t b = b0; b <= b1; ++b)
+                    r41_tilemask_mark(b, dx0, dx1);
+            }
+        }
+        dy = dy_end;
+    }
+
+    uint32_t dirty_blocks = 0u;
+    for (uint32_t b = 0u; b < kR41TileRows; ++b)
+        if (r41_tilemask_any(b)) ++dirty_blocks;
+
+    ++s_aspect_dirty_frames;
+    if (!dirty_blocks)
+        return true;
+
+    std::memset(s_r40_sync_rects, 0, sizeof(s_r40_sync_rects));
+    uint32_t sync_rect_count = 0u;
+    bool sync_overflow = false;
+    uint32_t frame_runs = 0u;
+    uint32_t frame_tiles = 0u;
+    uint64_t source_pixels = 0u;
+    uint64_t preserved_pixels = 0u;
+
+    for (uint32_t b = 0u; b < kR41TileRows; ++b)
+    {
+        if (!r41_tilemask_any(b))
+            continue;
+
+        const uint32_t by = b * 8u;
+        uint32_t next_tile = 0u, t0 = 0u, t1 = 0u;
+        while (r41_next_tile_run(b, next_tile, &t0, &t1))
+        {
+            next_tile = t1;
+            const uint32_t bx0 = t0 * 8u;
+            const uint32_t bx1 = std::min<uint32_t>(out_w, t1 * 8u);
+            if (bx1 <= bx0)
+                continue;
+
+            ++frame_runs;
+            frame_tiles += t1 - t0;
+
+            /* Build one logical 8x8 tile at a time in Internal SRAM.
+             * Dirty pixels come from the immutable sparse slot. Clean pixels
+             * are preserved from the current native framebuffer so stale clean
+             * rows in the sparse slot are never read. */
+            for (uint32_t tx = bx0; tx < bx1; tx += 8u)
+            {
+                for (uint32_t j = 0u; j < 8u; ++j)
+                {
+                    const uint32_t ly = by + j;
+                    const uint32_t sy = s_aspect_ymap[ly];
+                    const uint32_t src_mask = req.managed_dirty_tiles[sy];
+                    const uint16_t *src =
+                        req.frame + (size_t)sy * req.pitch_pixels;
+                    uint16_t *packed =
+                        s_r35_pack8 + (size_t)j * out_w + tx;
+
+                    const uint32_t native_x = s_tab5_keyboard_orientation_180
+                        ? (logical_y + ly)
+                        : (kDsiPhysWidth - 1u - (logical_y + ly));
+                    for (uint32_t i = 0u; i < 8u; ++i)
+                    {
+                        const uint32_t lx = tx + i;
+                        const uint32_t sx = s_aspect_xmap[lx];
+                        const uint32_t bit = sx >> 5;
+                        const bool pixel_dirty =
+                            src_mask == 0xffffffffu ||
+                            (bit < 32u && (src_mask & (1u << bit)) != 0u);
+                        if (pixel_dirty)
+                        {
+                            packed[i] = src[sx];
+                            ++source_pixels;
+                        }
+                        else
+                        {
+                            const uint32_t native_y = s_tab5_keyboard_orientation_180
+                                ? (kDsiPhysHeight - 1u - (logical_x + lx))
+                                : (logical_x + lx);
+                            packed[i] = front[
+                                (size_t)native_y * kDsiPhysStridePixels +
+                                native_x];
+                            ++preserved_pixels;
+                        }
+                    }
+                }
+
+                r35_swrot_tile8_packed(front, s_r35_pack8, out_w,
+                                        logical_x, logical_y, tx, by);
+            }
+
+            bool merged = false;
+            for (uint32_t i = sync_rect_count; i > 0u; --i)
+            {
+                r40_dirty_rect_t &r = s_r40_sync_rects[i - 1u];
+                if (r.y1 == by && r.x0 == bx0 && r.x1 == bx1)
+                {
+                    r.y1 = (uint16_t)(by + 8u);
+                    merged = true;
+                    break;
+                }
+            }
+            if (!merged)
+            {
+                if (sync_rect_count < kR41SyncRectCap)
+                {
+                    s_r40_sync_rects[sync_rect_count++] = {
+                        (uint16_t)bx0, (uint16_t)bx1,
+                        (uint16_t)by, (uint16_t)(by + 8u)};
+                }
+                else
+                    sync_overflow = true;
+            }
+        }
+    }
+
+    const int64_t sync0 = esp_timer_get_time();
+    bool sync_ok = true;
+    if (sync_overflow)
+    {
+        sync_ok = r40_sync_front_rect(front, logical_x, logical_y,
+                                      0u, out_w, 0u, out_h);
+    }
+    else
+    {
+        for (uint32_t i = 0u; i < sync_rect_count; ++i)
+        {
+            const r40_dirty_rect_t &r = s_r40_sync_rects[i];
+            if (!r40_sync_front_rect(front, logical_x, logical_y,
+                                     r.x0, r.x1, r.y0, r.y1))
+            {
+                sync_ok = false;
+                break;
+            }
+        }
+    }
+    const uint64_t sync_us = (uint64_t)(esp_timer_get_time() - sync0);
+    if (!sync_ok)
+    {
+        s_dsi_need_full_sync = true;
+        s_r49_force_full_front = true;
+        ++s_r49_full_repaint_requests;
+        return false;
+    }
+
+    s_dsi_need_full_sync = false;
+    s_dsi_repair_pending = false;
+    s_dsi_ppa_prev_band_count = 0u;
+    s_dsi_ppa_prime_other = false;
+    s_dsi_ppa_geom_w = out_w;
+    s_dsi_ppa_geom_h = out_h;
+    s_dsi_ppa_geom_x = logical_x;
+    s_dsi_ppa_geom_y = logical_y;
+
+    /* Arm a completion fence *after* all CPU writes and cache writeback.
+     * The existing managed presenter then waits for one complete physical
+     * refresh before acknowledging this ScreenVersion. */
+    s_dsi_swap_refresh_seq =
+        __atomic_load_n(&s_dsi_refresh_seq, __ATOMIC_ACQUIRE);
+    s_dsi_swap_wait_refresh = true;
+
+    const uint64_t wall_us = (uint64_t)(esp_timer_get_time() - wall0);
+    portENTER_CRITICAL(&s_stats_mux);
+    ++s_r84_native_frames;
+    s_r84_native_tile_runs += frame_runs;
+    s_r84_native_tiles += frame_tiles;
+    s_r84_native_wall_us += wall_us;
+    s_r84_native_sync_us += sync_us;
+    s_r84_native_source_pixels += source_pixels;
+    s_r84_native_preserved_pixels += preserved_pixels;
+    portEXIT_CRITICAL(&s_stats_mux);
+    return true;
+#endif
+}
+
 static void push_snapshot(const present_request_t &req)
 {
     if (req.slot_index >= kPresentSlots)
@@ -4081,7 +4455,29 @@ static bool push_live_frame(const present_request_t &req,
         s_aspect_seen_src_w != req.width ||
         s_aspect_seen_src_h != req.height ||
         s_aspect_seen_pitch != req.pitch_pixels;
-    const bool force_full = geometry_changed || !s_aspect_dirty_frames;
+    const bool managed_map =
+        (req.mode == PRESENT_MANAGED) && (req.managed_dirty_tiles != nullptr);
+    const bool force_full = geometry_changed || !s_aspect_dirty_frames ||
+                            (req.mode == PRESENT_MANAGED && s_r74_managed_force_full_next);
+
+    const bool managed_physical_full =
+#if defined(CONFIG_IDF_TARGET_ESP32P4)
+        (req.mode == PRESENT_MANAGED) &&
+        (force_full || s_dsi_need_full_sync);
+#else
+        force_full;
+#endif
+
+    if (req.mode == PRESENT_MANAGED && req.managed_sparse &&
+        managed_physical_full) {
+        portENTER_CRITICAL(&s_stats_mux);
+        ++s_r82_slot_forcefull_rejects;
+        portEXIT_CRITICAL(&s_stats_mux);
+        return false;
+    }
+
+    if (managed_map)
+        ++s_r74_managed_map_frames;
 
     if (s_aspect_log_src_w != req.width || s_aspect_log_src_h != req.height)
     {
@@ -4108,9 +4504,27 @@ static bool push_live_frame(const present_request_t &req,
     }
 
 #if defined(CONFIG_IDF_TARGET_ESP32P4) && PX68K_TAB5_R36_DIRECT_NATIVE && PX68K_TAB5_R38_PRODUCER_EXACT_DIRTY
+    /* R57E85: managed immutable sparse path uses the proven direct-native
+     * kernel against the currently confirmed physical scanout front.
+     * R49's legacy LIVE FB0 full token is deliberately irrelevant here.
+     * Actual managed full/recovery (force_full / need_full_sync) remains PPA. */
+    if (req.mode == PRESENT_MANAGED && req.managed_sparse &&
+        !managed_physical_full && s_r32_direct_front &&
+        s_r34_selfcheck_ok && s_r35_pack8)
+    {
+        if (r84_managed_direct_native_present(
+                req, out_w, out_h, (uint32_t)x, (uint32_t)y0))
+            return true;
+
+        portENTER_CRITICAL(&s_stats_mux);
+        ++s_r84_native_fallbacks;
+        portEXIT_CRITICAL(&s_stats_mux);
+    }
+
     /* R38: producer-published exact generations eliminate all LCD-side raw
      * framebuffer compare traffic. PANIC/compat keeps the legacy path. */
-    if (!force_source_scan && s_r32_direct_front && s_r34_selfcheck_ok && s_r35_pack8 &&
+    if (req.mode != PRESENT_MANAGED &&
+        !force_source_scan && s_r32_direct_front && s_r34_selfcheck_ok && s_r35_pack8 &&
         r38_direct_native_present(req, out_w, out_h, (uint32_t)x, (uint32_t)y0,
                                   force_full, retry_count, unstable_count))
         return true;
@@ -4187,16 +4601,21 @@ static bool push_live_frame(const present_request_t &req,
          * keep the previous scaled LCD image so the exact PIE pixel diff can
          * suppress unchanged rows.  Do NOT turn the whole viewport into a
          * full refresh merely because WinDraw metadata is unavailable. */
-        const bool source_dirty = force_full || force_source_scan ||
-                                  line_writer_count(sy) != 0u ||
-                                  s_aspect_seen_generation[sy] != observed_gen;
+        const bool source_dirty = force_full ||
+                                  (managed_map
+                                       ? (req.managed_dirty_tiles[sy] != 0u)
+                                       : (force_source_scan ||
+                                          line_writer_count(sy) != 0u ||
+                                          s_aspect_seen_generation[sy] != observed_gen));
 
         if (!source_dirty)
         {
+            if (managed_map) ++s_r74_managed_rows_skipped;
             note_clean_group(dy, dy_end);
             dy = dy_end;
             continue;
         }
+        if (managed_map) ++s_r74_managed_rows_scanned;
 
         uint16_t *dst0 = live_dst_row(dy);
         uint16_t *render0 = s_aspect_line_scratch ? s_aspect_line_scratch : dst0;
@@ -4205,7 +4624,15 @@ static bool push_live_frame(const present_request_t &req,
         uint32_t stable_gen = observed_gen;
         bool stable = false;
 
-        if (force_source_scan)
+        if (managed_map)
+        {
+            /* R57E74: presenter owns an immutable snapshot. */
+            for (uint32_t dx = 0; dx < out_w; ++dx)
+                render0[dx] = src[s_aspect_xmap[dx]];
+            stable = true;
+            stable_gen = 0u;
+        }
+        else if (force_source_scan)
         {
             /* CPU0 just finished building the PANIC compat framebuffer, so
              * unlike WinDraw there is no concurrent writer to race here. */
@@ -4329,11 +4756,21 @@ static bool push_live_frame(const present_request_t &req,
     if (direct_fb && frame_dirty_rows != 0u)
     {
         const bool r9_force_full = force_full || frame_dirty_band_overflow;
-        if (!dbfb615h17r9_ppa_present(
+        const int64_t r83_ppa_t0 =
+            (req.mode == PRESENT_MANAGED) ? esp_timer_get_time() : 0;
+        const bool r83_ppa_ok = dbfb615h17r9_ppa_present(
                 s_aspect_frame, out_w, out_h,
                 (uint32_t)x, (uint32_t)y0,
                 frame_dirty_band_list, frame_dirty_band_count, r9_force_full,
-                req.mode != PRESENT_MANAGED))
+                req.mode != PRESENT_MANAGED);
+        if (r83_ppa_t0 != 0)
+        {
+            const uint64_t dt = (uint64_t)(esp_timer_get_time() - r83_ppa_t0);
+            portENTER_CRITICAL(&s_stats_mux);
+            s_r83_ppa_us += dt;
+            portEXIT_CRITICAL(&s_stats_mux);
+        }
+        if (!r83_ppa_ok)
         {
             present_ok = false;
             /* PPA/DBFB failure falls back to the proven M5GFX path on the next
@@ -4707,7 +5144,16 @@ static void video_present_task(void *)
         uint32_t live_retries = 0;
         uint32_t live_unstable = 0;
 
+        const int64_t r83_lock_t0 =
+            (req.mode == PRESENT_MANAGED) ? esp_timer_get_time() : 0;
         display_lock();
+        if (r83_lock_t0 != 0)
+        {
+            const uint64_t dt = (uint64_t)(esp_timer_get_time() - r83_lock_t0);
+            portENTER_CRITICAL(&s_stats_mux);
+            s_r83_display_lock_us += dt;
+            portEXIT_CRITICAL(&s_stats_mux);
+        }
         if ((req.mode == PRESENT_LIVE_FB || req.mode == PRESENT_LIVE_FROZEN) &&
             req.live_epoch != __atomic_load_n(&s_live_present_epoch, __ATOMIC_ACQUIRE)) {
             ++s_live_epoch_drops;
@@ -4741,12 +5187,11 @@ static void video_present_task(void *)
             s_present_started = true;
             s_force_game_redraw = false;
         }
-        /* R56d ownership boundary at the physical presenter:
-         * managed ScreenVersions are already immutable and have a dedicated
-         * low-level PPA -> Back-FB -> DSI swap transaction.  Do not enter an
-         * M5GFX startWrite/endWrite transaction around that raw-panel path and
-         * do not force FB0 current immediately before it.  UI/chrome drawing
-         * above still uses M5GFX and marks the pair for a full sync. */
+        /* R84 ownership boundary at the physical presenter:
+         * managed ScreenVersions are immutable. Steady sparse frames update
+         * pinned FB0 directly; full/recovery frames retain the proven
+         * PPA->Back-FB->swap fallback. Neither raw-panel path is wrapped in an
+         * M5GFX transaction. UI/chrome drawing above still marks full sync. */
         if (req.mode != PRESENT_LIVE_FB && req.mode != PRESENT_MANAGED)
         {
 #if defined(CONFIG_IDF_TARGET_ESP32P4)
@@ -4757,8 +5202,15 @@ static void video_present_task(void *)
         bool managed_present_ok = true;
         if (req.mode == PRESENT_MANAGED) {
 #if defined(CONFIG_IDF_TARGET_ESP32P4)
+            const int64_t r83_push_t0 = esp_timer_get_time();
             managed_present_ok = s_dsi_double_live &&
-                push_live_frame(req, &live_retries, &live_unstable, true);
+                push_live_frame(req, &live_retries, &live_unstable, false);
+            {
+                const uint64_t dt = (uint64_t)(esp_timer_get_time() - r83_push_t0);
+                portENTER_CRITICAL(&s_stats_mux);
+                s_r83_push_frame_us += dt;
+                portEXIT_CRITICAL(&s_stats_mux);
+            }
 #else
             managed_present_ok = false;
 #endif
@@ -4788,8 +5240,17 @@ static void video_present_task(void *)
              * the Back framebuffer (direct-front is bypassed above), and this
              * wait confirms that this exact swap crossed the physical DSI
              * refresh boundary before Screen Manager retires the old VISIBLE. */
+            const int64_t r83_refresh_t0 = esp_timer_get_time();
             managed_present_ok = dbfb615h17_wait_refresh();
+            {
+                const uint64_t dt = (uint64_t)(esp_timer_get_time() - r83_refresh_t0);
+                portENTER_CRITICAL(&s_stats_mux);
+                s_r83_refresh_wait_us += dt;
+                portEXIT_CRITICAL(&s_stats_mux);
+            }
         }
+        if (req.mode == PRESENT_MANAGED)
+            s_r74_managed_force_full_next = !managed_present_ok;
 #endif
         display_unlock();
 
@@ -4924,7 +5385,10 @@ static bool init_async_present(void)
         s_slots[i].pixels = static_cast<uint16_t *>(heap_caps_malloc(
             s_slot_capacity_pixels * sizeof(uint16_t),
             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-        if (!s_slots[i].pixels)
+        s_slots[i].managed_dirty_tiles = static_cast<uint32_t *>(heap_caps_calloc(
+            kTrackedLines, sizeof(uint32_t),
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (!s_slots[i].pixels || !s_slots[i].managed_dirty_tiles)
             return false;
         if (xQueueSend(s_free_slots, &i, 0) != pdTRUE)
             return false;
@@ -5091,6 +5555,17 @@ static bool init_async_present(void)
 
     ESP_LOGI(TAG,
              "PX68K_SCREEN_R56D: LCD task stack=8192; managed path bypasses M5GFX write transaction and owns raw PPA/Back-FB/swap only");
+    ESP_LOGI(TAG,
+             "PX68K_LCD_R57E74: managed immutable dirty-map ACTIVE; unchanged source rows skip scale/diff; failure forces next full repaint");
+    ESP_LOGI(TAG,
+             "PX68K_LCD_R57E82: managed immutable slot SPARSE-ROW transport ACTIVE; clean source rows are not PSRAM-copied; force-full guarded");
+    ESP_LOGI(TAG,
+             "PX68K_LCD_R57E83: managed phase attribution ACTIVE slot-copy / display-lock / push-frame / PPA / refresh-wait; behavior unchanged");
+    ESP_LOGI(TAG,
+             "PX68K_LCD_R57E84: managed sparse DIRECT-NATIVE FB0 ACTIVE; exact dirty32 -> 8x8 native stores; full/recovery stays PPA; completion waits next refresh_done");
+    ESP_LOGI(TAG,
+             "PX68K_LCD_R57E85: managed native ARM FIX ACTIVE; legacy R49 full-front token no longer gates managed path; writes follow confirmed front_idx");
+    ESP_LOGI(TAG, "PX68K_LCD_R57E92: A164 180-degree rotation-aware native/PPA mapping compiled in; inactive unless keyboard detected");
     ESP_LOGI(TAG,
              "PX68K_HOST_R56K: LCD presenter prio=3 queue-blocking + IRQ-flag touch sampling boundary-yield stack=8192");
     return true;
@@ -5376,6 +5851,25 @@ void tab5_video_set_panic_compat_enabled(int enabled)
         ESP_LOGI(TAG, "PANIC compatibility presenter armed on CPU0");
 }
 
+extern "C" void tab5_video_set_tab5_keyboard_orientation(int enabled)
+{
+    const bool want = enabled != 0;
+    if (s_tab5_keyboard_orientation_180 == want) return;
+    s_tab5_keyboard_orientation_180 = want;
+    /* Host UI uses M5GFX coordinates; managed native/PPA paths use the same
+     * orientation flag above, so both halves flip together. */
+    M5.Display.setRotation(want ? 3 : 1);
+    s_dsi_need_full_sync = true;
+    s_r49_force_full_front = true;
+    s_force_game_redraw = true;
+    std::memset(s_aspect_seen_generation, 0, sizeof(s_aspect_seen_generation));
+    ESP_LOGI(TAG,
+             "PX68K_LCD_R57E92: Tab5 Keyboard orientation %s; logical=%dx%d native mapping=%s",
+             want ? "180deg ACTIVE" : "normal",
+             M5.Display.width(), M5.Display.height(),
+             want ? "rotation3" : "rotation1");
+}
+
 void tab5_video_init(void)
 {
     auto cfg = M5.config();
@@ -5399,6 +5893,7 @@ void tab5_video_init(void)
     display_unlock();
 
     ESP_LOGI(TAG, "Display initialized: %d x %d", M5.Display.width(), M5.Display.height());
+    ESP_LOGI(TAG, "PX68K_TURBO_R57E97T: UI compiled; N/A=44.1k audio-safe, Turbo=22.05k + aggressive video bias/target30fps; button x=31 y=296 98x58");
 
     s_async_ready = init_async_present();
     if (s_async_ready)
@@ -5736,6 +6231,7 @@ int tab5_video_present_px68k_managed(const uint16_t *frame,
                                      uint32_t width,
                                      uint32_t height,
                                      uint32_t pitch_pixels,
+                                     const uint32_t *dirty_tiles32,
                                      uint64_t screen_token)
 {
     if (!frame || !width || !height || !pitch_pixels || !screen_token)
@@ -5780,22 +6276,86 @@ int tab5_video_present_px68k_managed(const uint16_t *frame,
         return 0;
     }
 
+    const int64_t r83_slot_copy_t0 = esp_timer_get_time();
     uint16_t *dst = slot.pixels;
-    if (pitch_pixels == width)
+
+    const bool geometry_submit_changed =
+        (s_r82_submit_w != width) || (s_r82_submit_h != height);
+    const bool full_snapshot =
+        !dirty_tiles32 || geometry_submit_changed || s_r74_managed_force_full_next;
+
+    uint32_t copied_rows = 0u;
+    uint32_t skipped_rows = 0u;
+    uint64_t copied_bytes = 0u;
+
+    if (full_snapshot)
     {
-        std::memcpy(dst, frame, pixels * sizeof(uint16_t));
+        if (pitch_pixels == width)
+        {
+            std::memcpy(dst, frame, pixels * sizeof(uint16_t));
+        }
+        else
+        {
+            for (uint32_t row = 0; row < height; ++row)
+            {
+                std::memcpy(dst + (size_t)row * width,
+                            frame + (size_t)row * pitch_pixels,
+                            (size_t)width * sizeof(uint16_t));
+            }
+        }
+        copied_rows = height;
+        copied_bytes = (uint64_t)width * (uint64_t)height * sizeof(uint16_t);
+        slot.managed_sparse = 0u;
+        s_r82_submit_w = width;
+        s_r82_submit_h = height;
     }
     else
     {
         for (uint32_t row = 0; row < height; ++row)
         {
-            std::memcpy(dst + (size_t)row * width,
-                        frame + (size_t)row * pitch_pixels,
-                        (size_t)width * sizeof(uint16_t));
+            if (dirty_tiles32[row] != 0u)
+            {
+                std::memcpy(dst + (size_t)row * width,
+                            frame + (size_t)row * pitch_pixels,
+                            (size_t)width * sizeof(uint16_t));
+                ++copied_rows;
+            }
+            else
+            {
+                ++skipped_rows;
+            }
         }
+        copied_bytes = (uint64_t)copied_rows * (uint64_t)width * sizeof(uint16_t);
+        slot.managed_sparse = 1u;
     }
+
+    portENTER_CRITICAL(&s_stats_mux);
+    if (full_snapshot) ++s_r82_slot_full_frames;
+    else ++s_r82_slot_sparse_frames;
+    s_r82_slot_rows_copied += copied_rows;
+    s_r82_slot_rows_skipped += skipped_rows;
+    s_r82_slot_bytes_copied += copied_bytes;
+    portEXIT_CRITICAL(&s_stats_mux);
+
     slot.width = width;
     slot.height = height;
+    if (slot.managed_dirty_tiles) {
+        if (dirty_tiles32) {
+            std::memcpy(slot.managed_dirty_tiles, dirty_tiles32,
+                        (size_t)height * sizeof(uint32_t));
+        } else {
+            const uint32_t tiles = (width + 31u) >> 5u;
+            const uint32_t full = (tiles >= 32u) ? 0xffffffffu : ((1u << tiles) - 1u);
+            for (uint32_t y = 0; y < height; ++y)
+                slot.managed_dirty_tiles[y] = full;
+        }
+    }
+    {
+        const uint64_t dt = (uint64_t)(esp_timer_get_time() - r83_slot_copy_t0);
+        portENTER_CRITICAL(&s_stats_mux);
+        s_r83_slot_copy_us += dt;
+        portEXIT_CRITICAL(&s_stats_mux);
+    }
 
     present_request_t req = {};
     req.mode = PRESENT_MANAGED;
@@ -5805,6 +6365,8 @@ int tab5_video_present_px68k_managed(const uint16_t *frame,
     req.height = height;
     req.pitch_pixels = width;
     req.live_epoch = 0u; /* immutable snapshots do not participate in LIVE epoch invalidation */
+    req.managed_dirty_tiles = slot.managed_dirty_tiles;
+    req.managed_sparse = slot.managed_sparse;
     req.screen_token = screen_token;
 
     if (xQueueSend(s_ready_requests, &req, 0) != pdTRUE)
@@ -5909,6 +6471,28 @@ void tab5_video_get_async_stats(tab5_video_async_stats_t *out)
     out->pace_skipped_slots = s_pace_skipped_slots;
     out->pace_last_interval_us = s_pace_last_interval_us;
     out->cpu0_push_total_us = s_cpu0_push_total_us;
+    out->managed_rows_scanned = s_r74_managed_rows_scanned;
+    out->managed_rows_skipped = s_r74_managed_rows_skipped;
+    out->managed_map_frames = s_r74_managed_map_frames;
+    out->managed_slot_sparse_frames = s_r82_slot_sparse_frames;
+    out->managed_slot_full_frames = s_r82_slot_full_frames;
+    out->managed_slot_rows_copied = s_r82_slot_rows_copied;
+    out->managed_slot_rows_skipped = s_r82_slot_rows_skipped;
+    out->managed_slot_forcefull_rejects = s_r82_slot_forcefull_rejects;
+    out->managed_slot_bytes_copied = s_r82_slot_bytes_copied;
+    out->managed_slot_copy_us = s_r83_slot_copy_us;
+    out->managed_display_lock_us = s_r83_display_lock_us;
+    out->managed_push_frame_us = s_r83_push_frame_us;
+    out->managed_ppa_us = s_r83_ppa_us;
+    out->managed_refresh_wait_us = s_r83_refresh_wait_us;
+    out->managed_native_frames = s_r84_native_frames;
+    out->managed_native_fallbacks = s_r84_native_fallbacks;
+    out->managed_native_tile_runs = s_r84_native_tile_runs;
+    out->managed_native_tiles = s_r84_native_tiles;
+    out->managed_native_wall_us = s_r84_native_wall_us;
+    out->managed_native_sync_us = s_r84_native_sync_us;
+    out->managed_native_source_pixels = s_r84_native_source_pixels;
+    out->managed_native_preserved_pixels = s_r84_native_preserved_pixels;
     portEXIT_CRITICAL(&s_stats_mux);
     out->queued_frames = s_ready_requests ? (uint32_t)uxQueueMessagesWaiting(s_ready_requests) : 0u;
 }

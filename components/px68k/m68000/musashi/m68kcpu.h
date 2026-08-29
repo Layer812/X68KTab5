@@ -1137,6 +1137,16 @@ static inline __attribute__((always_inline)) void tab5_data584_native_word_store
     __builtin_memcpy(p, &w, sizeof(w));
 }
 
+/* R57E70C: slice-local PC/opcode fetch cache generation.  Any guest RAM
+ * write during m68k_execute invalidates cached instruction words immediately.
+ * External/device writes occur outside m68k_execute and are covered by the
+ * generation bump at the next slice entry. */
+extern uint32_t g_tab5_fetch70c_epoch;
+static inline __attribute__((always_inline)) void tab5_fetch70c_note_ram_write(void)
+{
+    ++g_tab5_fetch70c_epoch;
+}
+
 static inline __attribute__((always_inline)) uint tab5_data584_read8_bus(uint32 bus)
 {
     if (__builtin_expect(bus < 0x00c00000u, 1))
@@ -1182,6 +1192,7 @@ static inline __attribute__((always_inline)) void tab5_data584_write8_bus(uint32
     if (__builtin_expect(bus < 0x00c00000u, 1)) {
         BusErrFlag = 0;
         MEM[bus ^ 1u] = (uint8)value;
+        tab5_fetch70c_note_ram_write();
         return;
     }
     m68k_write_memory_8(bus, value);
@@ -1192,6 +1203,7 @@ static inline __attribute__((always_inline)) void tab5_data584_write16_bus(uint3
     if (__builtin_expect(!(bus & 1u) && bus <= 0x00bffffeu, 1)) {
         BusErrFlag = 0;
         tab5_data584_native_word_store(MEM + bus, (uint32)value);
+        tab5_fetch70c_note_ram_write();
         return;
     }
     m68k_write_memory_16(bus, value);
@@ -1204,6 +1216,7 @@ static inline __attribute__((always_inline)) void tab5_data584_write32_bus(uint3
         BusErrFlag = 0;
         tab5_data584_native_word_store(MEM + bus, v >> 16);
         tab5_data584_native_word_store(MEM + bus + 2u, v);
+        tab5_fetch70c_note_ram_write();
         return;
     }
     m68k_write_memory_32(bus, value);

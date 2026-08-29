@@ -11,21 +11,21 @@
   Developed by Layer812 &nbsp;|&nbsp; Based on PX68K &nbsp;|&nbsp; 68000 core: Musashi
 </p>
 
-**X68K Tab** is a portable X68000 emulator for the M5Stack Tab5, powered by the ESP32-P4.
+**X68K Tab** is a portable X68000 emulator for the M5Stack Tab5, powered by the ESP32-P4.  
 It is based on PX68K and Musashi, but reorganized around the ESP32-P4's **two HP CPU cores plus the LP Core**, PSRAM, MIPI-DSI display, USB Host, microSD and integrated audio.
 
 It originally started with a simple idea: I wanted to play old X68000 **PANIC** data on the M5Stack Tab5, so I began building [**PanicPlayerTab5**](https://github.com/Layer812/PanicPlayerTab5).
 
 To play PANIC properly, I gradually implemented the X68000-compatible environment it needed. There was just one problem.
 
-**I didn’t actually have any PANIC data.**
+**I only had one PANIC data file.....**
 
-So, for the sake of all that **PANIC data I had yet to find**, I kept pushing the CPU, graphics, audio, I/O and memory-transfer paths further and further...
+So, for some reason(?), I kept pushing the CPU, graphics, audio, I/O and memory-transfer paths further and further **for all the PANIC data I had yet to find**...
 
 **and ended up with a multi-node cooperative X68000 emulator, with CPU1, the LP Core and CPU0 working asynchronously together.**
 
 > [!IMPORTANT]
-> Not every X68000 title is fully compatible yet. If you find a display, audio or USB compatibility problem, please report it **gently**, ideally with reproduction steps and a serial log. Issues are welcome.
+> Not every X68000 title is fully compatible yet. If you find a display, audio, input, USB or disk compatibility problem, please report it **gently**, ideally with reproduction steps and a serial log. Issues are welcome.
 
 ---
 
@@ -38,8 +38,9 @@ Open **Share Burn** in M5Burner and enter one of the Share Codes below.
 
 | Version | Share Code | Notes |
 |---|---|---|
-| **Latest / Production** | `qUbdr77ZmhX8Esgo` | **Recommended for normal use** |
-| Previous public build | `pfDbZl26Z3MsI3wP` | Previous public release / comparison |
+| **Latest / Production** | `wUgYltOEbYF7mrBn` | **Recommended for normal use** |
+| Previous public build | `qUbdr77ZmhX8Esgo` | Previous public release / comparison |
+| Older public build | `pfDbZl26Z3MsI3wP` | Kept for comparison / compatibility checks |
 | Older public build | `aFmGCMA3FSvzcW5H` | Kept for comparison / compatibility checks |
 | Legacy public build | `xX5zvurDW6xMacAK` | Older public image |
 
@@ -61,33 +62,65 @@ Demo:
 
 Useful extras:
 
+- **[M5Stack Tab5 Keyboard](https://www.switch-science.com/products/11257?srsltid=AfmBOoo04PDxT8gOg_ITsjEd6tO-oMFB7DE-c0gEf-J7O-1DS99WCCrx)**
 - USB keyboard
 - USB Joypad / Gamepad
 - USB mouse
 
-The touch UI can also be used without external input devices.
+Basic operation is also possible using only the Tab5 touch UI.
+
+---
+
+## Basic Usage
+
+1. **Flash X68K Tab with M5Burner.**  
+   Enter the Share Code `wUgYltOEbYF7mrBn` in **Share Burn** and burn X68K Tab to your Tab5.
+
+2. **Copy your X68000 disk images to a microSD card.**  
+   `XDF` / `DIM` files are used as floppy-disk images, and `HDS` files as hard-disk images. For a simple setup, place them in the root directory of the microSD card.
+
+3. **Insert the microSD card and start the Tab5.**  
+   The startup launcher scans the microSD card and lists the XDF / DIM / HDS images it finds.
+
+4. **Select what you want to boot.**
+   - XDF / DIM → boot from FDD
+   - HDS → boot from HDD
+   - A built-in Human68k Quick Boot is also available when you want to start Human68k directly.
+
+5. **Use whichever input device you prefer.**
+   - Touch UI
+   - [M5Stack Tab5 Keyboard](https://www.switch-science.com/products/11257?srsltid=AfmBOoo04PDxT8gOg_ITsjEd6tO-oMFB7DE-c0gEf-J7O-1DS99WCCrx)
+   - USB keyboard
+   - USB Joypad / Gamepad
+   - USB mouse  
+
+   For the Tab5 Keyboard, attaching it before starting the Tab5 is the most reliable setup. A USB Joypad can be used as X68000 JOY1.
+
+6. **Enable Turbo when you want more video performance.**  
+   Normal mode prioritizes audio quality and uses 44.1 kHz output. **Turbo** keeps the X68000 guest clock at 10 MHz, switches audio output to 22.05 kHz, and gives more host processing time to video, targeting up to about 30 fps of physical display updates.
+
+The integrated PANIC Player can also select and play `.PAN` data.
 
 ---
 
 ## Build 6.15 Production — Highlights
 
-Features and release-history notes are combined here. This describes the paths that remain in the current Production build rather than old experimental branches.
+This section summarizes the paths actually used by the current Production build.
 
 | Area | Production design |
 |---|---|
-| **68000** | Musashi + TCM / Internal SRAM dispatch caches + measured hot-path / inline fast paths |
+| **68000** | Musashi + TCM / Internal SRAM dispatch caches + hot-path / inline fast paths |
 | **CPU1** | Prioritizes the **X68000 guest time domain**: 68000, interrupts, timers and guest-side DMA events, decoupled from temporary host-side stalls |
-| **CPU0** | Handles final host-side work: composition, LCD, YM2151, final audio mix, USB, SD / Flash / HostFS and host UI |
+| **CPU0** | Handles final host-side work: composition, LCD, YM2151, final audio mix, USB, SD / Flash / HostFS, input and host UI |
 | **LP Core** | Async Broker for Notify / ACK / dirty / workset / metadata, with **no direct guest-memory access** |
 | **Inter-core** | no-wait / latest-wins event journal, shadow and mailbox-style pipelines |
 | **Graphics** | CPU0 compositor and GRP8 paired-page shared-scroll; PIE / XespV / PPA / DMA accelerate rendering and block processing |
 | **LCD** | Managed Double-FB + dirty-tile / partial updates + `refresh_done` synchronization + latest-frame priority |
 | **Audio** | guest-timed ADPCM on CPU1 + YM2151 / final mix on CPU0, using a vgmM5-family backend in a 44.1 kHz synthesis domain |
+| **Turbo** | Keeps the 10 MHz guest clock while using 22.05 kHz audio output and allocating more host time to video, targeting up to about 30 fps physical display updates |
 | **Storage** | microSD / Flash / HostFS, XDF / DIM / HDS, Human68k boot |
-| **Input** | USB Keyboard / Joypad / Mouse + Touch UI |
-| **PANIC** | Integrated PanicPlayer with automatic PANIC startup after Human68k boot |
-
-The many internal measurement-build names are intentionally omitted from the public README; the public release is presented simply as **Build 6.15 Production**.
+| **Input** | [M5Stack Tab5 Keyboard](https://www.switch-science.com/products/11257?srsltid=AfmBOoo04PDxT8gOg_ITsjEd6tO-oMFB7DE-c0gEf-J7O-1DS99WCCrx) / USB Keyboard / Joypad / Mouse + Touch UI |
+| **PANIC** | Integrated PanicPlayer with PANIC playback after Human68k boot |
 
 ---
 
@@ -103,7 +136,7 @@ X68K Tab does not put the entire emulator into one large synchronous loop. It se
   Keeps X68000-side time moving: 68000 execution, LSI state, interrupts, timers, guest-side DMA and ADPCM events. A central design goal is to avoid stopping guest time just because host-side work is temporarily late.
 
 - **HP CPU0 — Host Processing**  
-  Handles Tab5-side peripherals and final output: composition, LCD, FM, final audio mix, USB, SD, HostFS and touch UI.
+  Handles Tab5-side peripherals and final output: composition, LCD, FM, final audio mix, USB, SD, HostFS, Tab5 Keyboard and touch UI.
 
 - **LP Core — Async Broker**  
   Processes lightweight `Notify / ACK / dirty / workset / metadata` messages. It does not directly walk the large X68000 guest-memory space; instead it assists asynchronous coordination between the HP cores.
@@ -114,7 +147,7 @@ The key rule is simple: **temporary host-side work should not unnecessarily stop
 
 ## PANIC Player
 
-X68K Tab grew out of [PanicPlayerTab5](https://github.com/Layer812/PanicPlayerTab5).
+X68K Tab grew out of [PanicPlayerTab5](https://github.com/Layer812/PanicPlayerTab5).  
 The PANIC Player remains integrated, so `.PAN` data can be selected and played directly.
 
 If you still have old HDDs, MO disks, CD-Rs or backups containing PANIC data or even old file listings, information is very welcome.

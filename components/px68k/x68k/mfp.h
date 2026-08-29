@@ -45,10 +45,20 @@ void FASTCALL MFP_Write(uint32_t adr, uint8_t data);
  * timer-control write, reset and state load.  When no ordinary timer is active
  * there is no state change at all, so skip the cross-TU call. */
 extern uint8_t MFP_TimerActiveMask;
+/* R57E71: cache the measured steady-state MDX B/C tuple at register-write
+ * time instead of re-testing six control/reload bytes every 200-cycle slice. */
+extern uint8_t MFP_TimerFastMode;
+void FASTCALL MFP_TimerR71ExactBC(int32_t clock);
 void FASTCALL MFP_TimerSlow(int32_t clock);
 void MFP_Tab5TimerFastStats(uint32_t *exact_bc, uint32_t *fallback);
 static inline __attribute__((always_inline)) void MFP_Timer(int32_t clock)
 {
+#ifdef ESP_PLATFORM
+    if (__builtin_expect(MFP_TimerFastMode == 1u, 0)) {
+        MFP_TimerR71ExactBC(clock);
+        return;
+    }
+#endif
     if (__builtin_expect(MFP_TimerActiveMask != 0, 0))
         MFP_TimerSlow(clock);
 }

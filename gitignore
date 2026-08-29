@@ -42,7 +42,7 @@ sdkconfig.*
 *.bin
 *.hex
 *.uf2
-
+*.bak
 # ----------------------------------------------------------------------
 # X68000 user media / ROM images
 # Do not accidentally publish commercial or personally dumped software.

@@ -784,6 +784,8 @@ static int async_opm_init(int clock)
      * fallback because default C++ heap placement cannot satisfy the hard
      * "FM never in PSRAM" contract. */
     s_audio_vgm = vgmm5_ym2151_create((uint32_t)clock, 44100u);
+    if (s_audio_vgm)
+        printf("PX68K_FMBLOCK_R57E70B: render-call zero-depth specialization ACTIVE; existing 256-frame Internal scratch retained; sample/state order unchanged\n");
     if (!s_audio_vgm || !esp_ptr_internal(s_audio_vgm) || esp_ptr_external_ram(s_audio_vgm))
     {
         if (s_audio_vgm) vgmm5_ym2151_destroy(s_audio_vgm);

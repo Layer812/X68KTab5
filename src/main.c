@@ -20,6 +20,8 @@
 #include "esp_task_wdt.h"
 #include "esp_err.h"
 #include "esp_rom_sys.h"
+#include "driver/gpio.h"
+#include "driver/i2c_master.h"
 
 #include "libretro.h"
 #include "libretro/state.h"
@@ -47,8 +49,10 @@
 #include "tab5_guest_input.h"
 #include "tab5_usb_keyboard.h"
 #include "tab5_audio.h"
+#include "tab5_audio_r57e91.h"
 #include "tab5_compose.h"
 #include "tab5_screen_manager.h"
+#include "tab5_screen_r57e89.h"
 #include "tab5_guest_bus.h"
 #include "tab5_lp_broker.h"
 #include "tab5_dynarec_arena.h"
@@ -56,6 +60,721 @@
 #include "tab5_video_cpu1.h"
 
 static const char *TAG = "PX68K_TAB5";
+
+#ifndef PX68K_TAB5_RELEASE_DIAGNOSTICS
+#define PX68K_TAB5_RELEASE_DIAGNOSTICS 0
+#endif
+
+
+/* R57E95: M5Stack Tab5 Keyboard A164 ExtPort1 bridge.
+ *
+ * Protocol/key layout follows M5Stack's official A164 implementation:
+ *   - Default/production mode: Normal (REG_MODE_KEYBOARD=0)
+ *   - Normal event register: REG_KEY_EVENT=0x20
+ *   - Event byte: bit7=pressed, bits6:4=row(0..4), bits3:0=col(0..13)
+ *   - Queue-empty sentinel: 0xFF
+ *   - INT_CFG bit0 enables Normal-mode interrupt
+ *   - Matrix→HID mappings (base/Sym) are derived from the official
+ *     M5Unit-KEYBOARD UnitTab5Keyboard MIT implementation.
+ *
+ * The dedicated AUTO-selected ESP-IDF I2C controller on GPIO0/GPIO1 from
+ * R57E92B is retained because it is proven on this Tab5/M5Unified build.
+ * All A164 transactions remain on CPU0; CPU1 only consumes atomic hotkeys. */
+#define TAB5KBD_ADDR            0x6Du
+#define TAB5KBD_REG_INT_CFG     0x00u
+#define TAB5KBD_REG_INT_STAT    0x01u
+#define TAB5KBD_REG_EVENT_NUM   0x02u
+#define TAB5KBD_REG_BRIGHTNESS  0x03u
+#define TAB5KBD_REG_MODE        0x10u
+#define TAB5KBD_REG_KEY_EVENT   0x20u
+#define TAB5KBD_REG_FW_VERSION  0xFEu
+#define TAB5KBD_MODE_NORMAL     0u
+#define TAB5KBD_EVENT_EMPTY     0xFFu
+#define TAB5KBD_ROWS            5u
+#define TAB5KBD_COLS            14u
+#define TAB5KBD_KEYS            70u
+#define TAB5KBD_I2C_PORT_AUTO   ((i2c_port_num_t)-1)
+#define TAB5KBD_I2C_HZ          400000u
+#define TAB5KBD_SDA_GPIO        GPIO_NUM_0
+#define TAB5KBD_SCL_GPIO        GPIO_NUM_1
+#define TAB5KBD_INT_GPIO        GPIO_NUM_50
+
+#define TAB5KBD_KIDX_SYM        (3u * TAB5KBD_COLS + 0u)
+#define TAB5KBD_KIDX_AA         (3u * TAB5KBD_COLS + 1u)
+#define TAB5KBD_KIDX_CTRL       (4u * TAB5KBD_COLS + 0u)
+#define TAB5KBD_KIDX_ALT        (4u * TAB5KBD_COLS + 1u)
+
+typedef struct {
+    uint8_t scan;
+    uint8_t modifier;
+} tab5kbd_map_t;
+
+/* R57E105P: A164 official 5x14 key-top/Sym semantics -> native X68000 scan map.
+ * IMPORTANT: the A164 firmware's HID table is PC/US-semantic.  For example
+ * A164 Sym+';' denotes ':' and is represented in HID as SHIFT+SEMICOLON.
+ * Carrying that HID chord literally into an X68000 is WRONG: X68000 0x27 is
+ * ';' / '+' while ':' is the dedicated 0x28 key.  Therefore we first resolve
+ * the A164 physical key+Sym layer to the intended character, then emit the
+ * X68000-native scan/SHIFT combination for that character.
+ * modifier bit 0x02 means hold X68000 SHIFT while this physical key is down.
+ * R102P acquisition/priority/timing/RTQ code is intentionally untouched. */
+static const tab5kbd_map_t s_tab5kbd_map_base[TAB5KBD_KEYS] = {
+    /* row0: Esc 1 2 3 4 5 6 7 8 9 0 - + Del */
+    {0x01,0x00},{0x02,0x00},{0x03,0x00},{0x04,0x00},{0x05,0x00},{0x06,0x00},{0x07,0x00},
+    {0x08,0x00},{0x09,0x00},{0x0A,0x00},{0x0B,0x00},{0x0C,0x00},{0x27,0x02},{0x37,0x00},
+    /* row1: ` ! @ # $ % ^ & * ( ) [ ] \\ */
+    {0x1B,0x02},{0x02,0x02},{0x1B,0x00},{0x04,0x02},{0x05,0x02},{0x06,0x02},{0x0D,0x00},
+    {0x07,0x02},{0x28,0x02},{0x09,0x02},{0x0A,0x02},{0x1C,0x00},{0x29,0x00},{0x0E,0x00},
+    /* row2: Tab q w e r t y u i o p ; ' Backspace */
+    {0x10,0x00},{0x11,0x00},{0x12,0x00},{0x13,0x00},{0x14,0x00},{0x15,0x00},{0x16,0x00},
+    {0x17,0x00},{0x18,0x00},{0x19,0x00},{0x1A,0x00},{0x27,0x00},{0x08,0x02},{0x0F,0x00},
+    /* row3: Sym Aa a s d f g h j k l Up _ Enter */
+    {0x00,0x00},{0x00,0x00},{0x1E,0x00},{0x1F,0x00},{0x20,0x00},{0x21,0x00},{0x22,0x00},
+    {0x23,0x00},{0x24,0x00},{0x25,0x00},{0x26,0x00},{0x3C,0x00},{0x34,0x02},{0x1D,0x00},
+    /* row4: Ctrl Alt z x c v b n m . Left Down Right Space */
+    {0x00,0x00},{0x00,0x00},{0x2A,0x00},{0x2B,0x00},{0x2C,0x00},{0x2D,0x00},{0x2E,0x00},
+    {0x2F,0x00},{0x30,0x00},{0x32,0x00},{0x3B,0x00},{0x3E,0x00},{0x3D,0x00},{0x35,0x00},
+};
+
+static const tab5kbd_map_t s_tab5kbd_map_sym[TAB5KBD_KEYS] = {
+    /* row0: identical physical legends */
+    {0x01,0x00},{0x02,0x00},{0x03,0x00},{0x04,0x00},{0x05,0x00},{0x06,0x00},{0x07,0x00},
+    {0x08,0x00},{0x09,0x00},{0x0A,0x00},{0x0B,0x00},{0x0C,0x00},{0x27,0x02},{0x37,0x00},
+    /* row1: `->~, !->?, @, #, $, %, ^, &, *->/, (-><, )->>, [->{, ]->}, \->| */
+    {0x0D,0x02},{0x33,0x02},{0x1B,0x00},{0x04,0x02},{0x05,0x02},{0x06,0x02},{0x0D,0x00},
+    {0x07,0x02},{0x33,0x00},{0x31,0x02},{0x32,0x02},{0x1C,0x02},{0x29,0x02},{0x0E,0x02},
+    /* row2: ;->:, '->" */
+    {0x10,0x00},{0x11,0x00},{0x12,0x00},{0x13,0x00},{0x14,0x00},{0x15,0x00},{0x16,0x00},
+    {0x17,0x00},{0x18,0x00},{0x19,0x00},{0x1A,0x00},{0x28,0x00},{0x03,0x02},{0x0F,0x00},
+    /* row3: _->= */
+    {0x00,0x00},{0x00,0x00},{0x1E,0x00},{0x1F,0x00},{0x20,0x00},{0x21,0x00},{0x22,0x00},
+    {0x23,0x00},{0x24,0x00},{0x25,0x00},{0x26,0x00},{0x3C,0x00},{0x0C,0x02},{0x1D,0x00},
+    /* row4: .->, */
+    {0x00,0x00},{0x00,0x00},{0x2A,0x00},{0x2B,0x00},{0x2C,0x00},{0x2D,0x00},{0x2E,0x00},
+    {0x2F,0x00},{0x30,0x00},{0x31,0x00},{0x3B,0x00},{0x3E,0x00},{0x3D,0x00},{0x35,0x00},
+};
+
+/* R57E105P boot-time map certificate for the nine punctuation cases reported
+ * on real hardware.  This is diagnostic only; it does not touch A164 I2C,
+ * task priority, 10-ms service cadence, KEY_EVENT acquisition, or RTQ flow. */
+typedef struct {
+    uint8_t idx;
+    bool sym;
+    uint8_t scan;
+    uint8_t modifier;
+    const char *name;
+} tab5kbd_r105p_expect_t;
+
+static void tab5kbd_r105p_map_selfcheck(void)
+{
+    static const tab5kbd_r105p_expect_t expect[] = {
+        {(uint8_t)(1u * TAB5KBD_COLS + 0u), false, 0x1B, 0x02, "`"},
+        {(uint8_t)(1u * TAB5KBD_COLS + 0u), true,  0x0D, 0x02, "~"},
+        {(uint8_t)(1u * TAB5KBD_COLS + 1u), true,  0x33, 0x02, "?"},
+        {(uint8_t)(2u * TAB5KBD_COLS + 11u),true,  0x28, 0x00, ":"},
+        {(uint8_t)(2u * TAB5KBD_COLS + 12u),true,  0x03, 0x02, "\""},
+        {(uint8_t)(3u * TAB5KBD_COLS + 12u),false, 0x34, 0x02, "_"},
+        {(uint8_t)(3u * TAB5KBD_COLS + 12u),true,  0x0C, 0x02, "="},
+        {(uint8_t)(4u * TAB5KBD_COLS + 9u), true,  0x31, 0x00, ","},
+        {(uint8_t)(1u * TAB5KBD_COLS + 8u), true,  0x33, 0x00, "/"},
+    };
+    bool ok = true;
+    for (unsigned i = 0; i < sizeof(expect) / sizeof(expect[0]); ++i) {
+        const tab5kbd_r105p_expect_t *e = &expect[i];
+        const tab5kbd_map_t m = e->sym ? s_tab5kbd_map_sym[e->idx] : s_tab5kbd_map_base[e->idx];
+        if (m.scan != e->scan || m.modifier != e->modifier) {
+            ok = false;
+            ESP_LOGE(TAG,
+                     "PX68K_TAB5KBD_R57E105P_MAPFAIL char=%s idx=%u sym=%u got=%02X/%02X want=%02X/%02X",
+                     e->name, (unsigned)e->idx, e->sym ? 1u : 0u,
+                     (unsigned)m.scan, (unsigned)m.modifier,
+                     (unsigned)e->scan, (unsigned)e->modifier);
+        }
+    }
+    if (ok) {
+        ESP_LOGI(TAG,
+                 "PX68K_TAB5KBD_R57E105P_MAPCERT PASS: ` ~ ? : quote _ = , / -> X68K native scans; A164 Sym layer source-exact");
+    }
+}
+
+static volatile bool s_tab5kbd_present = false;
+static volatile bool s_tab5kbd_input_armed = false;
+static uint8_t s_tab5kbd_fw = 0u;
+static uint32_t s_tab5kbd_hotkeys = 0u;
+static uint32_t s_tab5kbd_events = 0u;
+static uint32_t s_tab5kbd_i2c_errors = 0u;
+static uint32_t s_tab5kbd_raw_events = 0u;
+static uint32_t s_tab5kbd_key_downs = 0u;
+static uint32_t s_tab5kbd_key_ups = 0u;
+static uint32_t s_tab5kbd_modifier_edges = 0u;
+static uint32_t s_tab5kbd_repeat_reports = 0u;
+static uint32_t s_tab5kbd_unmapped = 0u;
+static uint32_t s_tab5kbd_invalid_events = 0u;
+static uint32_t s_tab5kbd_trace_count = 0u;
+static uint8_t s_tab5kbd_last_raw = TAB5KBD_EVENT_EMPTY;
+static uint8_t s_tab5kbd_last_row = 0u;
+static uint8_t s_tab5kbd_last_col = 0u;
+static bool s_tab5kbd_last_pressed = false;
+static bool s_tab5kbd_pressed[TAB5KBD_KEYS];
+static int16_t s_tab5kbd_active_scan[TAB5KBD_KEYS];
+static bool s_tab5kbd_active_forced_shift[TAB5KBD_KEYS];
+static uint8_t s_tab5kbd_forced_shift_count = 0u;
+static bool s_tab5kbd_sym_down = false;
+static bool s_tab5kbd_aa_down = false;
+static bool s_tab5kbd_ctrl_down = false;
+static bool s_tab5kbd_alt_down = false;
+static bool s_tab5kbd_guest_shift_down = false;
+static TaskHandle_t s_tab5kbd_task = NULL;
+static bool s_tab5kbd_i2c_ready = false;
+static i2c_master_bus_handle_t s_tab5kbd_bus = NULL;
+static i2c_master_dev_handle_t s_tab5kbd_dev = NULL;
+static esp_err_t s_tab5kbd_last_err = ESP_OK;
+static bool s_tab5kbd_missing_logged = false;
+/* R57E97T: mirror M5Stack's current UnitTab5Keyboard lifecycle exactly:
+ * mode -> clear INT -> clear queue -> configure NEGEDGE IRQ -> enable the
+ * Normal-mode interrupt.  Runtime draining is EVENT_NUM driven, just like
+ * the official library.  A bounded health audit remains so a silent device
+ * is distinguishable from a PX68K key-mapping problem. */
+static volatile bool s_tab5kbd_irq_pending = false;
+static volatile uint32_t s_tab5kbd_irq_edges = 0u;
+static bool s_tab5kbd_irq_installed = false;
+/* R57E99K: official UnitTab5Keyboard readiness semantics.  The current
+ * M5Stack library drains when an IRQ is pending OR the active-low INT pin
+ * is still low.  Keep an unconditional 50-ms safety poll as well so shared
+ * ISR-service/edge-delivery quirks cannot make the keyboard silently dead. */
+static uint32_t s_tab5kbd_int_low_drains = 0u;
+static uint32_t s_tab5kbd_safety_polls = 0u;
+static uint32_t s_tab5kbd_r101_direct_polls = 0u;
+static uint32_t s_tab5kbd_r101_direct_hits = 0u;
+static uint32_t s_tab5kbd_r101_direct_empty = 0u;
+static uint32_t s_tab5kbd_r101_direct_trace = 0u;
+static uint32_t s_tab5kbd_count_reads = 0u;
+static uint32_t s_tab5kbd_count_nonzero = 0u;
+static uint32_t s_tab5kbd_direct_reads = 0u;
+static uint32_t s_tab5kbd_empty_reads = 0u;
+static uint32_t s_tab5kbd_count_mismatch = 0u;
+static uint32_t s_tab5kbd_probe_traces = 0u;
+static uint32_t s_tab5kbd_health_samples = 0u;
+static uint32_t s_tab5kbd_r102p_service_ticks = 0u;
+static uint32_t s_tab5kbd_r102p_gap_max_us = 0u;
+static int64_t s_tab5kbd_r102p_last_service_us = 0;
+static uint32_t s_tab5kbd_xscan_queued = 0u;
+static uint32_t s_tab5kbd_xscan_enqueue_fail = 0u;
+static uint32_t s_tab5kbd_xscan_trace = 0u;
+/* R57E100K: diagnostic-only cross-core breadcrumb. CPU0 publishes the latest
+ * A164->X68K enqueue attempt; CPU1 samples it immediately after guest_input_tick().
+ * No input timing or queue semantics are changed. */
+static uint32_t s_tab5kbd_pipe_seq_next = 0u;
+static volatile uint32_t s_tab5kbd_pipe_seq_pub = 0u;
+static volatile uint8_t s_tab5kbd_pipe_scan_pub = 0u;
+static volatile uint8_t s_tab5kbd_pipe_down_pub = 0u;
+static volatile uint8_t s_tab5kbd_pipe_enq_pub = 0u;
+static uint8_t s_tab5kbd_last_mode_reg = 0xffu;
+static uint8_t s_tab5kbd_last_intcfg_reg = 0xffu;
+static uint8_t s_tab5kbd_last_intstat_reg = 0xffu;
+static uint8_t s_tab5kbd_last_count_reg = 0xffu;
+
+static void IRAM_ATTR tab5kbd_irq_handler(void *arg)
+{
+    (void)arg;
+    s_tab5kbd_irq_pending = true;
+    ++s_tab5kbd_irq_edges;
+}
+
+extern void tab5_video_set_tab5_keyboard_orientation(int enabled);
+extern int tab5_video_turbo_enabled(void);
+/* R57E97T V2: shared 30 Hz wall-clock phase for the emulation task. */
+static int64_t r57e97_turbo_next_present_us = 0;
+
+static bool tab5kbd_i2c_init(void)
+{
+    if (s_tab5kbd_i2c_ready && s_tab5kbd_bus && s_tab5kbd_dev)
+        return true;
+
+    const i2c_master_bus_config_t bus_cfg = {
+        .i2c_port = TAB5KBD_I2C_PORT_AUTO,
+        .sda_io_num = TAB5KBD_SDA_GPIO,
+        .scl_io_num = TAB5KBD_SCL_GPIO,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .intr_priority = 0,
+        .trans_queue_depth = 0,
+        .flags = {
+            .enable_internal_pullup = true,
+            .allow_pd = false,
+        },
+    };
+
+    i2c_master_bus_handle_t bus = NULL;
+    esp_err_t e = i2c_new_master_bus(&bus_cfg, &bus);
+    if (e != ESP_OK) {
+        s_tab5kbd_last_err = e;
+        return false;
+    }
+
+    const i2c_device_config_t dev_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = TAB5KBD_ADDR,
+        .scl_speed_hz = TAB5KBD_I2C_HZ,
+        .scl_wait_us = 0,
+        .flags = {
+            .disable_ack_check = false,
+        },
+    };
+
+    i2c_master_dev_handle_t dev = NULL;
+    e = i2c_master_bus_add_device(bus, &dev_cfg, &dev);
+    if (e != ESP_OK) {
+        (void)i2c_del_master_bus(bus);
+        s_tab5kbd_last_err = e;
+        return false;
+    }
+
+    s_tab5kbd_bus = bus;
+    s_tab5kbd_dev = dev;
+    s_tab5kbd_i2c_ready = true;
+    s_tab5kbd_last_err = ESP_OK;
+
+
+    ESP_LOGI(TAG,
+             "PX68K_TAB5KBD_R57E98T: dedicated AUTO I2C ready sda=0 scl=1 addr=0x6D; IRQ setup deferred until official lifecycle stage");
+    return true;
+}
+
+static bool tab5kbd_configure_irq_pin(void)
+{
+    gpio_config_t irq = {
+        .pin_bit_mask = (1ULL << TAB5KBD_INT_GPIO),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_NEGEDGE,
+    };
+    const esp_err_t irq_cfg = gpio_config(&irq);
+    esp_err_t irq_svc = gpio_install_isr_service(0);
+    if (irq_svc == ESP_ERR_INVALID_STATE) irq_svc = ESP_OK;
+    esp_err_t irq_add = ESP_FAIL;
+    if (irq_cfg == ESP_OK && irq_svc == ESP_OK)
+        irq_add = gpio_isr_handler_add(TAB5KBD_INT_GPIO, tab5kbd_irq_handler, NULL);
+    s_tab5kbd_irq_installed = (irq_add == ESP_OK);
+    if (!s_tab5kbd_irq_installed)
+        (void)gpio_set_intr_type(TAB5KBD_INT_GPIO, GPIO_INTR_DISABLE);
+    return s_tab5kbd_irq_installed;
+}
+
+static bool tab5kbd_write_reg(uint8_t reg, uint8_t value)
+{
+    if (!tab5kbd_i2c_init()) return false;
+    const uint8_t msg[2] = { reg, value };
+    const esp_err_t e = i2c_master_transmit(s_tab5kbd_dev, msg, sizeof(msg), 20);
+    if (e != ESP_OK) {
+        s_tab5kbd_last_err = e;
+        ++s_tab5kbd_i2c_errors;
+        return false;
+    }
+    return true;
+}
+
+static bool tab5kbd_read_reg(uint8_t reg, uint8_t *dst, size_t n)
+{
+    if (!dst || !n || !tab5kbd_i2c_init()) return false;
+    const esp_err_t e = i2c_master_transmit_receive(s_tab5kbd_dev,
+                                                     &reg, 1u,
+                                                     dst, n,
+                                                     20);
+    if (e != ESP_OK) {
+        s_tab5kbd_last_err = e;
+        ++s_tab5kbd_i2c_errors;
+        return false;
+    }
+    return true;
+}
+
+static void tab5kbd_reset_state(void)
+{
+    memset(s_tab5kbd_pressed, 0, sizeof(s_tab5kbd_pressed));
+    memset(s_tab5kbd_active_forced_shift, 0, sizeof(s_tab5kbd_active_forced_shift));
+    for (unsigned i = 0; i < TAB5KBD_KEYS; ++i)
+        s_tab5kbd_active_scan[i] = -1;
+    s_tab5kbd_forced_shift_count = 0u;
+    s_tab5kbd_sym_down = false;
+    s_tab5kbd_aa_down = false;
+    s_tab5kbd_ctrl_down = false;
+    s_tab5kbd_alt_down = false;
+    s_tab5kbd_guest_shift_down = false;
+}
+
+static bool tab5kbd_detect_and_configure(void)
+{
+    if (!tab5kbd_i2c_init()) return false;
+
+    uint8_t fw = 0u;
+    esp_err_t last = ESP_FAIL;
+    for (unsigned attempt = 0; attempt < 3u; ++attempt) {
+        last = i2c_master_probe(s_tab5kbd_bus, TAB5KBD_ADDR, 20);
+        if (last == ESP_OK) break;
+        if (last == ESP_ERR_TIMEOUT || last == ESP_ERR_INVALID_STATE)
+            (void)i2c_master_bus_reset(s_tab5kbd_bus);
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    if (last == ESP_OK) {
+        for (unsigned attempt = 0; attempt < 3u; ++attempt) {
+            if (tab5kbd_read_reg(TAB5KBD_REG_FW_VERSION, &fw, 1u)) {
+                last = ESP_OK;
+                break;
+            }
+            last = s_tab5kbd_last_err;
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
+    if (last != ESP_OK) {
+        if (!s_tab5kbd_missing_logged) {
+            s_tab5kbd_missing_logged = true;
+            ESP_LOGW(TAG,
+                     "PX68K_TAB5KBD_R57E98T: A164 not detected addr=0x6D err=%s INT=%d; hotplug retry active",
+                     esp_err_to_name(last), gpio_get_level(TAB5KBD_INT_GPIO));
+        }
+        return false;
+    }
+
+    /* Current M5Unit-KEYBOARD begin() lifecycle, in the same order:
+     *  1) select Normal mode (mode switch flushes the old-mode queue/INT),
+     *  2) clear residual INT status,
+     *  3) clear the active-mode event queue,
+     *  4) configure GPIO50 falling-edge IRQ,
+     *  5) enable only the Normal-mode INT bit (startPeriodic equivalent).
+     * Do not touch brightness/RGB here; it is unrelated to keyboard scanning. */
+    uint8_t mode_before = 0xffu;
+    (void)tab5kbd_read_reg(TAB5KBD_REG_MODE, &mode_before, 1u);
+    if (!tab5kbd_write_reg(TAB5KBD_REG_MODE, TAB5KBD_MODE_NORMAL)) return false;
+    vTaskDelay(1); /* R101K: real 10-ms tick; 2ms rounded to zero at 100Hz */
+    if (!tab5kbd_write_reg(TAB5KBD_REG_INT_STAT, 0u)) return false;
+    if (!tab5kbd_write_reg(TAB5KBD_REG_EVENT_NUM, 0u)) return false;
+
+    /* gpio_install_isr_service() may already have been called by touch/USB;
+     * ESP_ERR_INVALID_STATE is the official accepted outcome. */
+    (void)tab5kbd_configure_irq_pin();
+    s_tab5kbd_irq_pending = false;
+
+    if (!tab5kbd_write_reg(TAB5KBD_REG_INT_CFG, 0x01u)) return false;
+
+    uint8_t mode_verify = 0xffu, int_verify = 0xffu;
+    uint8_t stat0 = 0xffu, cnt0 = 0xffu;
+    if (!tab5kbd_read_reg(TAB5KBD_REG_MODE, &mode_verify, 1u) || mode_verify != TAB5KBD_MODE_NORMAL ||
+        !tab5kbd_read_reg(TAB5KBD_REG_INT_CFG, &int_verify, 1u) || (int_verify & 0x01u) == 0u) {
+        ESP_LOGE(TAG,
+                 "PX68K_TAB5KBD_R57E98T: official lifecycle verify FAILED mode=0x%02X intcfg=0x%02X",
+                 (unsigned)mode_verify, (unsigned)int_verify);
+        return false;
+    }
+    (void)tab5kbd_read_reg(TAB5KBD_REG_INT_STAT, &stat0, 1u);
+    (void)tab5kbd_read_reg(TAB5KBD_REG_EVENT_NUM, &cnt0, 1u);
+
+    tab5kbd_reset_state();
+    s_tab5kbd_fw = fw;
+    s_tab5kbd_missing_logged = false;
+    s_tab5kbd_present = true;
+    s_tab5kbd_last_mode_reg = mode_verify;
+    s_tab5kbd_last_intcfg_reg = int_verify;
+    s_tab5kbd_last_intstat_reg = stat0;
+    s_tab5kbd_last_count_reg = cnt0;
+    ESP_LOGI(TAG,
+             "PX68K_TAB5KBD_R57E98T: A164 detected fw=0x%02X officialLifecycle mode %u->NORMAL intcfg=0x%02X IRQ50=%s INT=%d stat=0x%02X count=%u orientation=180deg",
+             (unsigned)fw, (unsigned)mode_before, (unsigned)int_verify,
+             s_tab5kbd_irq_installed ? "NEGEDGE" : "POLL",
+             gpio_get_level(TAB5KBD_INT_GPIO), (unsigned)stat0, (unsigned)cnt0);
+    return true;
+}
+
+/* R57E98T: A164 no longer goes through Core_Key_State/RETROK state merging.
+ * Use the same X68000 scan codes as PX68K KeyTable and the already-proven
+ * touch/software-keyboard realtime queue.  This preserves real press/release
+ * edges from the A164 Normal-mode event stream. */
+static int tab5kbd_retrok_to_x68k_scan(int rk)
+{
+    switch (rk) {
+    case RETROK_ESCAPE: return 0x01;
+    case RETROK_1: return 0x02; case RETROK_2: return 0x03; case RETROK_3: return 0x04;
+    case RETROK_4: return 0x05; case RETROK_5: return 0x06; case RETROK_6: return 0x07;
+    case RETROK_7: return 0x08; case RETROK_8: return 0x09; case RETROK_9: return 0x0a;
+    case RETROK_0: return 0x0b; case RETROK_MINUS: return 0x0c; case RETROK_EQUALS: return 0x0d;
+    case RETROK_BACKSLASH: return 0x0e; case RETROK_BACKSPACE: return 0x0f;
+    case RETROK_TAB: return 0x10;
+    case RETROK_q: return 0x11; case RETROK_w: return 0x12; case RETROK_e: return 0x13;
+    case RETROK_r: return 0x14; case RETROK_t: return 0x15; case RETROK_y: return 0x16;
+    case RETROK_u: return 0x17; case RETROK_i: return 0x18; case RETROK_o: return 0x19; case RETROK_p: return 0x1a;
+    case RETROK_BACKQUOTE: return 0x1b; case RETROK_LEFTBRACKET: return 0x1c; case RETROK_RETURN: return 0x1d;
+    case RETROK_a: return 0x1e; case RETROK_s: return 0x1f; case RETROK_d: return 0x20;
+    case RETROK_f: return 0x21; case RETROK_g: return 0x22; case RETROK_h: return 0x23;
+    case RETROK_j: return 0x24; case RETROK_k: return 0x25; case RETROK_l: return 0x26;
+    case RETROK_SEMICOLON: return 0x27; case RETROK_QUOTE: return 0x28; case RETROK_RIGHTBRACKET: return 0x29;
+    case RETROK_z: return 0x2a; case RETROK_x: return 0x2b; case RETROK_c: return 0x2c;
+    case RETROK_v: return 0x2d; case RETROK_b: return 0x2e; case RETROK_n: return 0x2f; case RETROK_m: return 0x30;
+    case RETROK_COMMA: return 0x31; case RETROK_PERIOD: return 0x32; case RETROK_SLASH: return 0x33;
+    case RETROK_SPACE: return 0x35; case RETROK_HOME: return 0x36; case RETROK_DELETE: return 0x37;
+    case RETROK_PAGEDOWN: return 0x38; case RETROK_PAGEUP: return 0x39; case RETROK_END: return 0x3a;
+    case RETROK_LEFT: return 0x3b; case RETROK_UP: return 0x3c; case RETROK_RIGHT: return 0x3d; case RETROK_DOWN: return 0x3e;
+    case RETROK_F1: return 0x63; case RETROK_F2: return 0x64; case RETROK_F3: return 0x65;
+    case RETROK_F4: return 0x66; case RETROK_F5: return 0x67; case RETROK_F6: return 0x68;
+    case RETROK_F7: return 0x69; case RETROK_F8: return 0x6a; case RETROK_F9: return 0x6b; case RETROK_F10: return 0x6c;
+    case RETROK_LSHIFT: case RETROK_RSHIFT: return 0x70;
+    case RETROK_LCTRL: case RETROK_RCTRL: return 0x71;
+    case RETROK_LALT: return 0x72; case RETROK_RALT: return 0x73;
+    default: return -1;
+    }
+}
+
+static void tab5kbd_queue_x68k_scan(uint8_t scan, bool down)
+{
+    /* R57E106P production: only the proven RT queue write remains here.
+     * R100/R105 cross-core breadcrumbs, atomics and UART trace are retired. */
+    (void)tab5_guest_input_queue_x68k_scancode(scan, down ? 1 : 0);
+}
+
+static void tab5kbd_queue_x68k_retrok(int rk, bool down)
+{
+    const int scan = tab5kbd_retrok_to_x68k_scan(rk);
+    if (scan < 0) {
+        ++s_tab5kbd_unmapped;
+        return;
+    }
+    tab5kbd_queue_x68k_scan((uint8_t)scan, down);
+}
+
+static void tab5kbd_set_guest_modifier(unsigned rk, bool *state, bool down)
+{
+    if (*state == down) return;
+    *state = down;
+    tab5kbd_queue_x68k_retrok((int)rk, down);
+    ++s_tab5kbd_modifier_edges;
+}
+
+static void tab5kbd_sync_shift(void)
+{
+    const bool want = s_tab5kbd_aa_down || (s_tab5kbd_forced_shift_count != 0u);
+    tab5kbd_set_guest_modifier(RETROK_LSHIFT, &s_tab5kbd_guest_shift_down, want);
+}
+
+static void tab5kbd_process_normal(uint8_t raw)
+{
+    ++s_tab5kbd_raw_events;
+    s_tab5kbd_last_raw = raw;
+
+    if (raw == TAB5KBD_EVENT_EMPTY)
+        return;
+
+    const bool pressed = (raw & 0x80u) != 0u;
+    const uint8_t row = (uint8_t)((raw >> 4u) & 0x07u);
+    const uint8_t col = (uint8_t)(raw & 0x0fu);
+    s_tab5kbd_last_row = row;
+    s_tab5kbd_last_col = col;
+    s_tab5kbd_last_pressed = pressed;
+
+    if (row >= TAB5KBD_ROWS || col >= TAB5KBD_COLS) {
+        ++s_tab5kbd_invalid_events;
+        return;
+    }
+
+    const uint8_t idx = (uint8_t)(row * TAB5KBD_COLS + col);
+
+    /* Official modifier positions in the 5x14 Normal-mode matrix. */
+    if (idx == TAB5KBD_KIDX_SYM) {
+        if (s_tab5kbd_pressed[idx] == pressed) { ++s_tab5kbd_repeat_reports; return; }
+        s_tab5kbd_pressed[idx] = pressed;
+        s_tab5kbd_sym_down = pressed;
+        ++s_tab5kbd_events;
+        return;
+    }
+    if (idx == TAB5KBD_KIDX_AA) {
+        if (s_tab5kbd_pressed[idx] == pressed) { ++s_tab5kbd_repeat_reports; return; }
+        s_tab5kbd_pressed[idx] = pressed;
+        s_tab5kbd_aa_down = pressed;
+        tab5kbd_sync_shift();
+        ++s_tab5kbd_events;
+        return;
+    }
+    if (idx == TAB5KBD_KIDX_CTRL) {
+        if (s_tab5kbd_pressed[idx] == pressed) { ++s_tab5kbd_repeat_reports; return; }
+        s_tab5kbd_pressed[idx] = pressed;
+        tab5kbd_set_guest_modifier(RETROK_LCTRL, &s_tab5kbd_ctrl_down, pressed);
+        ++s_tab5kbd_events;
+        return;
+    }
+    if (idx == TAB5KBD_KIDX_ALT) {
+        if (s_tab5kbd_pressed[idx] == pressed) { ++s_tab5kbd_repeat_reports; return; }
+        s_tab5kbd_pressed[idx] = pressed;
+        tab5kbd_set_guest_modifier(RETROK_LALT, &s_tab5kbd_alt_down, pressed);
+        ++s_tab5kbd_events;
+        return;
+    }
+
+    if (pressed) {
+        if (s_tab5kbd_pressed[idx]) {
+            ++s_tab5kbd_repeat_reports;
+            return;
+        }
+        s_tab5kbd_pressed[idx] = true;
+        const tab5kbd_map_t m = s_tab5kbd_sym_down ? s_tab5kbd_map_sym[idx] : s_tab5kbd_map_base[idx];
+        if (m.scan == 0u) {
+            s_tab5kbd_active_scan[idx] = -1;
+            ++s_tab5kbd_unmapped;
+            ++s_tab5kbd_events;
+            return;
+        }
+
+        const bool forced_shift = (m.modifier & 0x02u) != 0u;
+        s_tab5kbd_active_scan[idx] = (int16_t)m.scan;
+        s_tab5kbd_active_forced_shift[idx] = forced_shift;
+        if (forced_shift && s_tab5kbd_forced_shift_count != 0xffu)
+            ++s_tab5kbd_forced_shift_count;
+        tab5kbd_sync_shift();
+        tab5kbd_queue_x68k_scan(m.scan, true);
+        ++s_tab5kbd_key_downs;
+        ++s_tab5kbd_events;
+        return;
+    }
+
+    /* Release uses the exact mapping captured at press time.  This matters if
+     * Sym/Aa changed while another key was held, and it also supports genuine
+     * multi-key operation without a single-active-key shortcut. */
+    if (!s_tab5kbd_pressed[idx]) {
+        ++s_tab5kbd_repeat_reports;
+        return;
+    }
+    s_tab5kbd_pressed[idx] = false;
+    const int scan = s_tab5kbd_active_scan[idx];
+    if (scan >= 0) {
+        tab5kbd_queue_x68k_scan((uint8_t)scan, false);
+        ++s_tab5kbd_key_ups;
+    }
+    if (s_tab5kbd_active_forced_shift[idx]) {
+        s_tab5kbd_active_forced_shift[idx] = false;
+        if (s_tab5kbd_forced_shift_count != 0u)
+            --s_tab5kbd_forced_shift_count;
+    }
+    s_tab5kbd_active_scan[idx] = -1;
+    tab5kbd_sync_shift();
+    ++s_tab5kbd_events;
+}
+
+static void tab5kbd_drain_cpu0(void)
+{
+    if (!s_tab5kbd_present || !s_tab5kbd_input_armed) return;
+
+    /* Official M5Unit path: EVENT_NUM owns the drain loop.  KEY_EVENT is read
+     * only while the device reports queued events; 0xFF remains a defensive
+     * empty sentinel, not a polling mechanism. */
+    unsigned drained = 0u;
+    while (drained < 32u) {
+        uint8_t count = 0u;
+        if (!tab5kbd_read_reg(TAB5KBD_REG_EVENT_NUM, &count, 1u)) break;
+        if (count == 0u) break;
+
+        uint8_t raw = TAB5KBD_EVENT_EMPTY;
+        if (!tab5kbd_read_reg(TAB5KBD_REG_KEY_EVENT, &raw, 1u)) break;
+        if (raw == TAB5KBD_EVENT_EMPTY) {
+            break;
+        }
+        ++drained;
+        tab5kbd_process_normal(raw);
+    }
+    (void)tab5kbd_write_reg(TAB5KBD_REG_INT_STAT, 0u);
+}
+
+/* R57E101K: decisive acquisition probe/fix.  The official API exposes
+ * read_key_event() as a direct KEY_EVENT (0x20) operation with 0xFF as the
+ * empty sentinel.  Do not gate the physical event read on EVENT_NUM/IRQ.
+ * Poll KEY_EVENT once per real 10-ms CPU0 service tick and drain a bounded
+ * burst until 0xFF.  EVENT_NUM/INT remain telemetry/fallback only. */
+static void tab5kbd_r101_direct_poll_cpu0(void)
+{
+    if (!s_tab5kbd_present || !s_tab5kbd_input_armed) return;
+
+    unsigned drained = 0u;
+    bool hit = false;
+    while (drained < 32u) {
+        uint8_t raw = TAB5KBD_EVENT_EMPTY;
+        if (!tab5kbd_read_reg(TAB5KBD_REG_KEY_EVENT, &raw, 1u))
+            break;
+        if (raw == TAB5KBD_EVENT_EMPTY) {
+            break;
+        }
+
+        hit = true;
+        ++drained;
+        tab5kbd_process_normal(raw);
+    }
+
+    /* Do not hammer INT_STAT on empty polls.  Clear it only after an actual
+     * device event burst; queue data itself is consumed through KEY_EVENT. */
+    if (hit)
+        (void)tab5kbd_write_reg(TAB5KBD_REG_INT_STAT, 0u);
+}
+
+
+static void tab5kbd_cpu0_task(void *arg)
+{
+    (void)arg;
+    /* R57E102P: R101 health stopped after #2 once host RT load became active;
+     * promote bounded A164 service to priority 3 peer while preserving 10ms sleep.
+     * R57E98T: CONFIG_FREERTOS_HZ=100, so pdMS_TO_TICKS(5)==0.
+     * R97T accidentally busy-looped this prio-2 task and could starve the
+     * prio-1 app/main initialization (notably HDS/SFXVI startup).  Use one
+     * real 10-ms RTOS tick and express all periodic divisors in 10-ms units. */
+    unsigned tick10 = 0u;
+    for (;;) {
+        if (!s_tab5kbd_present) {
+            if ((tick10++ % 100u) == 0u && tab5kbd_detect_and_configure()) {
+                s_tab5kbd_input_armed = true;
+                tab5_video_set_tab5_keyboard_orientation(1);
+                ESP_LOGI(TAG, "PX68K_TAB5KBD_R57E99K: hotplug detected; official Normal-mode level-aware bridge ARMED on CPU0");
+            }
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+
+        /* R57E99K: match the official UnitTab5Keyboard readiness rule:
+         * service an IRQ edge OR an already-asserted active-low INT level.
+         * Additionally do a tiny 50-ms safety poll regardless of whether the
+         * ISR handler was installed.  At 400 kHz this is negligible traffic
+         * (20 EVENT_NUM reads/s) and prevents a shared ISR/edge miss from
+         * permanently suppressing A164 input.  The 10-ms blocking tick stays. */
+        const bool irq = __atomic_exchange_n(&s_tab5kbd_irq_pending, false, __ATOMIC_ACQ_REL);
+        const bool int_low = (gpio_get_level(TAB5KBD_INT_GPIO) == 0);
+        /* R101K primary acquisition: direct 0x20 read every real 10ms tick. */
+        tab5kbd_r101_direct_poll_cpu0();
+
+        /* Retain the count-driven path only as a secondary diagnostic/fallback.
+         * It should normally find nothing after the direct drain. */
+        if (irq || int_low)
+            tab5kbd_drain_cpu0();
+        ++tick10;
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+static bool tab5kbd_start_cpu0_task(void)
+{
+    if (s_tab5kbd_task) return true;
+    const BaseType_t ok = xTaskCreatePinnedToCore(tab5kbd_cpu0_task, "tab5_a164",
+                                                  4096, NULL, 3,
+                                                  &s_tab5kbd_task, 0);
+    if (ok != pdPASS) {
+        s_tab5kbd_task = NULL;
+        ESP_LOGE(TAG, "PX68K_TAB5KBD_R57E99K: CPU0 keyboard task create FAILED");
+        return false;
+    }
+    ESP_LOGI(TAG, "PX68K_TAB5KBD_R57E102P: CPU0 direct KEY_EVENT service READY prio=3 host-RT peer; 0x20 every 10ms; audio/speaker remain higher priority");
+    return true;
+}
+
+extern void px68k_m5spk_r57e91_reset(void);
+extern void px68k_m5spk_r57e91_get(uint32_t *qexhaust,
+                                    uint32_t *qgap_min_us,
+                                    uint32_t *qgap_max_us,
+                                    uint32_t *nodata_enter,
+                                    uint32_t *zero_dma_writes,
+                                    uint32_t *zero_dma_burst_max);
 
 #ifndef PX68K_TAB5_RELEASE_DIAGNOSTICS
 #define PX68K_TAB5_RELEASE_DIAGNOSTICS 0
@@ -282,11 +1001,9 @@ extern void WinX68k_GuestPaceGetStats(uint64_t *guest_cycles,
 extern void WinDraw_R56RPathTake(uint32_t *out, uint32_t count);
 extern void WinX68k_SetHostRenderEnabled(int enabled);
 extern void WinX68k_PerfSetSample(int enabled);
-extern void m68k_tab5_dynarec_dump(void);
-extern void m68k_tab5_cmphi617_stats(unsigned int *calls, unsigned long long *loops, unsigned int *maxbatch);
-extern void m68k_tab5_mdx619_stats(unsigned int *calls, unsigned long long *outer, unsigned long long *fixed_insn, unsigned int *maxbatch);
-extern void m68k_tab5_mdx622_stats(unsigned int *calls, unsigned long long *loops, unsigned int *maxbatch);
-extern void m68k_tab5_be01_target_snapshot(unsigned short *out_words, unsigned int max_words);
+/* R57E78: FM async stats are sampled by the one-shot recorder below. */
+extern void WinX68k_AudioAsyncGetStats(uint32_t *qdepth, uint32_t *event_drops, uint32_t *ring_overruns, uint32_t *fm_avail);
+/* R57E77: one-shot profiler getters must be declared before the recorder helper. */
 extern void WinX68k_PerfGetLast(uint32_t *frame_us,
                                 uint32_t *cpu_us,
                                 uint32_t *compose_us,
@@ -302,6 +1019,1040 @@ extern void WinX68k_PerfGetDetail543(uint32_t *mfp_us, uint32_t *rtc_us,
                                      uint32_t *edge_us, uint32_t *sched_us,
                                      uint32_t *adclk_us, uint32_t *opmclk_us,
                                      uint32_t *midi_us, uint32_t *post_us);
+extern void m68k_tab5_dynarec_dump(void);
+extern void m68k_tab5_cmphi617_stats(unsigned int *calls, unsigned long long *loops, unsigned int *maxbatch);
+extern void m68k_tab5_mdx619_stats(unsigned int *calls, unsigned long long *outer, unsigned long long *fixed_insn, unsigned int *maxbatch);
+extern void m68k_tab5_mdx622_stats(unsigned int *calls, unsigned long long *loops, unsigned int *maxbatch);
+
+/* R57E76: producer counter accessor is used by the R57E72 one-shot recorder below. */
+extern uint32_t WinX68k_AudioProducedFrames(void);
+
+/* R57E80: low-overhead governor accounting; declared before recorder helpers. */
+extern uint64_t WinX68k_GuestPaceR80WaitCycles(void);
+extern void WinX68k_GuestPaceR80ResetStats(void);
+extern void WinX68k_GuestPaceR80GetStats(uint64_t *wait_cycles,
+                                         uint64_t *requested_wait_us,
+                                         uint32_t *wait_events,
+                                         uint32_t *clamp_events,
+                                         uint64_t *discarded_lag_us,
+                                         uint32_t *max_lag_us,
+                                         uint32_t *max_lead_us,
+                                         int32_t *phase_us,
+                                         uint32_t *catchup_checks,
+                                         uint32_t *host_mhz);
+extern void WinX68k_GuestPaceR86GetStats(uint64_t *carry_start_us,
+                                         uint64_t *preserved_us,
+                                         uint64_t *repaid_us,
+                                         uint64_t *max_carry_us,
+                                         uint64_t *final_carry_us,
+                                         int64_t *effective_phase_us,
+                                         uint32_t *wait_suppressed);
+extern void WinX68k_GuestPaceR87SetAudioReserve(uint32_t effective_q);
+extern void WinX68k_GuestPaceR87GetStats(uint32_t *q_min,
+                                         uint32_t *q_max,
+                                         uint32_t *q_final,
+                                         uint32_t *recovery_allowed,
+                                         uint32_t *hold_events,
+                                         uint32_t *resume_events,
+                                         uint32_t *active_frames,
+                                         uint32_t *held_frames,
+                                         uint32_t *defer_checks,
+                                         uint32_t *repay_paused_checks,
+                                         uint64_t *deferred_lag_us);
+
+#if PX68K_TAB5_RELEASE_DIAGNOSTICS
+/* R57E72: low-overhead stutter flight recorder.
+ *
+ * This intentionally does NOT re-enable the old PERF / R57E67 periodic audit.
+ * It waits until the proven MDX620 hot block has actually executed, ignores
+ * the next 120 guest frames as warm-up, then records exactly 1200 guest-frame
+ * boundaries (~20 s at 61.45 Hz).  Nothing is printed during the measurement
+ * window.  A compact summary and the eight worst guest-frame gaps are printed
+ * only after capture is complete, so UART output cannot create the jitter that
+ * is being measured.
+ */
+#define PX68K_JIT72_WARMUP_FRAMES 120u
+#define PX68K_JIT72_CAPTURE_FRAMES 1200u
+#define PX68K_JIT72_HIST_BINS 128u  /* 0.5-ms bins; final bin is >=63.5 ms */
+#define PX68K_JIT72_SPIKES 8u
+#define PX68K_JIT79_PHASE_BINS 64u /* 2-ms bins, last is >=126 ms */
+#define PX68K_JIT80_EXEC_BINS 64u  /* 2-ms bins */
+
+typedef struct {
+    uint32_t frame;
+    uint32_t dt_us;
+    uint32_t effective_audio_q;
+    uint32_t present_interval_us;
+} tab5_jit72_spike_t;
+
+typedef struct {
+    uint8_t state; /* 0=waiting MDX, 1=warmup, 2=capture, 3=done */
+    uint32_t warm_left;
+    uint32_t sample_count;
+    uint32_t start_frame;
+    int64_t start_us;
+    int64_t prev_us;
+
+    uint64_t frame_sum_us;
+    uint32_t frame_min_us;
+    uint32_t frame_max_us;
+    uint32_t frame_hist[PX68K_JIT72_HIST_BINS];
+    uint32_t late_2ms;
+    uint32_t late_5ms;
+    uint32_t late_10ms;
+    uint32_t target_us;
+
+    uint64_t present_sum_us;
+    uint32_t present_count;
+    uint32_t present_min_us;
+    uint32_t present_max_us;
+    uint32_t present_hist[PX68K_JIT72_HIST_BINS];
+    uint32_t prev_presented;
+
+    uint32_t audio_q_min;
+    uint32_t audio_q_max;
+    uint32_t servo_frames;
+    uint32_t policy_normal;
+    uint32_t policy_guard;
+    uint32_t policy_crit;
+    uint32_t policy_recharge;
+    uint32_t rendered_guest_frames;
+    uint32_t start_under;
+    uint32_t start_low;
+    uint32_t start_empty;
+    uint32_t start_rate_changes;
+
+    uint32_t start_vdrop;
+    uint32_t start_vcoalesce;
+    uint32_t start_vskip;
+
+    uint32_t start_fm_us;
+    uint32_t start_comp_us;
+    uint32_t start_lcd_us;
+    uint32_t start_mix_us;
+    uint32_t start_spk_us;
+    uint32_t start_managed_rows_scanned;
+    uint32_t start_managed_rows_skipped;
+    uint32_t start_managed_map_frames;
+    uint32_t start_slot_sparse_frames;
+    uint32_t start_slot_full_frames;
+    uint32_t start_slot_rows_copied;
+    uint32_t start_slot_rows_skipped;
+    uint32_t start_slot_forcefull_rejects;
+    uint64_t start_slot_bytes_copied;
+    uint64_t start_slot_copy_us;
+    uint64_t start_managed_lock_us;
+    uint64_t start_managed_push_us;
+    uint64_t start_managed_ppa_us;
+    uint64_t start_managed_refresh_us;
+    uint32_t start_native_frames;
+    uint32_t start_native_fallbacks;
+    uint32_t start_native_runs;
+    uint32_t start_native_tiles;
+    uint64_t start_native_wall_us;
+    uint64_t start_native_sync_us;
+    uint64_t start_native_source_pixels;
+    uint64_t start_native_preserved_pixels;
+    uint64_t start_screen_submits;
+    uint64_t start_screen_completions;
+    uint64_t start_screen_backpressure;
+    uint64_t start_mailbox_refresh_claims;
+    uint64_t start_mailbox_buffer_swaps;
+    uint64_t start_mailbox_rescue_attempts;
+    uint64_t start_mailbox_rescue_swaps;
+    uint64_t start_mailbox_rescue_skip_busy;
+    uint64_t start_mailbox_rescue_skip_budget;
+    uint64_t start_mailbox_edge_wakes;
+    uint64_t start_mailbox_offer_suppressed;
+
+    /* R57E76 audio-flow deltas. */
+    uint32_t start_audio_produced;
+    uint32_t start_audio_submitted;
+    uint32_t start_audio_dropped;
+    uint32_t start_audio_played;
+    uint32_t start_speaker_full_waits;
+
+    /* R57E78 catch-up safety: ensure short >10-MHz debt repayment does not
+     * overflow the CPU1->CPU0 FM event/PCM transport. */
+    uint32_t start_fm_event_drops;
+    uint32_t start_fm_ring_overruns;
+    uint32_t fm_qdepth_max;
+    uint32_t fm_avail_min;
+
+    /* R57E79: partition each JIT72 guest-gap without enabling the heavy
+     * WinX68k detailed profiler:
+     *   PRE  = previous boundary -> current core entry
+     *   EXEC = WinX68k_ExecVideoProbeFrame wall time
+     *   POST = core exit -> current boundary
+     * PRE intentionally includes the remainder of the previous outer-loop
+     * host work, so PRE+EXEC+POST reconstructs the measured boundary gap. */
+    int64_t r79_prev_boundary_us;
+    int64_t r79_exec_end_us;
+    uint32_t r79_pre_cur_us;
+    uint32_t r79_exec_cur_us;
+
+    uint64_t r79_pre_sum_us;
+    uint64_t r79_exec_sum_us;
+    uint64_t r79_post_sum_us;
+    uint32_t r79_pre_min_us;
+    uint32_t r79_exec_min_us;
+    uint32_t r79_post_min_us;
+    uint32_t r79_pre_max_us;
+    uint32_t r79_exec_max_us;
+    uint32_t r79_post_max_us;
+    uint32_t r79_pre_max_frame;
+    uint32_t r79_exec_max_frame;
+    uint32_t r79_post_max_frame;
+    uint32_t r79_exec_over_target;
+    uint32_t r79_pre_hist[PX68K_JIT79_PHASE_BINS];
+    uint32_t r79_exec_hist[PX68K_JIT79_PHASE_BINS];
+    uint32_t r79_post_hist[PX68K_JIT79_PHASE_BINS];
+
+    /* R57E80: split EXEC into deliberate governor wait vs actual core work. */
+    uint32_t r80_host_mhz;
+    uint32_t r80_pace_cur_us;
+    uint32_t r80_run_cur_us;
+    uint64_t r80_pace_sum_us;
+    uint64_t r80_run_sum_us;
+    uint32_t r80_pace_min_us;
+    uint32_t r80_run_min_us;
+    uint32_t r80_pace_max_us;
+    uint32_t r80_run_max_us;
+    uint32_t r80_pace_max_frame;
+    uint32_t r80_run_max_frame;
+    uint32_t r80_pace_hist[PX68K_JIT80_EXEC_BINS];
+    uint32_t r80_run_hist[PX68K_JIT80_EXEC_BINS];
+
+    tab5_jit72_spike_t spikes[PX68K_JIT72_SPIKES];
+    uint32_t spike_count;
+} tab5_jit72_t;
+
+static tab5_jit72_t s_jit72;
+
+typedef struct {
+    uint8_t valid;
+    uint8_t render;
+    uint16_t pad;
+    uint32_t frame;
+    uint32_t core_us;
+    uint32_t cpu_us;
+    uint32_t compose_us;
+    uint32_t final_us;
+    uint32_t mfp_us;
+    uint32_t rtc_us;
+    uint32_t dma_us;
+    uint32_t sched_us;
+    uint32_t edge_us;
+    uint32_t line_us;
+    uint32_t adclk_us;
+    uint32_t opmclk_us;
+    uint32_t midi_us;
+    uint32_t input_us;
+    uint32_t soundmix_us;
+    uint32_t fdd_us;
+    uint32_t post_us;
+} tab5_r77_core_sample_t;
+
+static tab5_r77_core_sample_t s_r77_render_sample;
+static tab5_r77_core_sample_t s_r77_skip_sample;
+
+static void tab5_r77_capture_core_sample(tab5_r77_core_sample_t *d,
+                                          uint32_t frame, uint32_t render)
+{
+    uint32_t timer_us = 0, audio_timer_us = 0;
+    if (!d || d->valid)
+        return;
+
+    WinX68k_PerfGetLast(&d->core_us, &d->cpu_us, &d->compose_us, &d->final_us);
+    WinX68k_PerfGetDetail(&timer_us, &d->dma_us, &d->line_us,
+                          &audio_timer_us, &d->input_us, &d->soundmix_us,
+                          &d->fdd_us);
+    WinX68k_PerfGetDetail543(&d->mfp_us, &d->rtc_us, &d->edge_us, &d->sched_us,
+                             &d->adclk_us, &d->opmclk_us, &d->midi_us, &d->post_us);
+    d->frame = frame;
+    d->render = render ? 1u : 0u;
+    d->valid = 1u;
+}
+
+
+static inline uint32_t tab5_jit72_hist_index(uint32_t us)
+{
+    uint32_t i = us / 500u;
+    return (i < PX68K_JIT72_HIST_BINS) ? i : (PX68K_JIT72_HIST_BINS - 1u);
+}
+
+static uint32_t tab5_jit72_percentile_us(const uint32_t *hist, uint32_t count, uint32_t pct)
+{
+    if (!count) return 0u;
+    uint64_t want = ((uint64_t)count * pct + 99u) / 100u;
+    uint64_t sum = 0u;
+    for (uint32_t i = 0; i < PX68K_JIT72_HIST_BINS; ++i) {
+        sum += hist[i];
+        if (sum >= want)
+            return i * 500u + 250u;
+    }
+    return (PX68K_JIT72_HIST_BINS - 1u) * 500u;
+}
+
+static inline uint32_t tab5_jit79_phase_hist_index(uint32_t us)
+{
+    uint32_t i = us / 2000u;
+    return (i < PX68K_JIT79_PHASE_BINS) ? i : (PX68K_JIT79_PHASE_BINS - 1u);
+}
+
+static uint32_t tab5_jit79_phase_percentile_us(const uint32_t *hist,
+                                                uint32_t count,
+                                                uint32_t pct)
+{
+    if (!count) return 0u;
+    uint64_t want = ((uint64_t)count * pct + 99u) / 100u;
+    uint64_t sum = 0u;
+    for (uint32_t i = 0; i < PX68K_JIT79_PHASE_BINS; ++i) {
+        sum += hist[i];
+        if (sum >= want)
+            return i * 2000u + 1000u;
+    }
+    return (PX68K_JIT79_PHASE_BINS - 1u) * 2000u;
+}
+
+static inline void tab5_jit79_record_phase(uint32_t us, uint32_t frame,
+                                            uint64_t *sum_us,
+                                            uint32_t *min_us,
+                                            uint32_t *max_us,
+                                            uint32_t *max_frame,
+                                            uint32_t *hist)
+{
+    *sum_us += us;
+    if (us < *min_us) *min_us = us;
+    if (us > *max_us) {
+        *max_us = us;
+        *max_frame = frame;
+    }
+    ++hist[tab5_jit79_phase_hist_index(us)];
+}
+
+static void tab5_jit72_consider_spike(uint32_t frame, uint32_t dt_us,
+                                      uint32_t effective_audio_q,
+                                      uint32_t present_interval_us)
+{
+    tab5_jit72_t *p = &s_jit72;
+    uint32_t slot = 0u;
+
+    if (p->spike_count < PX68K_JIT72_SPIKES) {
+        slot = p->spike_count++;
+    } else {
+        uint32_t smallest = 0u;
+        for (uint32_t i = 1; i < PX68K_JIT72_SPIKES; ++i)
+            if (p->spikes[i].dt_us < p->spikes[smallest].dt_us)
+                smallest = i;
+        if (dt_us <= p->spikes[smallest].dt_us)
+            return;
+        slot = smallest;
+    }
+
+    p->spikes[slot].frame = frame;
+    p->spikes[slot].dt_us = dt_us;
+    p->spikes[slot].effective_audio_q = effective_audio_q;
+    p->spikes[slot].present_interval_us = present_interval_us;
+}
+
+static void tab5_jit72_sort_spikes(void)
+{
+    tab5_jit72_t *p = &s_jit72;
+    if (s_r77_render_sample.valid) {
+        const tab5_r77_core_sample_t *r = &s_r77_render_sample;
+        ESP_LOGI(TAG,
+                 "JIT77_CORE_RENDER f=%lu core=%lu cpu=%lu draw=%lu final=%lu dev{mfp=%lu rtc=%lu dma=%lu sched=%lu edge=%lu line=%lu ad=%lu opm=%lu midi=%lu input=%lu mix=%lu fdd=%lu post=%lu}",
+                 (unsigned long)r->frame, (unsigned long)r->core_us,
+                 (unsigned long)r->cpu_us, (unsigned long)r->compose_us,
+                 (unsigned long)r->final_us, (unsigned long)r->mfp_us,
+                 (unsigned long)r->rtc_us, (unsigned long)r->dma_us,
+                 (unsigned long)r->sched_us, (unsigned long)r->edge_us,
+                 (unsigned long)r->line_us, (unsigned long)r->adclk_us,
+                 (unsigned long)r->opmclk_us, (unsigned long)r->midi_us,
+                 (unsigned long)r->input_us, (unsigned long)r->soundmix_us,
+                 (unsigned long)r->fdd_us, (unsigned long)r->post_us);
+    }
+    if (s_r77_skip_sample.valid) {
+        const tab5_r77_core_sample_t *r = &s_r77_skip_sample;
+        ESP_LOGI(TAG,
+                 "JIT77_CORE_SKIP f=%lu core=%lu cpu=%lu draw=%lu final=%lu dev{mfp=%lu rtc=%lu dma=%lu sched=%lu edge=%lu line=%lu ad=%lu opm=%lu midi=%lu input=%lu mix=%lu fdd=%lu post=%lu}",
+                 (unsigned long)r->frame, (unsigned long)r->core_us,
+                 (unsigned long)r->cpu_us, (unsigned long)r->compose_us,
+                 (unsigned long)r->final_us, (unsigned long)r->mfp_us,
+                 (unsigned long)r->rtc_us, (unsigned long)r->dma_us,
+                 (unsigned long)r->sched_us, (unsigned long)r->edge_us,
+                 (unsigned long)r->line_us, (unsigned long)r->adclk_us,
+                 (unsigned long)r->opmclk_us, (unsigned long)r->midi_us,
+                 (unsigned long)r->input_us, (unsigned long)r->soundmix_us,
+                 (unsigned long)r->fdd_us, (unsigned long)r->post_us);
+    }
+
+    {
+        const uint32_t n = p->sample_count;
+        const uint32_t pre_avg = n ? (uint32_t)(p->r79_pre_sum_us / n) : 0u;
+        const uint32_t exec_avg = n ? (uint32_t)(p->r79_exec_sum_us / n) : 0u;
+        const uint32_t post_avg = n ? (uint32_t)(p->r79_post_sum_us / n) : 0u;
+        ESP_LOGI(TAG,
+                 "JIT79_PHASE n=%lu PRE{min/avg/p95/p99/max@f=%lu/%lu/%lu/%lu/%lu@%lu} EXEC{min/avg/p95/p99/max@f=%lu/%lu/%lu/%lu/%lu@%lu overTarget=%lu} POST{min/avg/p95/p99/max@f=%lu/%lu/%lu/%lu/%lu@%lu} sumAvg=%luus",
+                 (unsigned long)n,
+                 (unsigned long)((p->r79_pre_min_us == UINT32_MAX) ? 0u : p->r79_pre_min_us),
+                 (unsigned long)pre_avg,
+                 (unsigned long)tab5_jit79_phase_percentile_us(p->r79_pre_hist, n, 95u),
+                 (unsigned long)tab5_jit79_phase_percentile_us(p->r79_pre_hist, n, 99u),
+                 (unsigned long)p->r79_pre_max_us,
+                 (unsigned long)p->r79_pre_max_frame,
+                 (unsigned long)((p->r79_exec_min_us == UINT32_MAX) ? 0u : p->r79_exec_min_us),
+                 (unsigned long)exec_avg,
+                 (unsigned long)tab5_jit79_phase_percentile_us(p->r79_exec_hist, n, 95u),
+                 (unsigned long)tab5_jit79_phase_percentile_us(p->r79_exec_hist, n, 99u),
+                 (unsigned long)p->r79_exec_max_us,
+                 (unsigned long)p->r79_exec_max_frame,
+                 (unsigned long)p->r79_exec_over_target,
+                 (unsigned long)((p->r79_post_min_us == UINT32_MAX) ? 0u : p->r79_post_min_us),
+                 (unsigned long)post_avg,
+                 (unsigned long)tab5_jit79_phase_percentile_us(p->r79_post_hist, n, 95u),
+                 (unsigned long)tab5_jit79_phase_percentile_us(p->r79_post_hist, n, 99u),
+                 (unsigned long)p->r79_post_max_us,
+                 (unsigned long)p->r79_post_max_frame,
+                 (unsigned long)(pre_avg + exec_avg + post_avg));
+    }
+
+    {
+        const uint32_t n = p->sample_count;
+        const uint32_t pace_avg = n ? (uint32_t)(p->r80_pace_sum_us / n) : 0u;
+        const uint32_t run_avg = n ? (uint32_t)(p->r80_run_sum_us / n) : 0u;
+        uint64_t wait_cycles = 0u, req_wait_us = 0u, discarded_us = 0u;
+        uint32_t wait_events = 0u, clamp_events = 0u, max_lag_us = 0u;
+        uint32_t max_lead_us = 0u, catchup_checks = 0u, host_mhz = 0u;
+        int32_t phase_us = 0;
+
+        WinX68k_GuestPaceR80GetStats(&wait_cycles, &req_wait_us,
+                                     &wait_events, &clamp_events,
+                                     &discarded_us, &max_lag_us,
+                                     &max_lead_us, &phase_us,
+                                     &catchup_checks, &host_mhz);
+        const uint64_t actual_wait_us = host_mhz
+            ? ((wait_cycles + host_mhz / 2u) / host_mhz) : 0u;
+
+        ESP_LOGI(TAG,
+                 "JIT80_EXEC n=%lu RUN{min/avg/p95/p99/max@f=%lu/%lu/%lu/%lu/%lu@%lu} PACE{min/avg/p95/p99/max@f=%lu/%lu/%lu/%lu/%lu@%lu} run+paceAvg=%luus",
+                 (unsigned long)n,
+                 (unsigned long)((p->r80_run_min_us == UINT32_MAX) ? 0u : p->r80_run_min_us),
+                 (unsigned long)run_avg,
+                 (unsigned long)tab5_jit79_phase_percentile_us(p->r80_run_hist, n, 95u),
+                 (unsigned long)tab5_jit79_phase_percentile_us(p->r80_run_hist, n, 99u),
+                 (unsigned long)p->r80_run_max_us,
+                 (unsigned long)p->r80_run_max_frame,
+                 (unsigned long)((p->r80_pace_min_us == UINT32_MAX) ? 0u : p->r80_pace_min_us),
+                 (unsigned long)pace_avg,
+                 (unsigned long)tab5_jit79_phase_percentile_us(p->r80_pace_hist, n, 95u),
+                 (unsigned long)tab5_jit79_phase_percentile_us(p->r80_pace_hist, n, 99u),
+                 (unsigned long)p->r80_pace_max_us,
+                 (unsigned long)p->r80_pace_max_frame,
+                 (unsigned long)(run_avg + pace_avg));
+
+        ESP_LOGI(TAG,
+                 "JIT80_GOV wait{events=%lu requested=%lluus actual=%lluus} catchupChecks=%lu clamp=%lu discardedLag=%lluus maxLag=%luus maxLead=%luus finalPhase=%ldus host=%luMHz",
+                 (unsigned long)wait_events,
+                 (unsigned long long)req_wait_us,
+                 (unsigned long long)actual_wait_us,
+                 (unsigned long)catchup_checks,
+                 (unsigned long)clamp_events,
+                 (unsigned long long)discarded_us,
+                 (unsigned long)max_lag_us,
+                 (unsigned long)max_lead_us,
+                 (long)phase_us,
+                 (unsigned long)host_mhz);
+        uint64_t carry_start_us = 0u, preserved_us = 0u, repaid_us = 0u;
+        uint64_t max_carry_us = 0u, final_carry_us = 0u;
+        int64_t effective_phase_us = 0;
+        uint32_t wait_suppressed = 0u;
+        WinX68k_GuestPaceR86GetStats(&carry_start_us, &preserved_us,
+                                     &repaid_us, &max_carry_us,
+                                     &final_carry_us, &effective_phase_us,
+                                     &wait_suppressed);
+        ESP_LOGI(TAG,
+                 "JIT86_GOV carry{start=%lluus preserved=%lluus repaid=%lluus max=%lluus final=%lluus} effectivePhase=%lldus waitSuppressed=%lu",
+                 (unsigned long long)carry_start_us,
+                 (unsigned long long)preserved_us,
+                 (unsigned long long)repaid_us,
+                 (unsigned long long)max_carry_us,
+                 (unsigned long long)final_carry_us,
+                 (long long)effective_phase_us,
+                 (unsigned long)wait_suppressed);
+        uint32_t q_min = 0u, q_max = 0u, q_final = 0u, recovery = 0u;
+        uint32_t hold_ev = 0u, resume_ev = 0u, active_f = 0u, held_f = 0u;
+        uint32_t defer_checks = 0u, repay_paused = 0u;
+        uint64_t deferred_us = 0u;
+        WinX68k_GuestPaceR87GetStats(&q_min, &q_max, &q_final, &recovery,
+                                     &hold_ev, &resume_ev,
+                                     &active_f, &held_f,
+                                     &defer_checks, &repay_paused,
+                                     &deferred_us);
+        ESP_LOGI(TAG,
+                 "JIT87_GOV audioQ{min/max/final=%lu/%lu/%lu} recovery{active=%lu held=%lu holdEv=%lu resumeEv=%lu final=%u} defer{checks=%lu lag=%lluus repayPaused=%lu} thresholds=8192/16384",
+                 (unsigned long)q_min,
+                 (unsigned long)q_max,
+                 (unsigned long)q_final,
+                 (unsigned long)active_f,
+                 (unsigned long)held_f,
+                 (unsigned long)hold_ev,
+                 (unsigned long)resume_ev,
+                 (unsigned)recovery,
+                 (unsigned long)defer_checks,
+                 (unsigned long long)deferred_us,
+                 (unsigned long)repay_paused);
+    }
+
+    for (uint32_t i = 0; i < p->spike_count; ++i) {
+        for (uint32_t j = i + 1u; j < p->spike_count; ++j) {
+            if (p->spikes[j].dt_us > p->spikes[i].dt_us) {
+                tab5_jit72_spike_t t = p->spikes[i];
+                p->spikes[i] = p->spikes[j];
+                p->spikes[j] = t;
+            }
+        }
+    }
+}
+
+static tab5_screen_r57e89_stats_t s_jit89_screen_start;
+
+static void tab5_jit72_begin_capture(uint32_t frame)
+{
+    tab5_jit72_t *p = &s_jit72;
+    tab5_audio_stats_t a = {0};
+    tab5_video_async_stats_t v = {0};
+    tab5_compose_stats_t c = {0};
+    tab5_screen_manager_stats_t s = {0};
+    uint32_t fm_us = 0u, fm_calls = 0u, fm_frames = 0u;
+
+    memset(p, 0, sizeof(*p));
+    p->state = 2u;
+    p->start_frame = frame;
+    p->target_us = (CRTC_Regs[0x29] & 0x10) ? 18031u : 16271u;
+    p->frame_min_us = UINT32_MAX;
+    p->present_min_us = UINT32_MAX;
+    p->audio_q_min = UINT32_MAX;
+
+    tab5_audio_get_stats(&a);
+    tab5_video_get_async_stats(&v);
+    tab5_compose_get_stats(&c);
+    tab5_screen_manager_get_stats(&s);
+    OPM_AsyncWorkGet(&fm_us, &fm_calls, &fm_frames);
+
+    p->prev_presented = v.presented_frames;
+    p->start_under = a.underflow_events;
+    p->start_low = a.low_water_hits;
+    p->start_empty = a.queue_empty_events;
+    p->start_rate_changes = a.rate_changes;
+    p->start_vdrop = v.dropped_frames;
+    p->start_vcoalesce = v.pace_coalesced_frames;
+    p->start_vskip = v.pace_skipped_slots;
+    p->start_fm_us = fm_us;
+    p->start_comp_us = c.gbt65k_cpu0_work_us;
+    p->start_lcd_us = v.cpu0_push_total_us;
+    p->start_mix_us = a.cpu0_mix_work_us;
+    p->start_spk_us = a.cpu0_speaker_work_us;
+    p->start_managed_rows_scanned = v.managed_rows_scanned;
+    p->start_managed_rows_skipped = v.managed_rows_skipped;
+    p->start_managed_map_frames = v.managed_map_frames;
+    p->start_slot_sparse_frames = v.managed_slot_sparse_frames;
+    p->start_slot_full_frames = v.managed_slot_full_frames;
+    p->start_slot_rows_copied = v.managed_slot_rows_copied;
+    p->start_slot_rows_skipped = v.managed_slot_rows_skipped;
+    p->start_slot_forcefull_rejects = v.managed_slot_forcefull_rejects;
+    p->start_slot_bytes_copied = v.managed_slot_bytes_copied;
+    p->start_slot_copy_us = v.managed_slot_copy_us;
+    p->start_managed_lock_us = v.managed_display_lock_us;
+    p->start_managed_push_us = v.managed_push_frame_us;
+    p->start_managed_ppa_us = v.managed_ppa_us;
+    p->start_managed_refresh_us = v.managed_refresh_wait_us;
+    p->start_native_frames = v.managed_native_frames;
+    p->start_native_fallbacks = v.managed_native_fallbacks;
+    p->start_native_runs = v.managed_native_tile_runs;
+    p->start_native_tiles = v.managed_native_tiles;
+    p->start_native_wall_us = v.managed_native_wall_us;
+    p->start_native_sync_us = v.managed_native_sync_us;
+    p->start_native_source_pixels = v.managed_native_source_pixels;
+    p->start_native_preserved_pixels = v.managed_native_preserved_pixels;
+    p->start_screen_submits = s.present_submits;
+    p->start_screen_completions = s.present_completions;
+    p->start_screen_backpressure = s.present_backpressure;
+    p->start_mailbox_refresh_claims = s.mailbox_refresh_claims;
+    p->start_mailbox_buffer_swaps = s.mailbox_buffer_swaps;
+    p->start_mailbox_rescue_attempts = s.mailbox_rescue_attempts;
+    p->start_mailbox_rescue_swaps = s.mailbox_rescue_swaps;
+    p->start_mailbox_rescue_skip_busy = s.mailbox_rescue_skip_busy;
+    p->start_mailbox_rescue_skip_budget = s.mailbox_rescue_skip_budget;
+    p->start_mailbox_edge_wakes = s.mailbox_edge_wakes;
+    p->start_mailbox_offer_suppressed = s.mailbox_offer_suppressed;
+    p->start_audio_produced = WinX68k_AudioProducedFrames();
+    p->start_audio_submitted = a.submitted_frames;
+    p->start_audio_dropped = a.dropped_frames;
+    p->start_audio_played = a.played_frames;
+    p->start_speaker_full_waits = a.speaker_full_waits;
+    {
+        uint32_t fm_q = 0u, fm_drop = 0u, fm_over = 0u, fm_avail = 0u;
+        WinX68k_AudioAsyncGetStats(&fm_q, &fm_drop, &fm_over, &fm_avail);
+        p->start_fm_event_drops = fm_drop;
+        p->start_fm_ring_overruns = fm_over;
+        p->fm_qdepth_max = fm_q;
+        p->fm_avail_min = fm_avail;
+    }
+    tab5_screen_r57e89_get_stats(&s_jit89_screen_start);
+
+    /* Print before arming timestamps, so this UART line is outside capture. */
+    ESP_LOGI(TAG,
+             "PX68K_JITTER_R57E72 START f=%lu target=%luus window=%u frames; UART SILENT DURING CAPTURE",
+             (unsigned long)frame, (unsigned long)p->target_us,
+             (unsigned)PX68K_JIT72_CAPTURE_FRAMES);
+    tab5_audio_r57e91_reset_stats();
+    px68k_m5spk_r57e91_reset();
+    p->start_us = esp_timer_get_time();
+    p->prev_us = p->start_us;
+    p->r79_prev_boundary_us = p->start_us;
+    p->r79_exec_end_us = 0;
+    p->r79_pre_min_us = UINT32_MAX;
+    p->r79_exec_min_us = UINT32_MAX;
+    p->r79_post_min_us = UINT32_MAX;
+    p->r80_pace_min_us = UINT32_MAX;
+    p->r80_run_min_us = UINT32_MAX;
+
+    WinX68k_GuestPaceR80ResetStats();
+    WinX68k_GuestPaceR80GetStats(NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+                                 NULL, NULL, &p->r80_host_mhz);
+    if (p->r80_host_mhz == 0u)
+        p->r80_host_mhz = 360u;
+}
+
+static void tab5_jit72_finish(uint32_t frame)
+{
+    tab5_jit72_t *p = &s_jit72;
+    tab5_audio_stats_t a = {0};
+    tab5_video_async_stats_t v = {0};
+    tab5_compose_stats_t c = {0};
+    tab5_screen_manager_stats_t s = {0};
+    uint32_t fm_us = 0u, fm_calls = 0u, fm_frames = 0u;
+    const int64_t end_us = esp_timer_get_time();
+    const uint64_t wall_us = (uint64_t)(end_us - p->start_us);
+    tab5_audio_r57e91_stats_t r91a = {0};
+    uint32_t r91_m5_qexhaust = 0u, r91_m5_qgap_min = 0u, r91_m5_qgap_max = 0u;
+    uint32_t r91_m5_nodata = 0u, r91_m5_zero_dma = 0u, r91_m5_zero_burst = 0u;
+
+    /* Freeze the forensic window before any finish-time UART output. */
+    tab5_audio_r57e91_get_stats(&r91a);
+    px68k_m5spk_r57e91_get(&r91_m5_qexhaust, &r91_m5_qgap_min, &r91_m5_qgap_max,
+                            &r91_m5_nodata, &r91_m5_zero_dma, &r91_m5_zero_burst);
+
+    tab5_audio_get_stats(&a);
+    tab5_video_get_async_stats(&v);
+    tab5_compose_get_stats(&c);
+    tab5_screen_manager_get_stats(&s);
+    OPM_AsyncWorkGet(&fm_us, &fm_calls, &fm_frames);
+    tab5_jit72_sort_spikes();
+
+    const uint32_t frame_avg = p->sample_count
+        ? (uint32_t)(p->frame_sum_us / p->sample_count) : 0u;
+    const uint32_t present_avg = p->present_count
+        ? (uint32_t)(p->present_sum_us / p->present_count) : 0u;
+
+    ESP_LOGI(TAG,
+             "JIT72_FRAME n=%lu target=%luus wall=%lluus min/avg/p95/p99/max=%lu/%lu/%lu/%lu/%luus late+2/+5/+10ms=%lu/%lu/%lu",
+             (unsigned long)p->sample_count,
+             (unsigned long)p->target_us,
+             (unsigned long long)wall_us,
+             (unsigned long)((p->frame_min_us == UINT32_MAX) ? 0u : p->frame_min_us),
+             (unsigned long)frame_avg,
+             (unsigned long)tab5_jit72_percentile_us(p->frame_hist, p->sample_count, 95u),
+             (unsigned long)tab5_jit72_percentile_us(p->frame_hist, p->sample_count, 99u),
+             (unsigned long)p->frame_max_us,
+             (unsigned long)p->late_2ms,
+             (unsigned long)p->late_5ms,
+             (unsigned long)p->late_10ms);
+
+    ESP_LOGI(TAG,
+             "JIT72_PRESENT n=%lu min/avg/p95/p99/max=%lu/%lu/%lu/%lu/%luus video{drop+%lu coalesce+%lu skip+%lu q=%lu}",
+             (unsigned long)p->present_count,
+             (unsigned long)((p->present_min_us == UINT32_MAX) ? 0u : p->present_min_us),
+             (unsigned long)present_avg,
+             (unsigned long)tab5_jit72_percentile_us(p->present_hist, p->present_count, 95u),
+             (unsigned long)tab5_jit72_percentile_us(p->present_hist, p->present_count, 99u),
+             (unsigned long)p->present_max_us,
+             (unsigned long)(v.dropped_frames - p->start_vdrop),
+             (unsigned long)(v.pace_coalesced_frames - p->start_vcoalesce),
+             (unsigned long)(v.pace_skipped_slots - p->start_vskip),
+             (unsigned long)v.queued_frames);
+
+    ESP_LOGI(TAG,
+             "JIT72_AUDIO effectiveQ[min/max]=%lu/%lu now=%lu+%lu under+%lu low+%lu empty+%lu ratechg+%lu servoFrames=%lu/%lu",
+             (unsigned long)((p->audio_q_min == UINT32_MAX) ? 0u : p->audio_q_min),
+             (unsigned long)p->audio_q_max,
+             (unsigned long)a.queued_frames,
+             (unsigned long)a.speaker_queued_frames,
+             (unsigned long)(a.underflow_events - p->start_under),
+             (unsigned long)(a.low_water_hits - p->start_low),
+             (unsigned long)(a.queue_empty_events - p->start_empty),
+             (unsigned long)(a.rate_changes - p->start_rate_changes),
+             (unsigned long)p->servo_frames,
+             (unsigned long)p->sample_count);
+
+    ESP_LOGI(TAG,
+             "JIT73_POLICY normal/guard/crit=%lu/%lu/%lu recharge=%lu rendered=%lu/%lu",
+             (unsigned long)p->policy_normal,
+             (unsigned long)p->policy_guard,
+             (unsigned long)p->policy_crit,
+             (unsigned long)p->policy_recharge,
+             (unsigned long)p->rendered_guest_frames,
+             (unsigned long)p->sample_count);
+
+    ESP_LOGI(TAG,
+             "JIT72_CPU0 wall=%lluus work{FM=%lu comp=%lu LCD=%lu mix=%lu spk=%lu} NOTE=cumulative task-work deltas; tasks overlap",
+             (unsigned long long)wall_us,
+             (unsigned long)(fm_us - p->start_fm_us),
+             (unsigned long)(c.gbt65k_cpu0_work_us - p->start_comp_us),
+             (unsigned long)(v.cpu0_push_total_us - p->start_lcd_us),
+             (unsigned long)(a.cpu0_mix_work_us - p->start_mix_us),
+             (unsigned long)(a.cpu0_speaker_work_us - p->start_spk_us));
+
+    ESP_LOGI(TAG,
+             "JIT74_MANAGED rows scan/skip=%lu/%lu mapFrames=%lu screen{sub+%llu done+%llu backpressure+%llu}",
+             (unsigned long)(v.managed_rows_scanned - p->start_managed_rows_scanned),
+             (unsigned long)(v.managed_rows_skipped - p->start_managed_rows_skipped),
+             (unsigned long)(v.managed_map_frames - p->start_managed_map_frames),
+             (unsigned long long)(s.present_submits - p->start_screen_submits),
+             (unsigned long long)(s.present_completions - p->start_screen_completions),
+             (unsigned long long)(s.present_backpressure - p->start_screen_backpressure));
+
+    ESP_LOGI(TAG,
+             "JIT82_SLOT sparse/full=%lu/%lu rowsCopy/skip=%lu/%lu bytes=%llu forceFullReject=%lu",
+             (unsigned long)(v.managed_slot_sparse_frames - p->start_slot_sparse_frames),
+             (unsigned long)(v.managed_slot_full_frames - p->start_slot_full_frames),
+             (unsigned long)(v.managed_slot_rows_copied - p->start_slot_rows_copied),
+             (unsigned long)(v.managed_slot_rows_skipped - p->start_slot_rows_skipped),
+             (unsigned long long)(v.managed_slot_bytes_copied - p->start_slot_bytes_copied),
+             (unsigned long)(v.managed_slot_forcefull_rejects - p->start_slot_forcefull_rejects));
+
+    {
+        const uint64_t slot_us = v.managed_slot_copy_us - p->start_slot_copy_us;
+        const uint64_t lock_us = v.managed_display_lock_us - p->start_managed_lock_us;
+        const uint64_t push_us = v.managed_push_frame_us - p->start_managed_push_us;
+        const uint64_t ppa_us = v.managed_ppa_us - p->start_managed_ppa_us;
+        const uint64_t refresh_us = v.managed_refresh_wait_us - p->start_managed_refresh_us;
+        const uint64_t push_nonppa = (push_us >= ppa_us) ? (push_us - ppa_us) : 0u;
+        const uint32_t submits = (uint32_t)(s.present_submits - p->start_screen_submits);
+        const uint32_t done = (uint32_t)(s.present_completions - p->start_screen_completions);
+        ESP_LOGI(TAG,
+                 "JIT83_VIDEO submits=%lu done=%lu slotCopy=%lluus(avg=%lluus) presenter{lock=%lluus push=%lluus nonPPA=%lluus PPA=%lluus refreshWait=%lluus}",
+                 (unsigned long)submits,
+                 (unsigned long)done,
+                 (unsigned long long)slot_us,
+                 (unsigned long long)(submits ? slot_us / submits : 0u),
+                 (unsigned long long)lock_us,
+                 (unsigned long long)push_us,
+                 (unsigned long long)push_nonppa,
+                 (unsigned long long)ppa_us,
+                 (unsigned long long)refresh_us);
+    }
+
+    {
+        const uint32_t nf = v.managed_native_frames - p->start_native_frames;
+        const uint32_t fb = v.managed_native_fallbacks - p->start_native_fallbacks;
+        const uint32_t runs = v.managed_native_tile_runs - p->start_native_runs;
+        const uint32_t tiles = v.managed_native_tiles - p->start_native_tiles;
+        const uint64_t wall = v.managed_native_wall_us - p->start_native_wall_us;
+        const uint64_t sync = v.managed_native_sync_us - p->start_native_sync_us;
+        const uint64_t srcpx = v.managed_native_source_pixels - p->start_native_source_pixels;
+        const uint64_t keeppx = v.managed_native_preserved_pixels - p->start_native_preserved_pixels;
+        ESP_LOGI(TAG,
+                 "JIT84_NATIVE frames=%lu fallback=%lu runs=%lu tiles=%lu wall=%lluus(avg=%lluus) sync=%lluus sourcePix=%llu preservePix=%llu",
+                 (unsigned long)nf,
+                 (unsigned long)fb,
+                 (unsigned long)runs,
+                 (unsigned long)tiles,
+                 (unsigned long long)wall,
+                 (unsigned long long)(nf ? wall / nf : 0u),
+                 (unsigned long long)sync,
+                 (unsigned long long)srcpx,
+                 (unsigned long long)keeppx);
+    }
+
+    ESP_LOGI(TAG,
+             "JIT75_MAILBOX claims+%llu swaps+%llu rescue{try+%llu ok+%llu busy+%llu budget+%llu} edge+%llu offerSupp+%llu final{limit=%lu reserve=%lu}",
+             (unsigned long long)(s.mailbox_refresh_claims - p->start_mailbox_refresh_claims),
+             (unsigned long long)(s.mailbox_buffer_swaps - p->start_mailbox_buffer_swaps),
+             (unsigned long long)(s.mailbox_rescue_attempts - p->start_mailbox_rescue_attempts),
+             (unsigned long long)(s.mailbox_rescue_swaps - p->start_mailbox_rescue_swaps),
+             (unsigned long long)(s.mailbox_rescue_skip_busy - p->start_mailbox_rescue_skip_busy),
+             (unsigned long long)(s.mailbox_rescue_skip_budget - p->start_mailbox_rescue_skip_budget),
+             (unsigned long long)(s.mailbox_edge_wakes - p->start_mailbox_edge_wakes),
+             (unsigned long long)(s.mailbox_offer_suppressed - p->start_mailbox_offer_suppressed),
+             (unsigned long)s.mailbox_rescue_limit,
+             (unsigned long)s.audio_reserve_frames);
+
+    {
+        const uint32_t produced = WinX68k_AudioProducedFrames() - p->start_audio_produced;
+        const uint32_t submitted = a.submitted_frames - p->start_audio_submitted;
+        const uint32_t dropped = a.dropped_frames - p->start_audio_dropped;
+        const uint32_t played = a.played_frames - p->start_audio_played;
+        const uint32_t prod_hz = wall_us
+            ? (uint32_t)(((uint64_t)produced * 1000000ULL) / wall_us) : 0u;
+        const uint32_t submit_hz = wall_us
+            ? (uint32_t)(((uint64_t)submitted * 1000000ULL) / wall_us) : 0u;
+        const uint32_t play_hz = wall_us
+            ? (uint32_t)(((uint64_t)played * 1000000ULL) / wall_us) : 0u;
+        ESP_LOGI(TAG,
+                 "JIT76_AUDIOFLOW produced=%lu(%luHz) submitted=%lu(%luHz) dropped+%lu played=%lu(%luHz) speakerFullWait+%lu chunk=512 slots=2",
+                 (unsigned long)produced, (unsigned long)prod_hz,
+                 (unsigned long)submitted, (unsigned long)submit_hz,
+                 (unsigned long)dropped,
+                 (unsigned long)played, (unsigned long)play_hz,
+                 (unsigned long)(a.speaker_full_waits - p->start_speaker_full_waits));
+    }
+    {
+        uint32_t fm_q = 0u, fm_drop = 0u, fm_over = 0u, fm_avail = 0u;
+        WinX68k_AudioAsyncGetStats(&fm_q, &fm_drop, &fm_over, &fm_avail);
+        ESP_LOGI(TAG,
+                 "JIT78_CATCHUP debtCap=500000us FM{qMax=%lu availMin=%lu eventDrop+%lu ringOverrun+%lu finalQ=%lu finalAvail=%lu}",
+                 (unsigned long)p->fm_qdepth_max,
+                 (unsigned long)p->fm_avail_min,
+                 (unsigned long)(fm_drop - p->start_fm_event_drops),
+                 (unsigned long)(fm_over - p->start_fm_ring_overruns),
+                 (unsigned long)fm_q,
+                 (unsigned long)fm_avail);
+    }
+
+    ESP_LOGI(TAG,
+             "JIT94_AUDIOFORENSIC outpcmFullScan=RETIRED submit/M5=ACTIVE; boundary endpoints only");
+
+    ESP_LOGI(TAG,
+             "JIT99_KBD present=%u armed=%u mode=NORMAL raw=%lu down/up=%lu/%lu xscan=%lu modEdge=%lu repeat=%lu unmapped=%lu invalid=%lu i2cErr=%lu io{irq=%lu levelLow=%lu poll=%lu count=%lu nz=%lu keyRead=%lu empty=%lu mismatch=%lu health=%lu} regs{mode=0x%02X cfg=0x%02X stat=0x%02X count=%u} last{raw=0x%02X row=%u col=%u press=%u} state{sym=%u aa=%u ctrl=%u alt=%u shift=%u forced=%u}",
+             s_tab5kbd_present ? 1u : 0u,
+             s_tab5kbd_input_armed ? 1u : 0u,
+             (unsigned long)s_tab5kbd_raw_events,
+             (unsigned long)s_tab5kbd_key_downs,
+             (unsigned long)s_tab5kbd_key_ups,
+             (unsigned long)s_tab5kbd_xscan_queued,
+             (unsigned long)s_tab5kbd_modifier_edges,
+             (unsigned long)s_tab5kbd_repeat_reports,
+             (unsigned long)s_tab5kbd_unmapped,
+             (unsigned long)s_tab5kbd_invalid_events,
+             (unsigned long)s_tab5kbd_i2c_errors,
+             (unsigned long)s_tab5kbd_irq_edges,
+             (unsigned long)s_tab5kbd_int_low_drains,
+             (unsigned long)s_tab5kbd_safety_polls,
+             (unsigned long)s_tab5kbd_count_reads,
+             (unsigned long)s_tab5kbd_count_nonzero,
+             (unsigned long)s_tab5kbd_direct_reads,
+             (unsigned long)s_tab5kbd_empty_reads,
+             (unsigned long)s_tab5kbd_count_mismatch,
+             (unsigned long)s_tab5kbd_health_samples,
+             (unsigned)s_tab5kbd_last_mode_reg,
+             (unsigned)s_tab5kbd_last_intcfg_reg,
+             (unsigned)s_tab5kbd_last_intstat_reg,
+             (unsigned)s_tab5kbd_last_count_reg,
+             (unsigned)s_tab5kbd_last_raw,
+             (unsigned)s_tab5kbd_last_row,
+             (unsigned)s_tab5kbd_last_col,
+             s_tab5kbd_last_pressed ? 1u : 0u,
+             s_tab5kbd_sym_down ? 1u : 0u,
+             s_tab5kbd_aa_down ? 1u : 0u,
+             s_tab5kbd_ctrl_down ? 1u : 0u,
+             s_tab5kbd_alt_down ? 1u : 0u,
+             s_tab5kbd_guest_shift_down ? 1u : 0u,
+             (unsigned)s_tab5kbd_forced_shift_count);
+
+    ESP_LOGI(TAG,
+             "JIT91_SUBMIT count=%lu gapMin/Max=%lu/%luus gapGT{15/20/30ms=%lu/%lu/%lu} zeroQ=%lu boundaryMax=%lu@%lu ringAfter[min/max]=%lu/%lu",
+             (unsigned long)r91a.submit_count,
+             (unsigned long)r91a.submit_gap_min_us,
+             (unsigned long)r91a.submit_gap_max_us,
+             (unsigned long)r91a.submit_gap_gt15ms,
+             (unsigned long)r91a.submit_gap_gt20ms,
+             (unsigned long)r91a.submit_gap_gt30ms,
+             (unsigned long)r91a.submit_zeroq_refill,
+             (unsigned long)r91a.submit_boundary_max,
+             (unsigned long)r91a.submit_boundary_max_frame,
+             (unsigned long)r91a.submit_ring_min,
+             (unsigned long)r91a.submit_ring_max);
+
+    ESP_LOGI(TAG,
+             "JIT91_M5 qExhaust=%lu qGapMin/Max=%lu/%lums nodataEnter=%lu zeroDMA{writes=%lu burstMax=%lu} NOTE=zeroDMA is M5Unified internal zero-fill, below Tab5 host-ring counters",
+             (unsigned long)r91_m5_qexhaust,
+             (unsigned long)(r91_m5_qgap_min / 1000u),
+             (unsigned long)(r91_m5_qgap_max / 1000u),
+             (unsigned long)r91_m5_nodata,
+             (unsigned long)r91_m5_zero_dma,
+             (unsigned long)r91_m5_zero_burst);
+
+    for (uint32_t i = 0; i < TAB5_AUDIO_R57E91_TOP; ++i) {
+        const tab5_audio_r57e91_submit_event_t *e = &r91a.submit_top[i];
+        if (!e->gap_us) break;
+        ESP_LOGI(TAG,
+                 "JIT91_SUBMIT_EVT #%lu pos=%lu(~%lums) gap=%luus ringAfter=%lu speakerQ=%lu boundaryJump=%lu",
+                 (unsigned long)(i + 1u),
+                 (unsigned long)e->frame_pos,
+                 (unsigned long)(((uint64_t)e->frame_pos * 1000ULL) / 44100ULL),
+                 (unsigned long)e->gap_us,
+                 (unsigned long)e->ring_after_take,
+                 (unsigned long)e->speaker_queue_before,
+                 (unsigned long)e->boundary_jump);
+    }
+
+    {
+        tab5_screen_r57e89_stats_t z={0}; tab5_screen_r57e89_get_stats(&z);
+#define D89(f) ((unsigned long long)(z.f-s_jit89_screen_start.f))
+        ESP_LOGI(TAG,"JIT89_LIVE frameReq/cons=%llu/%llu presentOpp/cons=%llu/%llu seal{armed=%llu reject=%llu try=%llu blockPend=%llu blockRetry=%llu blockReset=%llu noChange=%llu epochDrop=%llu}",D89(frame_requests),D89(frame_consumed),D89(present_opportunities),D89(present_consumed),D89(seal_armed),D89(seal_arm_rejected),D89(seal_tries),D89(seal_block_pending),D89(seal_block_retry),D89(seal_block_reset),D89(seal_nochange),D89(seal_epoch_drop));
+        ESP_LOGI(TAG,"JIT89_FLOW mailbox{post=%llu dup=%llu supp=%llu edge=%llu swap=%llu claim=%llu rescue=%llu/%llu busy=%llu budget=%llu} presenter{call=%llu reject=%llu displayOK=%llu fail=%llu} final{pending=%lu retry=%lu seal=%lu admission=%lu}",D89(mailbox_posts),D89(mailbox_duplicates),D89(mailbox_offer_suppressed),D89(mailbox_edges),D89(mailbox_swaps),D89(mailbox_claims),D89(rescue_try),D89(rescue_ok),D89(rescue_busy),D89(rescue_budget),D89(presenter_calls),D89(presenter_rejects),D89(display_ok),D89(display_fail),(unsigned long)z.pending_tickets,(unsigned long)z.retry_debt,(unsigned long)z.seal_requested,(unsigned long)z.admission_open);
+#undef D89
+    }
+
+    for (uint32_t i = 0; i < p->spike_count; ++i) {
+        ESP_LOGI(TAG,
+                 "JIT72_SPIKE #%lu f=%lu guestGap=%luus effectiveQ=%lu presentInterval=%luus",
+                 (unsigned long)(i + 1u),
+                 (unsigned long)p->spikes[i].frame,
+                 (unsigned long)p->spikes[i].dt_us,
+                 (unsigned long)p->spikes[i].effective_audio_q,
+                 (unsigned long)p->spikes[i].present_interval_us);
+    }
+
+    ESP_LOGI(TAG,
+             "PX68K_JITTER_R57E72 DONE f=%lu; recorder stopped, no further runtime telemetry",
+             (unsigned long)frame);
+    p->state = 3u;
+}
+
+static void tab5_jit72_frame_boundary(uint32_t frame, uint32_t policy_mode,
+                                      uint32_t recharge, uint32_t rendered)
+{
+    tab5_jit72_t *p = &s_jit72;
+
+    if (p->state == 3u)
+        return;
+
+    if (p->state == 0u) {
+        unsigned int mdx_calls = 0u, mdx_max = 0u;
+        unsigned long long mdx_outer = 0u, mdx_insn = 0u;
+        m68k_tab5_mdx619_stats(&mdx_calls, &mdx_outer, &mdx_insn, &mdx_max);
+        if (mdx_calls != 0u) {
+            p->state = 1u;
+            p->warm_left = PX68K_JIT72_WARMUP_FRAMES;
+        }
+        return;
+    }
+
+    if (p->state == 1u) {
+        if (p->warm_left != 0u) {
+            --p->warm_left;
+            return;
+        }
+        tab5_jit72_begin_capture(frame);
+        return;
+    }
+
+    if (p->state != 2u)
+        return;
+
+    if (policy_mode == 0u) ++p->policy_normal;
+    else if (policy_mode == 1u) ++p->policy_guard;
+    else ++p->policy_crit;
+    if (recharge) ++p->policy_recharge;
+    if (rendered) ++p->rendered_guest_frames;
+
+    const int64_t now_us = esp_timer_get_time();
+    uint32_t dt_us = (uint32_t)(now_us - p->prev_us);
+    p->prev_us = now_us;
+
+    {
+        const uint32_t pre_us = p->r79_pre_cur_us;
+        const uint32_t exec_us = p->r79_exec_cur_us;
+        uint32_t post_us = 0u;
+        if (p->r79_exec_end_us != 0 && now_us > p->r79_exec_end_us)
+            post_us = (uint32_t)(now_us - p->r79_exec_end_us);
+
+        tab5_jit79_record_phase(pre_us, frame,
+                                &p->r79_pre_sum_us, &p->r79_pre_min_us,
+                                &p->r79_pre_max_us, &p->r79_pre_max_frame,
+                                p->r79_pre_hist);
+        tab5_jit79_record_phase(exec_us, frame,
+                                &p->r79_exec_sum_us, &p->r79_exec_min_us,
+                                &p->r79_exec_max_us, &p->r79_exec_max_frame,
+                                p->r79_exec_hist);
+        tab5_jit79_record_phase(post_us, frame,
+                                &p->r79_post_sum_us, &p->r79_post_min_us,
+                                &p->r79_post_max_us, &p->r79_post_max_frame,
+                                p->r79_post_hist);
+        if (exec_us > p->target_us)
+            ++p->r79_exec_over_target;
+
+        {
+            const uint32_t pace_us = p->r80_pace_cur_us;
+            const uint32_t run_us = p->r80_run_cur_us;
+            tab5_jit79_record_phase(pace_us, frame,
+                                    &p->r80_pace_sum_us, &p->r80_pace_min_us,
+                                    &p->r80_pace_max_us, &p->r80_pace_max_frame,
+                                    p->r80_pace_hist);
+            tab5_jit79_record_phase(run_us, frame,
+                                    &p->r80_run_sum_us, &p->r80_run_min_us,
+                                    &p->r80_run_max_us, &p->r80_run_max_frame,
+                                    p->r80_run_hist);
+        }
+
+        p->r79_prev_boundary_us = now_us;
+        p->r79_exec_end_us = 0;
+        p->r79_pre_cur_us = 0u;
+        p->r79_exec_cur_us = 0u;
+        p->r80_pace_cur_us = 0u;
+        p->r80_run_cur_us = 0u;
+    }
+
+    tab5_audio_stats_t a = {0};
+    tab5_video_async_stats_t v = {0};
+    tab5_audio_get_stats(&a);
+    tab5_video_get_async_stats(&v);
+
+    const uint32_t effective_q = a.queued_frames + a.speaker_queued_frames;
+    {
+        uint32_t fm_q = 0u, fm_drop = 0u, fm_over = 0u, fm_avail = 0u;
+        WinX68k_AudioAsyncGetStats(&fm_q, &fm_drop, &fm_over, &fm_avail);
+        if (fm_q > p->fm_qdepth_max) p->fm_qdepth_max = fm_q;
+        if (fm_avail < p->fm_avail_min) p->fm_avail_min = fm_avail;
+    }
+    if (effective_q < p->audio_q_min) p->audio_q_min = effective_q;
+    if (effective_q > p->audio_q_max) p->audio_q_max = effective_q;
+    if (a.rate_servo_active) ++p->servo_frames;
+
+    p->frame_sum_us += dt_us;
+    if (dt_us < p->frame_min_us) p->frame_min_us = dt_us;
+    if (dt_us > p->frame_max_us) p->frame_max_us = dt_us;
+    ++p->frame_hist[tab5_jit72_hist_index(dt_us)];
+    if (dt_us > p->target_us + 2000u) ++p->late_2ms;
+    if (dt_us > p->target_us + 5000u) ++p->late_5ms;
+    if (dt_us > p->target_us + 10000u) ++p->late_10ms;
+
+    uint32_t present_interval = v.pace_last_interval_us;
+    if (v.presented_frames != p->prev_presented) {
+        uint32_t d = v.presented_frames - p->prev_presented;
+        if (d == 0u) d = 1u;
+        p->prev_presented = v.presented_frames;
+        p->present_count += d;
+        p->present_sum_us += (uint64_t)present_interval * d;
+        if (present_interval < p->present_min_us) p->present_min_us = present_interval;
+        if (present_interval > p->present_max_us) p->present_max_us = present_interval;
+        p->present_hist[tab5_jit72_hist_index(present_interval)] += d;
+    }
+
+    tab5_jit72_consider_spike(frame, dt_us, effective_q, present_interval);
+
+    ++p->sample_count;
+    if (p->sample_count >= PX68K_JIT72_CAPTURE_FRAMES)
+        tab5_jit72_finish(frame);
+}
+
+#endif /* PX68K_TAB5_RELEASE_DIAGNOSTICS: R57E72/R79/R80 recorder */
+
+extern void m68k_tab5_be01_target_snapshot(unsigned short *out_words, unsigned int max_words);
 extern void WinX68k_VideoPerfGetLast(uint32_t *grp_us, uint32_t *text_us, uint32_t *bg_us,
                                       uint32_t *blend_us, uint32_t *clear_us,
                                       uint32_t *dirty_lines, uint32_t *grp_calls,
@@ -315,9 +2066,7 @@ extern void WinX68k_VideoPerfGetR57E44(uint32_t *fused_lines, uint32_t *fallback
 extern void WinX68k_VideoPerfGetR57E48(uint32_t *direct_lines, uint32_t *fallback_lines,
                                         uint32_t *text_reject, uint32_t *bg_reject,
                                         uint32_t *final_reject);
-extern uint32_t WinX68k_AudioProducedFrames(void);
 extern void WinX68k_AudioPerfGetLast(uint32_t *adpcm_us, uint32_t *opm_us, uint32_t *mix_calls, uint32_t *mix_frames);
-extern void WinX68k_AudioAsyncGetStats(uint32_t *qdepth, uint32_t *event_drops, uint32_t *ring_overruns, uint32_t *fm_avail);
 extern void WinX68k_AudioAsyncGetQueueTaxonomy(
     uint32_t *write_attempt, uint32_t *write_drop, uint32_t *write_drop_frames,
     uint32_t *render_attempt, uint32_t *render_drop, uint32_t *render_drop_frames,
@@ -410,11 +2159,19 @@ static tab5_budget_mode_t tab5_budget_next_mode(tab5_budget_mode_t mode,
                                                 uint32_t queued,
                                                 uint32_t submitted)
 {
+    /* R57E94: R88 deliberately moved the steady audio reservoir to the
+     * 8K/16K domain, but the visual Frame Budget Manager was still using the
+     * pre-R88 384/1024 cliff thresholds.  The R92B/R93 logs show real
+     * 90-120-ms guest stalls: waiting until <23 ms cannot protect the speaker.
+     * Enter GUARD with ~186 ms left and CRITICAL with ~93 ms left, then keep
+     * hysteresis until reserve is rebuilt.  Guest-visible X68000 work is still
+     * never skipped; only host video cadence is reduced.  R57E95T makes sample
+     * rate a manual N/A/Turbo choice and budget state never changes it. */
     enum {
-        Q_CRITICAL_ENTER = 1024u,
-        Q_GUARD_ENTER = 3072u,
-        Q_CRITICAL_EXIT = 4096u,
-        Q_NORMAL_EXIT = 6144u,
+        Q_CRITICAL_ENTER = 4096u,  /* ~92.9 ms total PCM reserve */
+        Q_GUARD_ENTER = 8192u,     /* ~185.8 ms */
+        Q_CRITICAL_EXIT = 8192u,   /* CRIT -> GUARD after ~186 ms rebuilt */
+        Q_NORMAL_EXIT = 12288u,    /* GUARD -> NORMAL after ~279 ms */
         Q_POLICY_ARM = 4096u
     };
 
@@ -669,6 +2426,14 @@ void app_main(void)
      * services exist do we launch the X68000 time-axis as a dedicated CPU1
      * task. */
     tab5_video_init();
+    ESP_LOGI(TAG, "PX68K_R57E92B: A164 dedicated AUTO-I2C base retained; M5Unified internal I2C untouched");
+    ESP_LOGI(TAG, "PX68K_R57E98T: A164 official lifecycle + direct X68K scan bridge + Turbo30 ACTIVE; buffers/512f/R85 unchanged");
+    ESP_LOGI(TAG, "PX68K_R57E102P: A164 Normal direct10ms service prio3 retained; Turbo30/audio/HDS unchanged");
+    ESP_LOGI(TAG, "PX68K_R57E105P: A164 official key-top/Sym semantic bridge ACTIVE");
+    ESP_LOGI(TAG, "PX68K_R57E106P: PRODUCTION QUIET PASS1 ACTIVE; live keyboard/JIT/audio/screen measurement probes retired");
+    tab5kbd_r105p_map_selfcheck();
+    if (tab5kbd_detect_and_configure())
+        tab5_video_set_tab5_keyboard_orientation(1);
     /* PX68K_R56S1_LAUNCHER_HOST_UI
      * Keep cold-start Media Setup + picker on the M5GFX/FB0 ownership
      * path for the entire launcher session. R49 quarantines FB1 scanout;
@@ -779,6 +2544,10 @@ void app_main(void)
 
     tab5_guest_input_init();
     tab5_guest_input_set_interval_frames(12u);
+    s_tab5kbd_input_armed = s_tab5kbd_present;
+    if (s_tab5kbd_input_armed)
+        ESP_LOGI(TAG, "PX68K_TAB5KBD_R57E99K: guest direct-X68K Normal-mode bridge ARMED; USB-A keyboard remains available in parallel");
+    (void)tab5kbd_start_cpu0_task();
 
     /* LPFAB R2 starts only after guest-input state has been reset.  The CPU0
      * touch presenter therefore uses the proven direct fallback during the
@@ -1340,7 +3109,20 @@ static void px68k_emulation_task(void *arg)
      * absorbs predictable frame/host work before any wait is issued.  Up to
      * 20 ms of lag remains bounded catch-up credit instead of being erased.
      * Long-term slope remains the configured X68000 clock. */
-    WinX68k_GuestPaceConfigure(6000u, 3000u, 20000u);
+    /* R57E78: R77 proved natural CPU1 core time is ~12.1 ms for an
+     * 18.031-ms guest frame, so sustained compute capacity is sufficient.
+     * The remaining slowdown comes from long host stalls whose negative phase
+     * was truncated by the old 20-ms debt cap.  Preserve 250 ms of debt so
+     * the existing >10-MHz natural headroom can repay observed 40-170 ms
+     * stalls instead of permanently lowering guest/audio wall rate.
+     *
+     * Lead reservoir remains exactly 6 ms / keep 3 ms.  Only *late* phase
+     * retention changes; configured guest clock remains exactly 10.000 MHz. */
+    /* R57E79: visible negative phase remains bounded at 500 ms.
+     * R57E86 changes what happens beyond that boundary: overflow is carried
+     * separately in 64 bits and must be repaid before a future PACE wait.
+     * The configured guest clock is still exactly 10.000 MHz. */
+    WinX68k_GuestPaceConfigure(6000u, 3000u, 500000u);
 
     /* R57E66 TEXT priority: actual changed TVRAM bytes advance this epoch.
      * It is only a presentation hint; R57 ordered shadow remains authoritative.
@@ -1367,6 +3149,42 @@ static void px68k_emulation_task(void *arg)
     uint64_t r57e64_prev_mix_clips = 0;
     int64_t r57e63_prev_wall_us = esp_timer_get_time();
 #endif
+
+    ESP_LOGI(TAG,
+             "PX68K_CADENCE_R57E97T: N/A keeps R94 guard; Turbo target=30fps wall cadence=33333us, render aggressive, rescue-biased; true near-empty remains emergency; buffers unchanged");
+    ESP_LOGI(TAG,
+             "PX68K_R57E74: managed ScreenVersion exact dirty-map pass-through ACTIVE; unchanged source rows bypass CPU0 scale/diff");
+    ESP_LOGI(TAG,
+             "PX68K_R57E75: Screen Manager mailbox rescue budget rebased to measured exact-10MHz audio reserve domain; edge-latch policy unchanged");
+    ESP_LOGI(TAG,
+             "PX68K_R57E76: audio deadline protection ACTIVE; speaker chunk=1024 + eager 2-slot prefill + silent producer-rate counter");
+    ESP_LOGI(TAG,
+             "PX68K_R57E77: R76 producer result accepted; feeder quantum restored 512/eager, one natural render + one skip core profile armed");
+    ESP_LOGI(TAG,
+             "PX68K_R57E78: phase-debt recovery ACTIVE; lead=6000/keep=3000us unchanged, lag debt 20000->250000us; guest clock remains 10.000MHz");
+    ESP_LOGI(TAG,
+             "PX68K_R57E79: phase debt=500000us + lightweight PRE/EXEC/POST attribution ACTIVE; R77 heavy per-slice core samples RETIRED");
+    ESP_LOGI(TAG,
+             "PX68K_R57E80: EXEC split=RUN+PACE ACTIVE; 500ms debt unchanged; clamp/discard/wait accounting one-shot only");
+    ESP_LOGI(TAG,
+             "PX68K_R57E82: R81 contention result accepted; diagnostic freeze RETIRED; normal video + sparse immutable presenter-slot transport ACTIVE");
+    ESP_LOGI(TAG,
+             "PX68K_R57E83: R82 sparse transport retained; managed presenter phase attribution one-shot ACTIVE; no behavior change");
+    ESP_LOGI(TAG,
+             "PX68K_R57E84: R83 PPA bottleneck result accepted; managed steady sparse frames use direct-native FB0, full/recovery retains PPA fallback");
+    ESP_LOGI(TAG,
+             "PX68K_R57E85: R84 native-arm bug fixed; managed direct-native follows current physical front and ignores legacy LIVE-only R49 full token");
+    ESP_LOGI(TAG,
+             "PX68K_R57E86: exact phase overflow-carry ACTIVE; 500ms fast reservoir retained, excess lag preserved in 64-bit carry and repaid before PACE");
+    ESP_LOGI(TAG,
+             "PX68K_R57E87: carry repayment audio-reserve gated ACTIVE; resume<=8192 hold>=16384 effective PCM frames; exact 10MHz unchanged");
+    ESP_LOGI(TAG,
+             "PX68K_R57E88: mid-ring audio reservoir ACTIVE; measured 124ms burst headroom protected; carry semantics/R85 video unchanged");
+    ESP_LOGI(TAG, "PX68K_R57E89: screen liveness measurement retired for production; R88/R85 behavior retained");
+    ESP_LOGI(TAG, "PX68K_R57E91: continuity forensics retired for production; audio behavior retained");
+    ESP_LOGI(TAG, "PX68K_R57E98T: R97 Turbo30 retained + A164 10ms task fix/direct-X68K bridge ACTIVE; R94 audio buffers unchanged");
+    ESP_LOGI(TAG, "PX68K_R57E102P: direct 0x20 poll prio3 -> RTQ -> CPU1 -> KeyBuf/MFP transport ACTIVE; trace retired");
+    ESP_LOGI(TAG, "PX68K_R57E105P: punctuation semantic map ACTIVE (`~?:\"_=,/); HID chords are translated, not copied, into X68K scans");
 
     /* R56: SOURCE/MASS-DIRTY transition heuristics are retired.  Screen
      * lifecycle is owned by tab5_screen_manager and driven by guest-sequenced
@@ -1396,6 +3214,14 @@ static void px68k_emulation_task(void *arg)
 
         budget.preexec_q = budget_audio.queued_frames;
         budget.preexec_q_effective = budget_audio.queued_frames + budget_audio.speaker_queued_frames;
+        const bool r57e97_turbo_video = (tab5_video_turbo_enabled() != 0);
+
+        /* R57E87: one CPU1-local governor policy update per guest frame.
+         * tab5_audio_get_stats() was already required for the existing audio
+         * deadline policy, so this adds no new cross-core read or wait. */
+        if (audio_host_ready)
+            WinX68k_GuestPaceR87SetAudioReserve(budget.preexec_q_effective);
+
         /* R57E11: fact-only audio reserve hint.  Screen Manager uses this to
          * scale optional mailbox rescue 0/1/3/7/15; CPU1 never waits. */
         tab5_screen_manager_audio_reserve_hint(budget_audio.queued_frames,
@@ -1441,11 +3267,10 @@ static void px68k_emulation_task(void *arg)
             budget.mode = next_budget_mode;
             ++budget.transitions;
         }
-        /* Build 5.98g12: NORMAL keeps full 44.1-kHz quality.  The existing
-         * queue-hysteretic GUARD/CRIT states request a pitch-safe 22.05-kHz
-         * output path (2:1 pair-average decimation), never clock stretching. */
-        if (audio_host_ready)
-            tab5_audio_set_high_load_22k(budget.mode != TAB5_BUDGET_NORMAL);
+        /* R57E95T: sample rate is explicit user state, not a load heuristic.
+         * N/A stays 44.1 kHz; Turbo stays 22.05 kHz.  Budget state continues
+         * to shed only host video work and never changes audio rate or buffer
+         * geometry automatically. */
 
         /* BAT161: retain BAT160 interactive/file-manager refresh only when the
          * audio reserve is already in the safest high-water band.  Heavy MDX
@@ -1463,21 +3288,31 @@ static void px68k_emulation_task(void *arg)
          * roughly 30/15 fps while guest/audio time continues every frame. */
         const uint32_t visual_pending = tab5_compose_gbt65k_pending();
         uint32_t visual_div = 1u;
-        if (visual_pending >= 14u)
-            visual_div = 4u;
-        else if (visual_pending >= 8u || budget_audio.queued_frames >= 12288u)
-            visual_div = 2u;
+        if (!r57e97_turbo_video) {
+            if (visual_pending >= 14u)
+                visual_div = 4u;
+            else if (visual_pending >= 8u || budget_audio.queued_frames >= 12288u)
+                visual_div = 2u;
+        }
+        /* Turbo intentionally keeps latest-wins render production aggressive.
+         * Queue pressure is allowed to coalesce downstream instead of making
+         * CPU1 skip whole visual frames.  Audio emergency recharge remains
+         * authoritative below. */
 
         /* R57E57 audio-reserve recharge.  The R57E56 log proved the final
          * residual stutter is true speaker underflow while R57 and pacing are
          * healthy.  Enter before the ring reaches the cliff, render only one
          * rescue frame out of 12, and leave once roughly 90 ms of effective
          * PCM reserve has been rebuilt. */
+        /* R57E94: emergency recharge now lives in the R88 reservoir domain.
+         * A 2048-frame entry (~46 ms) is the last-resort band; remain sparse
+         * until 8192 frames (~186 ms) have been rebuilt so one 100-ms guest
+         * spike cannot immediately empty the speaker again. */
         if (budget_audio.submitted_frames >= 4096u) {
-            if (!r57e57_audio_recharge && budget.preexec_q_effective < 1536u) {
+            if (!r57e57_audio_recharge && budget.preexec_q_effective < 2048u) {
                 r57e57_audio_recharge = 1;
                 ++r57e57_recharge_enters;
-            } else if (r57e57_audio_recharge && budget.preexec_q_effective >= 4096u) {
+            } else if (r57e57_audio_recharge && budget.preexec_q_effective >= 8192u) {
                 r57e57_audio_recharge = 0;
             }
         }
@@ -1492,22 +3327,31 @@ static void px68k_emulation_task(void *arg)
         if (r57e57_audio_recharge)
         {
             ++r57e57_recharge_frames;
-            budget_render = ((frame % 12u) == 0u);
+            /* True near-empty emergency is still audio-safe.  Turbo merely
+             * raises the floor from 1/4 to 1/2 while 22.05 kHz halves the
+             * speaker-side sample work. */
+            budget_render = ((frame % (r57e97_turbo_video ? 2u : 4u)) == 0u);
             if (budget_render)
                 ++r57e57_recharge_rescue;
         }
         else if (budget.mode == TAB5_BUDGET_AUDIO_CRITICAL)
         {
             ++budget.critical_frames;
-            budget_render = ((frame % 6u) == 0u);
+            budget_render = r57e97_turbo_video
+                                ? ((budget.preexec_q_effective >= 2048u) || ((frame & 1u) == 0u))
+                                : ((frame % 4u) == 0u);
             if (budget_render)
                 ++budget.critical_forced_renders;
         }
         else if (budget.mode == TAB5_BUDGET_AUDIO_GUARD)
         {
             ++budget.guard_frames;
-            const uint32_t div = (visual_div < 2u) ? 2u : visual_div;
-            budget_render = ((frame % div) == 0u);
+            if (r57e97_turbo_video)
+                budget_render = true;
+            else {
+                const uint32_t div = (visual_div < 2u) ? 2u : visual_div;
+                budget_render = ((frame % div) == 0u);
+            }
         }
         else
         {
@@ -1582,7 +3426,41 @@ static void px68k_emulation_task(void *arg)
             mdx615e_diag_active && ((frame % 600u) == 300u);
         const int64_t r56q1_exec_t0 = r56q1_sample ? esp_timer_get_time() : 0;
 #endif
+#if PX68K_TAB5_RELEASE_DIAGNOSTICS
+        /* R57E72/R79/R80 measurement-build attribution only. */
+        int64_t r79_exec_t0 = 0;
+        uint64_t r80_wait_cc0 = 0u;
+        if (s_jit72.state == 2u) {
+            r80_wait_cc0 = WinX68k_GuestPaceR80WaitCycles();
+            r79_exec_t0 = esp_timer_get_time();
+            if (s_jit72.r79_prev_boundary_us != 0) {
+                const int64_t pre = r79_exec_t0 - s_jit72.r79_prev_boundary_us;
+                s_jit72.r79_pre_cur_us = (pre > 0) ? (uint32_t)pre : 0u;
+            } else {
+                s_jit72.r79_pre_cur_us = 0u;
+            }
+        }
+#endif
+
         int cycles = WinX68k_ExecVideoProbeFrame();
+
+#if PX68K_TAB5_RELEASE_DIAGNOSTICS
+        if (r79_exec_t0 != 0) {
+            const int64_t r79_exec_t1 = esp_timer_get_time();
+            const int64_t exec = r79_exec_t1 - r79_exec_t0;
+            const uint64_t r80_wait_cc1 = WinX68k_GuestPaceR80WaitCycles();
+            const uint64_t r80_wait_delta = r80_wait_cc1 - r80_wait_cc0;
+            const uint32_t pace_us = (uint32_t)(
+                (r80_wait_delta + (s_jit72.r80_host_mhz / 2u)) /
+                s_jit72.r80_host_mhz);
+            const uint32_t exec_us = (exec > 0) ? (uint32_t)exec : 0u;
+
+            s_jit72.r79_exec_cur_us = exec_us;
+            s_jit72.r80_pace_cur_us = (pace_us <= exec_us) ? pace_us : exec_us;
+            s_jit72.r80_run_cur_us = exec_us - s_jit72.r80_pace_cur_us;
+            s_jit72.r79_exec_end_us = r79_exec_t1;
+        }
+#endif
 #if PX68K_TAB5_RELEASE_DIAGNOSTICS
         const uint32_t r56q1_exec_us = r56q1_sample
             ? (uint32_t)(esp_timer_get_time() - r56q1_exec_t0) : 0u;
@@ -2001,6 +3879,13 @@ static void px68k_emulation_task(void *arg)
         tab5_guest_video_state_frame_boundary(w, h, pitch, VCReg0[1], CRTC_Regs[0x29]);
         tab5_cpu1_video_frame_boundary_sync();
 
+#if PX68K_TAB5_RELEASE_DIAGNOSTICS
+        tab5_jit72_frame_boundary(frame,
+                                  (uint32_t)budget.mode,
+                                  r57e57_audio_recharge ? 1u : 0u,
+                                  budget_render ? 1u : 0u);
+#endif
+
 #if PX68K_TAB5_R57E63_AUDIO_AUDIT
         /* Focused release-candidate audit. 300 guest frames is sparse enough
          * not to perturb MDX timing, while still showing timer and PCM changes
@@ -2242,8 +4127,27 @@ static void px68k_emulation_task(void *arg)
         }
 
         const uint32_t present_div = textview_active ? 6u : (lowload_present_boost ? 6u : 12u);
-        const bool do_present =
-            (frame <= 12u) || ((frame % present_div) == 0u);
+        bool do_present = false;
+        if (frame <= 12u) {
+            do_present = true;
+            if (r57e97_turbo_video)
+                r57e97_turbo_next_present_us = esp_timer_get_time() + 33333LL;
+        } else if (r57e97_turbo_video) {
+            const int64_t now_present_us = esp_timer_get_time();
+            if (r57e97_turbo_next_present_us == 0)
+                r57e97_turbo_next_present_us = now_present_us;
+            if (now_present_us >= r57e97_turbo_next_present_us) {
+                do_present = true;
+                /* Advance by deadline slots, but never emit stale catch-up
+                 * frames.  The next guest iteration always presents the latest. */
+                do {
+                    r57e97_turbo_next_present_us += 33333LL;
+                } while (r57e97_turbo_next_present_us <= now_present_us);
+            }
+        } else {
+            r57e97_turbo_next_present_us = 0;
+            do_present = ((frame % present_div) == 0u);
+        }
 
         /* Build 5.45: while viewing COMPOSITE the expensive host text renderer
          * is diagnostic-only.  Refresh it once per second instead of every
@@ -2306,8 +4210,9 @@ static void px68k_emulation_task(void *arg)
                 (void)tab5_guest_input_queue_touch_joypad(lp_touch_joy);
         }
 
-        /* Drain USB real-time events, then optional automatic text, on this task only. */
+        /* Drain USB/A164 real-time events, then optional automatic text, on this task only. */
         tab5_guest_input_tick(frame);
+
 
         /* In-game side-bar actions.  CPU0 owns touch/UI; CPU1 applies disk
          * mutations here between guest frames so PX68K media state is never
@@ -2763,7 +4668,8 @@ static void px68k_emulation_task(void *arg)
          * here, on the emulation task, so PX68K/FDD state remains single-threaded.
          */
         {
-            const uint32_t hotkeys = tab5_usb_keyboard_take_hotkeys();
+            const uint32_t builtin_hotkeys = __atomic_exchange_n(&s_tab5kbd_hotkeys, 0u, __ATOMIC_ACQ_REL);
+            const uint32_t hotkeys = tab5_usb_keyboard_take_hotkeys() | builtin_hotkeys;
 
             if (hotkeys & TAB5_USB_HOTKEY_A_BOOT_NEXT)
             {
@@ -3110,7 +5016,7 @@ static void px68k_emulation_task(void *arg)
 #endif /* PX68K_TAB5_DIAG_VERBOSE */
 
         bool budget_present = budget_render;
-        if (do_present && frame > 12u && budget_render)
+        if (do_present && frame > 12u && budget_render && !r57e97_turbo_video)
         {
             const uint32_t present_slot = frame / present_div;
             if (budget.mode == TAB5_BUDGET_AUDIO_CRITICAL)
@@ -3701,7 +5607,7 @@ static void px68k_emulation_task(void *arg)
                 (uint32_t)(esp_timer_get_time() - perf_outer_start);
             const uint32_t known_us = core_us + perf_text_us + perf_lcd_us + perf_yield_us;
             const uint32_t misc_us = (outer_us > known_us) ? outer_us - known_us : 0u;
-            const uint32_t present_div_perf = present_div;
+            const uint32_t present_div_perf = r57e97_turbo_video ? 2u : present_div;
             const uint32_t text_div_perf = (textview_active && composite_view) ? 60u : present_div_perf;
             const uint32_t text_avg_us = perf_text_us / text_div_perf;
             const uint32_t lcd_avg_us = perf_lcd_us / present_div_perf;

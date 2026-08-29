@@ -2464,6 +2464,42 @@ static DRAM_ATTR uint32_t s_tab5_dispatch_misses = 0;
 static DRAM_ATTR tab5_m68k_dispatch_entry_t s_tab5_dispatch_l2[TAB5_M68K_DISPATCH_L2_SIZE];
 static DRAM_ATTR uint32_t s_tab5_dispatch_l2_hits = 0;
 
+/* R57E70C: 256-entry direct-mapped PC/opcode cache in Internal DRAM.
+ * It is deliberately slice-local: generation changes at every m68k_execute
+ * entry, so DMA/HostFS/device writes between scheduler slices can never leave
+ * stale code. Guest RAM writes inside a slice bump the same generation through
+ * the direct Musashi RAM-write helpers. This caches only the 16-bit opcode
+ * fetch; the existing TCM/L2 opcode-dispatch metadata cache remains unchanged. */
+#define TAB5_FETCH70C_BITS 8u
+#define TAB5_FETCH70C_SIZE (1u << TAB5_FETCH70C_BITS)
+#define TAB5_FETCH70C_MASK (TAB5_FETCH70C_SIZE - 1u)
+typedef struct {
+    uint32_t pc;
+    uint32_t epoch;
+    uint16_t word;
+    uint16_t pad;
+} tab5_fetch70c_entry_t;
+static DRAM_ATTR tab5_fetch70c_entry_t s_tab5_fetch70c[TAB5_FETCH70C_SIZE];
+DRAM_ATTR uint32_t g_tab5_fetch70c_epoch = 1u;
+
+static inline __attribute__((always_inline)) uint16_t tab5_fetch70c_ram_word(
+    uint8_t *base, uint32_t pc)
+{
+    const uint32_t epoch = g_tab5_fetch70c_epoch;
+    tab5_fetch70c_entry_t * const e =
+        &s_tab5_fetch70c[(pc >> 1) & TAB5_FETCH70C_MASK];
+    if (__builtin_expect(e->pc == pc && e->epoch == epoch, 1))
+        return e->word;
+
+    uint16_t w;
+    __builtin_memcpy(&w, base + pc, sizeof(w));
+    e->word = w;
+    e->pc = pc;
+    e->epoch = epoch;
+    return w;
+}
+
+
 uint32_t m68k_tab5_dispatch_tcm_bytes(void)
 {
     return (uint32_t)sizeof(s_tab5_dispatch_cache);
@@ -2678,6 +2714,7 @@ static inline __attribute__((always_inline)) void tab5_ram598g9_store32(uint32_t
     __builtin_memcpy(MEM + a, &hi, 2u);
     __builtin_memcpy(MEM + a + 2u, &lo, 2u);
     BusErrFlag = 0;
+    tab5_fetch70c_note_ram_write();
 }
 
 /* Return non-zero only when the instruction was fully executed here. Odd or
@@ -4211,6 +4248,7 @@ void tab5_sparse598g11_try_bpl(uint16_t branch_op)
         __builtin_memcpy(MEM + p + 2u, &zero16, 2u);
     }
     BusErrFlag = 0;
+    tab5_fetch70c_note_ram_write();
 
     REG_A[0] = a + span;
     counter -= n;
@@ -5716,6 +5754,12 @@ int m68k_execute(int num_cycles)
 		return rc;
 	}
 
+#ifdef ESP_PLATFORM
+	/* R57E70C: make the opcode-word cache slice-local. */
+	if (++g_tab5_fetch70c_epoch == 0u)
+		g_tab5_fetch70c_epoch = 1u;
+#endif
+
 	/* Set our pool of clock cycles available */
 	SET_CYCLES(num_cycles);
 	m68ki_initial_cycles = num_cycles;
@@ -5809,8 +5853,7 @@ int m68k_execute(int num_cycles)
 				tab5_fetch_pc = ADDRESS_68K(tab5_fetch_pc);
 
 				if (__builtin_expect(tab5_fetch_pc <= 0x00bffffeu, 1)) {
-					__builtin_memcpy(&tab5_fetch_word, tab5_mem_fetch_base + tab5_fetch_pc,
-					                 sizeof(tab5_fetch_word));
+					tab5_fetch_word = tab5_fetch70c_ram_word(tab5_mem_fetch_base, tab5_fetch_pc);
 					BusErrFlag = 0;
 					REG_IR = (uint32_t)tab5_fetch_word;
 				} else if (__builtin_expect(tab5_fetch_pc >= 0x00fc0000u &&
@@ -6125,6 +6168,8 @@ void m68k_init(void)
 		printf("PX68K_DISPATCH598G9: TCM L1=%u entries + internal-DRAM L2=%u entries (%u bytes) armed before PSRAM metadata fallback\n",
 		       (unsigned)TAB5_M68K_DISPATCH_CACHE_SIZE, (unsigned)TAB5_M68K_DISPATCH_L2_SIZE,
 		       (unsigned)sizeof(s_tab5_dispatch_l2));
+		printf("PX68K_FETCH_R57E70C: slice-local PC/opcode cache ACTIVE entries=%u bytes=%u; guest RAM writes invalidate generation; dispatch L1/L2 unchanged\n",
+		       (unsigned)TAB5_FETCH70C_SIZE, (unsigned)sizeof(s_tab5_fetch70c));
 		printf("PX68K_POLL598F: stable ordinary-RAM TST.W(An)+BNE/BEQ scheduler-bounded fast-forward armed\n");
 #endif
 		emulation_initialized = 1;

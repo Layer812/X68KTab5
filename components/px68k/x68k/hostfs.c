@@ -456,9 +456,13 @@ static int hfs_resolve_existing(const char *raw, char *resolved, size_t cap)
 static void hfs_log_path_failure(const char *op, const char *raw,
                                  const char *resolved, int e, uint32_t fcb, uint32_t mode)
 {
+#if PX68K_TAB5_DIAG_VERBOSE
     printf("PX68K_HOSTFS: %s FAILED fcb=$%06lX mode=%lu raw='%s' path='%s' errno=%d(%s) writable=%d\n",
            op ? op : "OP", (unsigned long)fcb, (unsigned long)mode,
            raw ? raw : "", resolved ? resolved : "", e, strerror(e), s_root_writable);
+#else
+    (void)op; (void)raw; (void)resolved; (void)e; (void)fcb; (void)mode;
+#endif
 }
 
 static void hfs_split_83(const char *name, char base[9], char ext[4])
@@ -1072,6 +1076,15 @@ uint32_t HostFS_InstallDriver(uint32_t guest_addr)
 {
     if (!HostFS_Available()) return 0;
     if (s_root_writable < 0) s_root_writable = hfs_probe_root_write();
+#if !PX68K_TAB5_DIAG_VERBOSE
+    {
+        static int r57e73_quiet_logged = 0;
+        if (!r57e73_quiet_logged) {
+            r57e73_quiet_logged = 1;
+            printf("PX68K_HOSTFS_R57E73: production runtime negative-status/path stdio SUPPRESSED; counters/guest error returns unchanged\n");
+        }
+    }
+#endif
     guest_addr &= 0x00ffffffu;
     const uint32_t strategy = guest_addr + 22u;
     const uint32_t intr = guest_addr + 32u;
@@ -1155,7 +1168,8 @@ void HostFS_InterruptTrap(void)
     }
 
     hfs_req_status(status);
-    if ((status < 0 || (PX68K_TAB5_DIAG_VERBOSE && s_calls <= 24u)) && cmd != 0x48)
+#if PX68K_TAB5_DIAG_VERBOSE
+    if (cmd != 0x48 && (status < 0 || s_calls <= 24u))
     {
         uint8_t unit = 0;
         hfs_guest_read(s_req + REQ_UNIT, &unit, 1);
@@ -1163,6 +1177,7 @@ void HostFS_InterruptTrap(void)
                (unsigned long)s_calls, cmd, (unsigned)unit,
                (long)status, (unsigned long)s_req);
     }
+#endif
 }
 
 uint32_t HostFS_DebugCalls(void) { return s_calls; }

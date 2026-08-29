@@ -45,6 +45,15 @@ void FASTCALL DMA_Write(uint32_t adr, uint8_t data);
 
 int FASTCALL DMA_Exec(int ch);
 int FASTCALL DMA_ExecActive012(void);
+/* R57E71: production CPU scheduler pays this boundary on every execute slice.
+ * Check the three CSR active bits in the caller and enter the large DMA engine
+ * only for channels that can actually transfer. Channel order is unchanged. */
+static inline __attribute__((always_inline)) void DMA_ExecActive012Inline(void)
+{
+    if (__builtin_expect(DMA[0].CSR & 0x08u, 0)) DMA_Exec(0);
+    if (__builtin_expect(DMA[1].CSR & 0x08u, 0)) DMA_Exec(1);
+    if (__builtin_expect(DMA[2].CSR & 0x08u, 0)) DMA_Exec(2);
+}
 /* R26: guarded exact MDX channel-3 RAM -> MSM6258 path measured by R25.
  * Returns 1 when handled, 0 when authoritative generic DMA_Exec(3) is needed. */
 int FASTCALL DMA_Exec3ADPCMFast(void);

@@ -53,6 +53,7 @@ static const int Timer_Prescaler[8] = {1, 10, 25, 40, 125, 160, 250, 500};
  * path whenever TACR bit 3 is set; TACR==8 remains handled by MFP_TimerA(). */
 static PX68K_DEVCACHE uint8_t s_timer_prescale_sel[4] = {0, 0, 0, 0};
 PX68K_DEVCACHE uint8_t MFP_TimerActiveMask = 0;
+PX68K_DEVCACHE uint8_t MFP_TimerFastMode = 0;
 #ifdef ESP_PLATFORM
 static DRAM_ATTR uint32_t s_mfp_exact_bc_calls = 0;
 static DRAM_ATTR uint32_t s_mfp_fallback_calls = 0;
@@ -78,6 +79,20 @@ static inline void mfp_refresh_timer_cache(void)
       MFP_TimerActiveMask |= 1u << 0;
    for (int i = 1; i < 4; ++i)
       if (s_timer_prescale_sel[i]) MFP_TimerActiveMask |= (uint8_t)(1u << i);
+
+#ifdef ESP_PLATFORM
+   /* R57E71: this exact tuple dominates the MDX workload.  Compute the
+    * classification only when the guest changes timer programming. */
+   MFP_TimerFastMode = (uint8_t)(
+      MFP_TimerActiveMask == 0x06u &&
+      MFP[MFP_TACR] == 0x08u &&
+      MFP[MFP_TBCR] == 0x01u &&
+      MFP[MFP_TCDCR] == 0x70u &&
+      Timer_Reload[1] == 13u &&
+      Timer_Reload[2] == 200u);
+#else
+   MFP_TimerFastMode = 0;
+#endif
 }
 
 /* Build 5.60: GetGPIP() used to redo two variable divisions on every read.
@@ -367,15 +382,19 @@ void FASTCALL MFP_Write(uint32_t adr, uint8_t data)
             break;
          case MFP_TADR:
             Timer_Reload[0] = MFP[reg] = data;
+            mfp_refresh_timer_cache();
             break;
          case MFP_TBDR:
             Timer_Reload[1] = MFP[reg] = data;
+            mfp_refresh_timer_cache();
             break;
          case MFP_TCDR:
             Timer_Reload[2] = MFP[reg] = data;
+            mfp_refresh_timer_cache();
             break;
          case MFP_TDDR:
             Timer_Reload[3] = MFP[reg] = data;
+            mfp_refresh_timer_cache();
             break;
          case MFP_TSR:
             MFP[reg] = data | 0x80; /* Tx is always enabled */
@@ -436,47 +455,73 @@ static inline uint8_t mfp_timer_advance_fast(uint8_t cur, uint8_t reload,
    return (uint8_t)((uint32_t)reload - rem);
 }
 
+/* R57E71 fixed IRQ paths for the measured MDX timer tuple.  These are exact
+ * specializations of MFP_Int(7) and MFP_Int(10): no priority/enable semantics
+ * are changed, only the runtime irq-number decode and shifts are removed. */
+static inline __attribute__((always_inline)) void mfp_r71_timerb_irq(void)
+{
+   const uint8_t flag = 0x01u; /* IRQ7 -> IERA/IPRA/IMRA/ISRA bit0 */
+   if (MFP[MFP_IERA] & flag) {
+      MFP[MFP_IPRA] |= flag;
+      if ((MFP[MFP_IMRA] & flag) && !(MFP[MFP_ISRA] & flag))
+         IRQH_Int(6, &MFP_IntCallback);
+   }
+}
+
+static inline __attribute__((always_inline)) void mfp_r71_timerc_irq(void)
+{
+   const uint8_t flag = 0x20u; /* IRQ10 -> IERB/IPRB/IMRB/ISRB bit5 */
+   if (MFP[MFP_IERB] & flag) {
+      MFP[MFP_IPRB] |= flag;
+      if ((MFP[MFP_IMRB] & flag) && !(MFP[MFP_ISRB] & flag))
+         IRQH_Int(6, &MFP_IntCallback);
+   }
+}
+
+void PX68K_DEVIRAM __attribute__((hot,optimize("O3"))) FASTCALL MFP_TimerR71ExactBC(int32_t clock)
+{
+#ifdef ESP_PLATFORM
+   ++s_mfp_exact_bc_calls;
+   if (__builtin_expect(!s_mfp_exact_bc_logged, 0)) {
+      s_mfp_exact_bc_logged = 1u;
+      printf("PX68K_MFP_R57E71: cached exact B/C hot path ACTIVE B=/10 reload=13 C=/500 reload=200; fixed IRQ decode\n");
+   }
+
+   int32_t accum = Timer_Tick[1] + clock;
+   if (accum >= 10) {
+      const uint32_t decs = (uint32_t)accum / 10u;
+      Timer_Tick[1] = accum - (int32_t)(decs * 10u);
+      int fired = 0;
+      MFP[MFP_TBDR] = mfp_timer_advance_fast(MFP[MFP_TBDR], 13u, decs, &fired);
+      if (fired) mfp_r71_timerb_irq();
+   } else {
+      Timer_Tick[1] = accum;
+   }
+
+   accum = Timer_Tick[2] + clock;
+   if (accum >= 500) {
+      const uint32_t decs = (uint32_t)accum / 500u;
+      Timer_Tick[2] = accum - (int32_t)(decs * 500u);
+      int fired = 0;
+      MFP[MFP_TCDR] = mfp_timer_advance_fast(MFP[MFP_TCDR], 200u, decs, &fired);
+      if (fired) mfp_r71_timerc_irq();
+   } else {
+      Timer_Tick[2] = accum;
+   }
+#else
+   MFP_TimerSlow(clock);
+#endif
+}
+
 void PX68K_DEVIRAM FASTCALL MFP_TimerSlow(int32_t clock)
 {
    static const uint8_t TimerInt[4] = { 2, 7, 10, 11 };
    const uint8_t active = MFP_TimerActiveMask;
 
 #ifdef ESP_PLATFORM
-   /* R26 measured exact steady-state MDX configuration:
-    *   TACR=08  -> Timer A is event-count mode, so not in this path
-    *   TBCR=01  -> Timer B /10, reload 13
-    *   TCDCR=70 -> Timer C /500, Timer D off, reload C=200
-    * R25 observed this tuple in 3,032,964 of 3,033,090 fallback calls.
-    * Keep exact control and reload guards so any guest reprogramming falls
-    * back to the original generic loop immediately. */
-   if (__builtin_expect(active == 0x06u &&
-                        MFP[MFP_TACR] == 0x08u &&
-                        MFP[MFP_TBCR] == 0x01u &&
-                        MFP[MFP_TCDCR] == 0x70u &&
-                        Timer_Reload[1] == 13u &&
-                        Timer_Reload[2] == 200u, 1))
-   {
-      ++s_mfp_exact_bc_calls;
-      if (!s_mfp_exact_bc_logged) {
-         s_mfp_exact_bc_logged = 1u;
-         printf("PX68K_MFPR26: exact TACR=08/TBCR=01/TCDCR=70 B=/10 C=/500 path ACTIVE\n");
-      }
-#define MFP_R26_STEP_CONST(CH, DIV, RELOAD, IRQNO) do { \
-         int32_t accum = Timer_Tick[(CH)] + clock; \
-         if (accum >= (DIV)) { \
-            const uint32_t decs = (uint32_t)accum / (uint32_t)(DIV); \
-            Timer_Tick[(CH)] = accum - (int32_t)(decs * (uint32_t)(DIV)); \
-            int fired = 0; \
-            MFP[MFP_TADR + (CH)] = mfp_timer_advance_fast( \
-               MFP[MFP_TADR + (CH)], (RELOAD), decs, &fired); \
-            if (fired) MFP_Int((IRQNO)); \
-         } else { \
-            Timer_Tick[(CH)] = accum; \
-         } \
-      } while (0)
-      MFP_R26_STEP_CONST(1, 10, 13, 7);
-      MFP_R26_STEP_CONST(2, 500, 200, 10);
-#undef MFP_R26_STEP_CONST
+   /* Direct callers are rare, but preserve the same cached exact dispatch. */
+   if (__builtin_expect(MFP_TimerFastMode == 1u, 0)) {
+      MFP_TimerR71ExactBC(clock);
       return;
    }
    ++s_mfp_fallback_calls;

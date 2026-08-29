@@ -1,0 +1,14 @@
+00000000 a $d
+00000000 a $d
+50108000 t $d
+50108000 T __lp_image_base
+50108080 t $x
+50108080 T _start
+501080a4 t $x
+501080a4 T main
+50108400 b $d
+50108400 B __lp_shared_start
+50108400 B g_lpbr
+50109cec B __lp_shared_end
+50109cf0 B __image_ram_end
+5010aff0 A __stack_top

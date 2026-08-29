@@ -2624,6 +2624,26 @@ static void handle_retrok(void)
 }
 
 #define CLOCK_SLICE 200
+/* R57E70A: when the within-scanline device state is provably idle, one
+ * m68k_execute() call may consume the rest of the scanline (normally ~294
+ * clocks at 10 MHz) instead of 200 + tail.  Any ordinary MFP timer or active
+ * DMA0..2 channel immediately restores the exact R57E68 200-cycle scheduler.
+ * Scanline edges, Timer-A event mode, OPM/ADPCM/MIDI line updates and pacing
+ * remain at their existing boundaries. */
+#define TAB5_R57E70A_IDLE_SLICE_MAX 800
+
+static inline __attribute__((always_inline)) int tab5_r57e70a_slice_request(int remaining)
+{
+#ifdef ESP_PLATFORM
+    if (__builtin_expect(MFP_TimerActiveMask == 0u &&
+                         ((DMA[0].CSR | DMA[1].CSR | DMA[2].CSR) & 0x08u) == 0u, 1))
+    {
+        return (remaining > TAB5_R57E70A_IDLE_SLICE_MAX)
+            ? TAB5_R57E70A_IDLE_SLICE_MAX : remaining;
+    }
+#endif
+    return (remaining > CLOCK_SLICE) ? CLOCK_SLICE : remaining;
+}
 
 /*  Core Main Loop */
 static void WinX68k_Exec(void)
@@ -2750,9 +2770,7 @@ static void WinX68k_Exec(void)
 
       MFP_Timer(usedclk);
       RTC_Timer(usedclk);
-      DMA_Exec(0);
-      DMA_Exec(1);
-      DMA_Exec(2);
+      DMA_ExecActive012Inline();
 
       if (clk_count >= clk_next)
       {
@@ -3429,6 +3447,53 @@ typedef struct {
     int64_t lead_max_q16;
     int64_t lead_keep_q16;
     int64_t lag_resync_q16;
+
+    /* R57E80: release-cheap governor accounting. These are intentionally
+     * independent of the old R57E63 periodic audit so the one-shot recorder
+     * can separate useful CPU work from deliberate 10-MHz pacing waits. */
+    uint64_t r80_wait_host_cycles;
+    uint64_t r80_wait_requested_us;
+    uint64_t r80_discarded_lag_q16;
+    uint64_t r80_max_lag_q16;
+    uint64_t r80_max_lead_q16;
+    uint32_t r80_wait_events;
+    uint32_t r80_clamp_events;
+    uint32_t r80_catchup_checks;
+
+    /* R57E86: phase overflow carry.
+     *
+     * The fast signed phase stays bounded at +/- the ordinary reservoir,
+     * but lag beyond the negative reservoir is no longer thrown away.
+     * It is carried separately and must be repaid from future positive
+     * phase before any real-time pacing wait is permitted again. */
+    uint64_t r86_overflow_debt_q16;
+    uint64_t r86_preserved_overflow_q16;
+    uint64_t r86_repaid_overflow_q16;
+    uint64_t r86_max_overflow_debt_q16;
+    uint64_t r86_capture_start_debt_q16;
+    uint32_t r86_wait_suppressed;
+
+    /* R57E87: audio-reserve-aware carry repayment.
+     *
+     * R86 proved that preserving debt is correct, but unrestricted repayment
+     * can generate PCM faster than the fixed 44.1-kHz sink can accept and fill
+     * the 32768-frame host ring.  Recovery therefore has hysteresis:
+     *   effectiveQ <= 8192  : catch-up repayment enabled
+     *   effectiveQ >= 16384 : catch-up repayment held
+     * While held, any newly observed negative visible phase is transferred
+     * into the 64-bit carry instead of being immediately chased. */
+    uint32_t r87_audio_q_effective;
+    uint32_t r87_audio_q_min;
+    uint32_t r87_audio_q_max;
+    uint32_t r87_recovery_allowed;
+    uint32_t r87_hold_events;
+    uint32_t r87_resume_events;
+    uint32_t r87_active_frames;
+    uint32_t r87_held_frames;
+    uint32_t r87_defer_checks;
+    uint32_t r87_repay_paused_checks;
+    uint64_t r87_deferred_lag_q16;
+
 #if PX68K_TAB5_R57E63_AUDIO_AUDIT
     uint64_t max_lead_q16;
     uint64_t max_lag_q16;
@@ -3464,6 +3529,14 @@ static inline uint32_t tab5_guest_pace_q16_to_us(uint64_t host_q16, uint32_t hos
     return (uint32_t)((host_cycles * 1000000ULL + host_hz - 1ULL) / host_hz);
 }
 
+static inline uint64_t tab5_guest_pace_q16_to_us64(uint64_t host_q16,
+                                                   uint32_t host_hz)
+{
+    if (!host_hz) return 0u;
+    const uint64_t host_cycles = (host_q16 + 0xffffULL) >> 16;
+    return (host_cycles * 1000000ULL + host_hz - 1ULL) / host_hz;
+}
+
 static inline uint32_t tab5_guest_pace_quantum(uint32_t guest_hz)
 {
     /* One wall-clock decision per ~2 ms of guest time.  Keep bounds sane for
@@ -3489,6 +3562,7 @@ static inline void tab5_guest_pace_set_clock(tab5_guest_pace_t *p,
     p->check_guest_cycles = tab5_guest_pace_quantum(guest_hz);
     p->pending_guest_cycles = 0u;
     p->lead_host_q16 = 0;
+    p->r86_overflow_debt_q16 = 0u;
     p->last_ccount = ccount;
 #if PX68K_TAB5_R57E63_AUDIO_AUDIT
     ++p->resyncs;
@@ -3509,8 +3583,41 @@ void WinX68k_GuestPaceConfigure(uint32_t lead_max_us,
     s_tab5_guest_pace.lead_max_us = lead_max_us;
     s_tab5_guest_pace.lead_keep_us = lead_keep_us;
     s_tab5_guest_pace.lag_resync_us = lag_resync_us;
+    s_tab5_guest_pace.r87_recovery_allowed = 1u;
+    s_tab5_guest_pace.r87_audio_q_min = UINT32_MAX;
     tab5_guest_pace_set_clock(&s_tab5_guest_pace, tab5_guest_clock_hz_inline(),
                               (uint32_t)esp_cpu_get_cycle_count());
+}
+
+#define TAB5_R57E87_RECOVERY_RESUME_Q 8192u
+#define TAB5_R57E87_RECOVERY_HOLD_Q   16384u
+
+void WinX68k_GuestPaceR87SetAudioReserve(uint32_t effective_q)
+{
+    tab5_guest_pace_t * const p = &s_tab5_guest_pace;
+    p->r87_audio_q_effective = effective_q;
+
+    if (effective_q < p->r87_audio_q_min)
+        p->r87_audio_q_min = effective_q;
+    if (effective_q > p->r87_audio_q_max)
+        p->r87_audio_q_max = effective_q;
+
+    if (p->r87_recovery_allowed) {
+        if (effective_q >= TAB5_R57E87_RECOVERY_HOLD_Q) {
+            p->r87_recovery_allowed = 0u;
+            ++p->r87_hold_events;
+        }
+    } else {
+        if (effective_q <= TAB5_R57E87_RECOVERY_RESUME_Q) {
+            p->r87_recovery_allowed = 1u;
+            ++p->r87_resume_events;
+        }
+    }
+
+    if (p->r87_recovery_allowed)
+        ++p->r87_active_frames;
+    else
+        ++p->r87_held_frames;
 }
 
 static inline void tab5_guest_pace_wall_update(tab5_guest_pace_t *p,
@@ -3556,15 +3663,44 @@ static void tab5_guest_pace_after_slice(int executed)
      * bounded debt reservoir (normally 20 ms); larger stalls are clamped to
      * that debt rather than rebased to zero. */
     if (p->lead_host_q16 < 0) {
+        const uint64_t r80_lag_q16_now = (uint64_t)(-p->lead_host_q16);
+        if (r80_lag_q16_now > p->r80_max_lag_q16)
+            p->r80_max_lag_q16 = r80_lag_q16_now;
+        ++p->r80_catchup_checks;
 #if PX68K_TAB5_R57E63_AUDIO_AUDIT
-        const uint64_t lag_q16_now = (uint64_t)(-p->lead_host_q16);
+        const uint64_t lag_q16_now = r80_lag_q16_now;
         if (lag_q16_now > p->max_lag_q16) p->max_lag_q16 = lag_q16_now;
 #endif
+        /* R57E87: when the PCM reserve is already healthy, do not chase
+         * historical wall-time debt and overfill the fixed-rate 44.1-kHz
+         * sink.  Preserve this visible lag in the same 64-bit carry, reset
+         * the fast visible phase to zero, and let normal 10-MHz pacing resume.
+         * Catch-up becomes eligible again only after effectiveQ drains to the
+         * lower hysteresis threshold. */
+        if (!p->r87_recovery_allowed) {
+            p->r86_overflow_debt_q16 += r80_lag_q16_now;
+            p->r86_preserved_overflow_q16 += r80_lag_q16_now;
+            p->r87_deferred_lag_q16 += r80_lag_q16_now;
+            if (p->r86_overflow_debt_q16 > p->r86_max_overflow_debt_q16)
+                p->r86_max_overflow_debt_q16 = p->r86_overflow_debt_q16;
+            p->lead_host_q16 = 0;
+            ++p->r87_defer_checks;
+            return;
+        }
+
         if (p->lead_host_q16 < -p->lag_resync_q16) {
-            /* R57E67: do not erase all catch-up credit after a host stall.
-             * Clamp it to a bounded debt reservoir instead.  This prevents
-             * the old wait-now / discard-lag-later bias that pulled sustained
-             * MDX throughput below the configured 10 MHz. */
+            const uint64_t overflow_q16 =
+                r80_lag_q16_now - (uint64_t)p->lag_resync_q16;
+
+            /* R57E86: retain *all* lag.  The visible phase remains bounded
+             * for cheap hot-path arithmetic, while excess debt is carried in
+             * 64 bits.  This removes the wait-now / discard-lag-later bias
+             * without widening the normal 500-ms phase accumulator. */
+            p->r86_overflow_debt_q16 += overflow_q16;
+            p->r86_preserved_overflow_q16 += overflow_q16;
+            if (p->r86_overflow_debt_q16 > p->r86_max_overflow_debt_q16)
+                p->r86_max_overflow_debt_q16 = p->r86_overflow_debt_q16;
+            ++p->r80_clamp_events;
             p->lead_host_q16 = -p->lag_resync_q16;
 #if PX68K_TAB5_R57E63_AUDIO_AUDIT
             ++p->resyncs;
@@ -3578,6 +3714,33 @@ static void tab5_guest_pace_after_slice(int executed)
         return;
     }
 
+    /* R57E86: a positive visible phase is first used to repay any lag that
+     * previously overflowed the bounded negative reservoir.  Until that
+     * historical debt reaches zero, no pacing sleep is allowed. */
+    if (p->r86_overflow_debt_q16 != 0u && p->lead_host_q16 > 0) {
+        if (p->r87_recovery_allowed) {
+            const uint64_t positive_q16 = (uint64_t)p->lead_host_q16;
+            const uint64_t repay_q16 =
+                (positive_q16 < p->r86_overflow_debt_q16)
+                    ? positive_q16 : p->r86_overflow_debt_q16;
+            p->r86_overflow_debt_q16 -= repay_q16;
+            p->r86_repaid_overflow_q16 += repay_q16;
+            p->lead_host_q16 -= (int64_t)repay_q16;
+            ++p->r86_wait_suppressed;
+
+            if (p->r86_overflow_debt_q16 != 0u || p->lead_host_q16 <= 0)
+                return;
+        } else {
+            /* Carry is intentionally frozen while audio reserve is high.
+             * Do not return: the positive visible phase must proceed through
+             * the ordinary lead_max/lead_keep wait logic so guest time stays
+             * at exact real-time speed instead of continuing to sprint. */
+            ++p->r87_repay_paused_checks;
+        }
+    }
+
+    if ((uint64_t)p->lead_host_q16 > p->r80_max_lead_q16)
+        p->r80_max_lead_q16 = (uint64_t)p->lead_host_q16;
 #if PX68K_TAB5_R57E63_AUDIO_AUDIT
     if ((uint64_t)p->lead_host_q16 > p->max_lead_q16)
         p->max_lead_q16 = (uint64_t)p->lead_host_q16;
@@ -3604,13 +3767,20 @@ static void tab5_guest_pace_after_slice(int executed)
 
     if (wait_us == 0u)
         return;
+
+    ++p->r80_wait_events;
+    p->r80_wait_requested_us += wait_us;
 #if PX68K_TAB5_R57E63_AUDIO_AUDIT
     ++p->wait_events;
     p->wait_us += wait_us;
     if (wait_us > p->max_wait_us) p->max_wait_us = wait_us;
 #endif
-    esp_rom_delay_us(wait_us);
-    cc = (uint32_t)esp_cpu_get_cycle_count();
+    {
+        const uint32_t wait_cc0 = (uint32_t)esp_cpu_get_cycle_count();
+        esp_rom_delay_us(wait_us);
+        cc = (uint32_t)esp_cpu_get_cycle_count();
+        p->r80_wait_host_cycles += (uint32_t)(cc - wait_cc0);
+    }
     tab5_guest_pace_wall_update(p, cc);
 }
 
@@ -3656,11 +3826,162 @@ void WinX68k_GuestPaceGetStats(uint64_t *guest_cycles,
     if (prefetch_events) *prefetch_events = 0;
 #endif
 }
+
+uint64_t WinX68k_GuestPaceR80WaitCycles(void)
+{
+    return s_tab5_guest_pace.r80_wait_host_cycles;
+}
+
+void WinX68k_GuestPaceR80ResetStats(void)
+{
+    tab5_guest_pace_t * const p = &s_tab5_guest_pace;
+    p->r80_wait_host_cycles = 0u;
+    p->r80_wait_requested_us = 0u;
+    p->r80_discarded_lag_q16 = 0u;
+    p->r80_max_lag_q16 = 0u;
+    p->r80_max_lead_q16 = 0u;
+    p->r80_wait_events = 0u;
+    p->r80_clamp_events = 0u;
+    p->r80_catchup_checks = 0u;
+
+    /* Do NOT erase functional R86 debt when the one-shot recorder starts. */
+    p->r86_capture_start_debt_q16 = p->r86_overflow_debt_q16;
+    p->r86_preserved_overflow_q16 = 0u;
+    p->r86_repaid_overflow_q16 = 0u;
+    p->r86_max_overflow_debt_q16 = p->r86_overflow_debt_q16;
+    p->r86_wait_suppressed = 0u;
+
+    p->r87_audio_q_min = p->r87_audio_q_effective;
+    p->r87_audio_q_max = p->r87_audio_q_effective;
+    p->r87_hold_events = 0u;
+    p->r87_resume_events = 0u;
+    p->r87_active_frames = 0u;
+    p->r87_held_frames = 0u;
+    p->r87_defer_checks = 0u;
+    p->r87_repay_paused_checks = 0u;
+    p->r87_deferred_lag_q16 = 0u;
+}
+
+void WinX68k_GuestPaceR80GetStats(uint64_t *wait_cycles,
+                                  uint64_t *requested_wait_us,
+                                  uint32_t *wait_events,
+                                  uint32_t *clamp_events,
+                                  uint64_t *discarded_lag_us,
+                                  uint32_t *max_lag_us,
+                                  uint32_t *max_lead_us,
+                                  int32_t *phase_us,
+                                  uint32_t *catchup_checks,
+                                  uint32_t *host_mhz)
+{
+    const tab5_guest_pace_t * const p = &s_tab5_guest_pace;
+    if (wait_cycles) *wait_cycles = p->r80_wait_host_cycles;
+    if (requested_wait_us) *requested_wait_us = p->r80_wait_requested_us;
+    if (wait_events) *wait_events = p->r80_wait_events;
+    if (clamp_events) *clamp_events = p->r80_clamp_events;
+    if (discarded_lag_us)
+        *discarded_lag_us = tab5_guest_pace_q16_to_us(
+            p->r80_discarded_lag_q16, p->host_hz);
+    if (max_lag_us)
+        *max_lag_us = tab5_guest_pace_q16_to_us(
+            p->r80_max_lag_q16, p->host_hz);
+    if (max_lead_us)
+        *max_lead_us = tab5_guest_pace_q16_to_us(
+            p->r80_max_lead_q16, p->host_hz);
+    if (phase_us) {
+        const int64_t q = p->lead_host_q16;
+        const uint32_t mag = tab5_guest_pace_q16_to_us(
+            (uint64_t)((q < 0) ? -q : q), p->host_hz);
+        *phase_us = (q < 0) ? -(int32_t)mag : (int32_t)mag;
+    }
+    if (catchup_checks) *catchup_checks = p->r80_catchup_checks;
+    if (host_mhz) *host_mhz = p->host_hz / 1000000u;
+}
+
+void WinX68k_GuestPaceR86GetStats(uint64_t *carry_start_us,
+                                  uint64_t *preserved_us,
+                                  uint64_t *repaid_us,
+                                  uint64_t *max_carry_us,
+                                  uint64_t *final_carry_us,
+                                  int64_t *effective_phase_us,
+                                  uint32_t *wait_suppressed)
+{
+    const tab5_guest_pace_t * const p = &s_tab5_guest_pace;
+    if (carry_start_us)
+        *carry_start_us = tab5_guest_pace_q16_to_us64(
+            p->r86_capture_start_debt_q16, p->host_hz);
+    if (preserved_us)
+        *preserved_us = tab5_guest_pace_q16_to_us64(
+            p->r86_preserved_overflow_q16, p->host_hz);
+    if (repaid_us)
+        *repaid_us = tab5_guest_pace_q16_to_us64(
+            p->r86_repaid_overflow_q16, p->host_hz);
+    if (max_carry_us)
+        *max_carry_us = tab5_guest_pace_q16_to_us64(
+            p->r86_max_overflow_debt_q16, p->host_hz);
+    if (final_carry_us)
+        *final_carry_us = tab5_guest_pace_q16_to_us64(
+            p->r86_overflow_debt_q16, p->host_hz);
+    if (effective_phase_us) {
+        int64_t visible_us = 0;
+        if (p->lead_host_q16 < 0) {
+            visible_us = -(int64_t)tab5_guest_pace_q16_to_us64(
+                (uint64_t)(-p->lead_host_q16), p->host_hz);
+        } else {
+            visible_us = (int64_t)tab5_guest_pace_q16_to_us64(
+                (uint64_t)p->lead_host_q16, p->host_hz);
+        }
+        const uint64_t carry_us = tab5_guest_pace_q16_to_us64(
+            p->r86_overflow_debt_q16, p->host_hz);
+        *effective_phase_us = visible_us - (int64_t)carry_us;
+    }
+    if (wait_suppressed) *wait_suppressed = p->r86_wait_suppressed;
+}
+
+void WinX68k_GuestPaceR87GetStats(uint32_t *q_min,
+                                  uint32_t *q_max,
+                                  uint32_t *q_final,
+                                  uint32_t *recovery_allowed,
+                                  uint32_t *hold_events,
+                                  uint32_t *resume_events,
+                                  uint32_t *active_frames,
+                                  uint32_t *held_frames,
+                                  uint32_t *defer_checks,
+                                  uint32_t *repay_paused_checks,
+                                  uint64_t *deferred_lag_us)
+{
+    const tab5_guest_pace_t * const p = &s_tab5_guest_pace;
+    if (q_min) *q_min = (p->r87_audio_q_min == UINT32_MAX) ? 0u : p->r87_audio_q_min;
+    if (q_max) *q_max = p->r87_audio_q_max;
+    if (q_final) *q_final = p->r87_audio_q_effective;
+    if (recovery_allowed) *recovery_allowed = p->r87_recovery_allowed;
+    if (hold_events) *hold_events = p->r87_hold_events;
+    if (resume_events) *resume_events = p->r87_resume_events;
+    if (active_frames) *active_frames = p->r87_active_frames;
+    if (held_frames) *held_frames = p->r87_held_frames;
+    if (defer_checks) *defer_checks = p->r87_defer_checks;
+    if (repay_paused_checks) *repay_paused_checks = p->r87_repay_paused_checks;
+    if (deferred_lag_us)
+        *deferred_lag_us = tab5_guest_pace_q16_to_us64(
+            p->r87_deferred_lag_q16, p->host_hz);
+}
 #endif
 
 int WinX68k_ExecVideoProbeFrame(void)
 {
 #ifdef HAVE_MUSASHI
+#ifdef ESP_PLATFORM
+    static int r57e70a_announced = 0;
+    if (!r57e70a_announced) {
+        r57e70a_announced = 1;
+        printf("PX68K_SCHED_R57E70A: adaptive idle scanline coalescing ACTIVE max=%d; MFP/DMA012 active path remains %d-cycle exact\n",
+               TAB5_R57E70A_IDLE_SLICE_MAX, CLOCK_SLICE);
+        printf("PX68K_DEVBOUND_R57E71: CPU scheduler boundary hot path ACTIVE; DMA012 idle calls eliminated + cached MFP B/C exact mode\n");
+        printf("PX68K_PACE_R57E80: governor accounting ACTIVE; wait/clamp/debt counters are one-shot readable, no periodic UART\n");
+        printf("PX68K_PACE_R57E86: overflow-debt carry ACTIVE; lag beyond bounded reservoir is preserved and repaid before any future pacing wait\n");
+        printf("PX68K_PACE_R57E87: audio-reserve-aware carry ACTIVE; recovery Q<=8192, hold Q>=16384; held lag is preserved, never discarded\n");
+        printf("PX68K_PACE_R57E88: mid-ring reservoir ACTIVE; 8K/16K hysteresis leaves >=16K host-ring headroom while covering measured ~124ms bursts\n");
+    }
+#endif
     static int key_int_cnt = 0;
     static int mouse_int_cnt = 0;
     int clk_total;
@@ -3798,7 +4119,7 @@ int WinX68k_ExecVideoProbeFrame(void)
         {
             const uint32_t perf_iter_t0 = perf_sample ? tab5_perf_ccount() : 0u;
             uint32_t perf_cpu_cc = 0u, perf_mfp_cc = 0u, perf_rtc_cc = 0u, perf_dma_cc = 0u;
-            int request = (remaining > CLOCK_SLICE) ? CLOCK_SLICE : remaining;
+            int request = tab5_r57e70a_slice_request(remaining);
             int executed;
             if (perf_sample)
             {
