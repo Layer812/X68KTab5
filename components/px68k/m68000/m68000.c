@@ -331,6 +331,7 @@ void m68k_write_memory_8(uint32_t address, uint32_t data)
 	{
 		BusErrFlag = 0;
 		MEM[address ^ 1u] = (uint8_t)data;
+		m68k_tab5_exec123_note_ram_write8(address);
 		return;
 	}
 #endif
@@ -369,6 +370,7 @@ void m68k_write_memory_16(uint32_t address, uint32_t data)
 		uint8_t *p = MEM + address;
 		BusErrFlag = 0;
 		px68k_native_word_store(p, data);
+		m68k_tab5_exec123_note_ram_write16(address);
 		return;
 	}
 #endif
@@ -407,6 +409,7 @@ void IRAM_ATTR __attribute__((hot, optimize("O3"))) m68k_write_memory_32(uint32_
 		uint8_t *p = MEM + address;
 		BusErrFlag = 0;
 		px68k_native_long_store(p, data);
+		m68k_tab5_exec123_note_ram_write32(address);
 		return;
 	}
 #endif
@@ -498,6 +501,7 @@ int IRAM_ATTR __attribute__((hot, optimize("O3"))) px68k_m68k_zero_fill_ram(uint
 #endif
     if (remain) memset(dst, 0, remain);
     BusErrFlag = 0;
+    m68k_tab5_exec123_invalidate_range(address, bytes);
     return 1;
 }
 
@@ -526,6 +530,7 @@ px68k_m68k_repeat_fill_ram(uint32_t address, uint32_t value,
     {
         memset(dst, 0, bytes);
         BusErrFlag = 0;
+        m68k_tab5_exec123_invalidate_range(address, bytes);
         return 1;
     }
 
@@ -583,6 +588,7 @@ px68k_m68k_repeat_fill_ram(uint32_t address, uint32_t value,
     }
 
     BusErrFlag = 0;
+    m68k_tab5_exec123_invalidate_range(address, bytes);
     return 1;
 }
 
@@ -696,6 +702,7 @@ px68k_m68k_live_repeat_movew_ram(uint32_t code_address, uint32_t dest_address,
         __builtin_memcpy(dst, &value16, sizeof(value16));
 
     BusErrFlag = 0;
+    m68k_tab5_exec123_invalidate_range(dest_address, bytes);
     return n;
 }
 

@@ -6,9 +6,6 @@
 #include "tab5_video.h"
 #include "tab5_branding.h"
 
-#ifndef PX68K_TAB5_RELEASE_DIAGNOSTICS
-#define PX68K_TAB5_RELEASE_DIAGNOSTICS 0
-#endif
 
 #include "tab5_guest_input.h"
 #include "tab5_lp_broker.h"
@@ -100,16 +97,42 @@ static inline void tab5_touch_joy_publish(uint16_t joy)
     }
 }
 extern "C" void tab5_screen_manager_present_complete(uint64_t screen_token, int success);
-static bool s_present_started = false;
+extern "C" uint32_t WinX68k_GetMonitorClass(void);
+static volatile uint32_t s_present_started = 0u;
 static bool s_game_controls_enabled = false;
-/* R57E95T: false=N/A 44.1kHz, true=Turbo 22.05kHz.  Rate only: no buffer,
- * watermark, task-priority or R94 guard changes are coupled to this button. */
-static bool s_turbo_audio_22k = false;
 
+/* P12R6A4 three-stage host-resource profile; never an X68000 overclock.
+ * 0=NORMAL 44.1k, 1=GREEN TURBO 22.05k, 2=RED TURBO 11.025k.
+ * Both Turbo levels cap expensive host visual work at 24fps; RED spends the
+ * additional audio savings on headroom, not a 30fps target. */
+static volatile uint32_t s_p12r6_turbo = 0u;
+static volatile uint32_t s_p12r6_turbo_lcd_period_us = 66667u; /* safe entry=15fps */
+
+extern "C" uint32_t tab5_video_turbo_mode(void)
+{
+    return __atomic_load_n(&s_p12r6_turbo, __ATOMIC_ACQUIRE);
+}
 extern "C" int tab5_video_turbo_enabled(void)
 {
-    return s_turbo_audio_22k ? 1 : 0;
+    return tab5_video_turbo_mode() ? 1 : 0;
 }
+extern "C" uint32_t tab5_video_turbo_period_us_r128(void)
+{
+    return __atomic_load_n(&s_p12r6_turbo_lcd_period_us, __ATOMIC_RELAXED);
+}
+extern "C" uint32_t tab5_video_turbo_fps_r128(void)
+{
+    const uint32_t p = tab5_video_turbo_period_us_r128();
+    return (p <= 41667u) ? 24u : ((p <= 50000u) ? 20u : 15u);
+}
+extern "C" void tab5_video_set_turbo_fps_r128(uint32_t fps)
+{
+    uint32_t period = 66667u;
+    if (fps >= 24u) period = 41667u;
+    else if (fps >= 20u) period = 50000u;
+    __atomic_store_n(&s_p12r6_turbo_lcd_period_us, period, __ATOMIC_RELAXED);
+}
+
 static bool s_host_ui_exclusive = false;
 static bool s_panic_compat_enabled = false;
 
@@ -181,14 +204,6 @@ static volatile uint32_t s_touch_irq_pending = 0;
 static bool s_touch_irq_enabled = false;
 static bool s_touch_contact_active = false;
 static int64_t s_touch_last_sample_us = 0;
-static volatile uint32_t s_touch_irq_count = 0;
-static volatile uint32_t s_touch_update_count = 0;
-static volatile uint32_t s_touch_irq_samples = 0;
-static volatile uint32_t s_touch_active_samples = 0;
-static volatile uint32_t s_touch_safety_samples = 0;
-static volatile uint32_t s_touch_update_us = 0;
-static volatile uint32_t s_touch_update_max_us = 0;
-static volatile uint32_t s_touch_irq_fallback = 0;
 static bool s_async_ready = false;
 /* R48: LIVE requests carry a presentation epoch.  A geometry/source barrier
  * increments this before rebuilding ScrBuf so any request already queued or
@@ -201,70 +216,52 @@ static uint64_t s_live_epoch_drops = 0u;
  * Only CPU1 submits frozen LIVE frames and it waits for each one to complete,
  * so a single binary semaphore is sufficient. */
 static SemaphoreHandle_t s_frozen_present_done = nullptr;
-static uint64_t s_r52_frozen_submits = 0u;
-static uint64_t s_r52_frozen_presented = 0u;
-static uint64_t s_r52_frozen_timeouts = 0u;
-static uint64_t s_r52_frozen_copy_us = 0u;
-static uint64_t s_r52_frozen_wait_us = 0u;
 
 /* Writer count permits nested marking (normal line + PPA batch flush).  The
  * generation increments once for every completed writer section. */
 static uint32_t s_line_writers[kTrackedLines] = {};
 static uint32_t s_line_generation[kTrackedLines] = {};
-/* R40: producer-published source-X dirty envelope.  Multiple producer writes
- * before the next LCD consumption union into the same pending span.  LCD
- * atomically consumes it under the same tiny spinlock; an empty x0/x1 pair
- * then lets the next producer start a fresh envelope. */
-static DRAM_ATTR uint16_t s_line_dirty_x0[kTrackedLines] = {};
-static DRAM_ATTR uint16_t s_line_dirty_x1[kTrackedLines] = {};
-/* R42: 32-source-pixel sparse producer mask. 800px max width => 25 useful bits,
- * so one uint32_t per tracked line preserves sparse X without another large SRAM table. */
+/* R42/HF3: producer-published sparse dirty state. Multiple producer writes
+ * before the next LCD consumption union through atomic mask OR; the presenter
+ * atomically exchanges the stable-generation mask and never blocks a writer. */
+/* HF3 CPU1 NO-WAIT: dirty publication is a pure atomic OR/exchange channel.
+ * Exact R42 writers publish 32-source-pixel bits; generic/span writers publish
+ * the conservative full-row sentinel.  No CPU1 writer ever spins on presenter state. */
 static DRAM_ATTR uint32_t s_line_dirty_tile32[kTrackedLines] = {};
-static portMUX_TYPE s_line_dirty_span_mux = portMUX_INITIALIZER_UNLOCKED;
 
-static portMUX_TYPE s_stats_mux = portMUX_INITIALIZER_UNLOCKED;
-static uint32_t s_submitted_frames = 0;
-static uint32_t s_presented_frames = 0;
-static uint32_t s_dropped_frames = 0;
-static uint32_t s_last_copy_us = 0;
-static uint32_t s_last_push_us = 0;
-static uint32_t s_cpu0_push_total_us = 0;
 /* R57E74: managed immutable dirty-map effectiveness. */
-static uint32_t s_r74_managed_rows_scanned = 0;
-static uint32_t s_r74_managed_rows_skipped = 0;
-static uint32_t s_r74_managed_map_frames = 0;
-static uint32_t s_r82_slot_sparse_frames = 0;
-static uint32_t s_r82_slot_full_frames = 0;
-static uint32_t s_r82_slot_rows_copied = 0;
-static uint32_t s_r82_slot_rows_skipped = 0;
-static uint32_t s_r82_slot_forcefull_rejects = 0;
-static uint64_t s_r82_slot_bytes_copied = 0;
 static uint32_t s_r82_submit_w = 0;
 static uint32_t s_r82_submit_h = 0;
 /* R57E83: phase timers are cumulative and sampled only by the silent
  * one-shot recorder.  No periodic UART is added. */
-static uint64_t s_r83_slot_copy_us = 0;
-static uint64_t s_r83_display_lock_us = 0;
-static uint64_t s_r83_push_frame_us = 0;
-static uint64_t s_r83_ppa_us = 0;
-static uint64_t s_r83_refresh_wait_us = 0;
 
 /* R57E84: managed immutable snapshots use the already-proven R42/R49
  * direct-native front-buffer mechanism in steady state instead of PPA.
  * Full/transition/recovery frames remain on the managed PPA path. */
-static uint32_t s_r84_native_frames = 0;
-static uint32_t s_r84_native_fallbacks = 0;
-static uint32_t s_r84_native_tile_runs = 0;
-static uint32_t s_r84_native_tiles = 0;
-static uint64_t s_r84_native_wall_us = 0;
-static uint64_t s_r84_native_sync_us = 0;
-static uint64_t s_r84_native_source_pixels = 0;
-static uint64_t s_r84_native_preserved_pixels = 0;
 
 static bool s_r74_managed_force_full_next = true;
-static uint32_t s_live_presented_frames = 0;
-static uint32_t s_live_row_retries = 0;
-static uint32_t s_live_unstable_rows = 0;
+
+/* P12R5 presentation-only geometry debounce.
+ * Guest/CRTC geometry remains authoritative and untouched on CPU1.  CPU0 LCD
+ * presentation accepts a new managed ScreenVersion geometry only after two
+ * consecutive observations.  A one-frame A->B->A excursion is acknowledged
+ * without changing the physical viewport, eliminating geometry-triggered full
+ * refresh blink while preserving the no-wait guest contract.
+ *
+ * If the confirming ScreenVersion is sparse, wait for the next forced full
+ * presenter snapshot before committing the new geometry; sparse slots contain
+ * intentionally stale clean rows and must never be promoted to a new geometry. */
+static uint32_t s_p12r5_geom_stable_w = 0u;
+static uint32_t s_p12r5_geom_stable_h = 0u;
+static uint32_t s_p12r5_geom_stable_pitch = 0u;
+static uint32_t s_p12r5_geom_pending_w = 0u;
+static uint32_t s_p12r5_geom_pending_h = 0u;
+static uint32_t s_p12r5_geom_pending_pitch = 0u;
+static uint8_t  s_p12r5_geom_pending_count = 0u;
+static volatile uint32_t s_p12r5_geom_force_full_next = 0u;
+static uint64_t s_p12r5_geom_candidates = 0u;
+static uint64_t s_p12r5_geom_accepted = 0u;
+static uint64_t s_p12r5_geom_rejected_transient = 0u;
 
 /* Build 6.14d: presentation pacing is host-only.  Quantize normal live-FB
  * presentation onto the X68000 CRTC cadence while keeping the newest queued
@@ -272,12 +269,6 @@ static uint32_t s_live_unstable_rows = 0;
 static esp_timer_handle_t s_pace_timer = nullptr;
 static int64_t s_pace_next_us = 0;
 static int64_t s_pace_last_present_us = 0;
-static uint32_t s_pace_waits = 0;
-static uint32_t s_pace_wait_us = 0;
-static uint32_t s_pace_last_wait_us = 0;
-static uint32_t s_pace_coalesced_frames = 0;
-static uint32_t s_pace_skipped_slots = 0;
-static uint32_t s_pace_last_interval_us = 0;
 static bool s_pace_active_logged = false;
 
 /* Build 5.98: libretro advertises PX68K output at a fixed 4:3 display
@@ -346,11 +337,6 @@ static constexpr uint32_t kDbfbPpaSubmitCap = 2;
 static constexpr uint32_t kDbfbPpaMergeGapRows = 8;
 static dbfb_dirty_band_t s_dsi_ppa_prev_bands[kDbfbDirtyBandCap] = {};
 static uint32_t s_dsi_ppa_prev_band_count = 0;
-static uint64_t s_dsi_ppa_us = 0;
-static uint64_t s_dsi_ppa_pixels = 0;
-static uint64_t s_dsi_ppa_rows = 0;
-static uint64_t s_dsi_ppa_ops = 0;
-static uint64_t s_dsi_ppa_frames = 0;
 /* Back-buffer coherence state.  Most frames repair only the previous frame's
  * changed LCD row span after refresh_done.  A full Front->Back sync is needed
  * only after M5GFX/UI writes, geometry resets, or initial activation. */
@@ -366,21 +352,7 @@ static async_memcpy_handle_t s_dsi_sync_gdma = nullptr;
 static SemaphoreHandle_t s_dsi_sync_done = nullptr;
 static SemaphoreHandle_t s_dsi_refresh_event = nullptr;
 static volatile uint32_t s_dsi_refresh_seq = 0;
-static volatile uint32_t s_dsi_refresh_last_us = 0;
-static volatile uint32_t s_dsi_refresh_period_us = 0;
 static volatile uint32_t s_dsi_sync_pending = 0;
-static uint64_t s_dbfb_sync_us = 0;
-static uint64_t s_dbfb_sync_bytes = 0;
-static uint64_t s_dbfb_sync_count = 0;
-static uint64_t s_dbfb_sync_full_count = 0;
-static uint64_t s_dbfb_sync_repair_count = 0;
-static uint64_t s_dbfb_sync_fallback = 0;
-static uint64_t s_dbfb_flush_us = 0;
-static uint64_t s_dbfb_flush_bytes = 0;
-static uint64_t s_dbfb_flush_count = 0;
-static uint64_t s_dbfb_swap_count = 0;
-static uint64_t s_dbfb_refresh_wait_us = 0;
-static uint64_t s_dbfb_refresh_timeouts = 0;
 
 /* Build 6.15h17R32: R31 proved that the expensive part is not scale/diff or
  * PPA Back writes, but the DPI framebuffer switch/refresh path.  Keep the
@@ -394,10 +366,6 @@ static uint64_t s_dbfb_refresh_timeouts = 0;
 static constexpr uint32_t kR32WarmupSwapFrames = 8u;
 static bool s_r32_direct_front = false;
 static uint32_t s_r32_warmup_swaps = 0u;
-static uint64_t s_r32_direct_frames = 0u;
-static uint64_t s_r32_direct_ppa_us = 0u;
-static uint64_t s_r32_direct_rows = 0u;
-static uint64_t s_r32_direct_ops = 0u;
 
 /* R49 correctness hardening:
  * - keep normal scanout on driver FB0 only after init;
@@ -412,7 +380,6 @@ static uint64_t s_r32_direct_ops = 0u;
 #endif
 static bool s_r49_force_full_front = true;
 static uint64_t s_r49_full_repaint_requests = 0u;
-static uint64_t s_r49_full_repaints = 0u;
 static uint64_t s_r49_fb0_pin_failures = 0u;
 
 /* Build 6.15h17R34: replace steady-state PPA rotation with an IRAM/XespV-
@@ -432,12 +399,6 @@ static uint64_t s_r49_fb0_pin_failures = 0u;
 static DRAM_ATTR uint16_t s_r34_tile[64] __attribute__((aligned(16))) = {};
 static bool s_r34_front_cache_primed = false;
 static bool s_r34_selfcheck_ok = false;
-static uint64_t s_r34_frames = 0u;
-static uint64_t s_r34_rotate_us = 0u;
-static uint64_t s_r34_sync_us = 0u;
-static uint64_t s_r34_rows = 0u;
-static uint64_t s_r34_tiles = 0u;
-static uint64_t s_r34_scalar_pixels = 0u;
 
 /* Build 6.15h17R35: R34 proved that merely replacing PPA with software
  * rotation is not enough: the 8x8 kernel still performs thousands of small
@@ -450,8 +411,6 @@ static uint64_t s_r34_scalar_pixels = 0u;
 #define PX68K_TAB5_R35_INTERNAL_STRIPE 1
 #endif
 static uint16_t *s_r35_pack8 = nullptr;
-static uint64_t s_r35_pack_us = 0u;
-static uint64_t s_r35_pack_stripes = 0u;
 static bool s_r35_line_scratch_internal = false;
 
 /* Build 6.15h17R37: R36 proved that eliminating the 960x720 scale staging
@@ -479,7 +438,6 @@ static const uint16_t *s_r37_shadow_source = nullptr;
 static uint32_t s_r37_shadow_pitch = 0u;
 static uint32_t s_r37_shadow_width = 0u;
 static uint32_t s_r37_shadow_height = 0u;
-static DRAM_ATTR uint32_t s_r36_dirty_block_bits[3] = {}; /* legacy R36-R40 fallback bookkeeping */
 /* R41: keep dirty coverage at the native store granularity instead of
  * widening all X spans inside an 8-row block into one large rectangle.
  * 960 / 8 = 120 logical X tiles, 720 / 8 = 90 logical Y blocks. */
@@ -491,29 +449,7 @@ static DRAM_ATTR uint32_t s_r41_tile_mask[kR41TileRows][kR41TileWords] = {};
 typedef struct { uint16_t x0, x1, y0, y1; } r40_dirty_rect_t;
 static DRAM_ATTR r40_dirty_rect_t s_r40_sync_rects[kR41SyncRectCap] = {};
 static uint64_t s_r36_updates = 0u;
-static uint64_t s_r36_calls = 0u;
-static uint64_t s_r36_scan_us = 0u;
-static uint64_t s_r36_scale_us = 0u;
-static uint64_t s_r36_store_us = 0u;
-static uint64_t s_r36_sync_us = 0u;
-static uint64_t s_r36_blocks = 0u;
-static uint64_t s_r40_block_width_sum = 0u;
-static uint64_t s_r40_logical_pixels = 0u;
-static uint64_t s_r41_dirty_tiles = 0u;
-static uint64_t s_r41_tile_runs = 0u;
-static uint64_t s_r41_sync_rects_total = 0u;
-static uint64_t s_r41_span_fallbacks = 0u;
-static uint64_t s_r41_sync_overflows = 0u;
-static uint64_t s_r41_verify_ok = 0u;
-static uint64_t s_r41_verify_skip = 0u;
 static uint64_t s_r41_verify_fail = 0u;
-static uint64_t s_r42_src_tile_rows = 0u;
-static uint64_t s_r42_src_tiles = 0u;
-static uint64_t s_r42_src_mask_fallbacks = 0u;
-static uint64_t s_r37_rows_tested = 0u;
-static uint64_t s_r37_rows_same = 0u;
-static uint64_t s_r37_rows_changed = 0u;
-static uint64_t s_r37_rows_copied = 0u;
 #else
 static void *s_dsi_panel = nullptr;
 static uint32_t s_dsi_stride_pixels = 0;
@@ -587,10 +523,6 @@ static uint8_t s_panic_compat_last_enable = 0xff;
  * s_aspect_frame for the PIE wrapper. */
 static uint8_t *s_aspect_line_scratch_raw = nullptr;
 static uint16_t *s_aspect_line_scratch = nullptr;
-static uint64_t s_vdiff_tested_src_rows = 0;
-static uint64_t s_vdiff_same_src_rows = 0;
-static uint64_t s_vdiff_changed_src_rows = 0;
-static uint64_t s_vdiff_identical_dst_rows = 0;
 static uint16_t s_aspect_xmap[kAspectMapMaxWidth] = {};
 static uint16_t s_aspect_ymap[kAspectViewportHeight] = {};
 static uint32_t s_aspect_map_src_w = 0;
@@ -613,8 +545,6 @@ static uint32_t s_aspect_seen_src_h = 0;
 static uint32_t s_aspect_seen_pitch = 0;
 static uint32_t s_aspect_dirty_frames = 0;
 static uint32_t s_aspect_full_frames = 0;
-static uint32_t s_aspect_dirty_bands = 0;
-static uint32_t s_aspect_dirty_rows = 0;
 
 /*
  * In-game touch chrome + runtime media changer
@@ -718,12 +648,36 @@ static void draw_game_controls_unlocked(void)
     /* Build 6.12o: software keyboard launcher in the unused left-side slot. */
     draw_panel_button(31, 207, 98, 68, "KEY", 0x1082, 0x8410, 2);
 
-    /* R57E95T: directly below KEY.  User wording is intentionally N/A/Turbo. */
-    draw_panel_button(31, 296, 98, 58,
-                      s_turbo_audio_22k ? "Turbo" : "N/A",
-                      s_turbo_audio_22k ? 0x03E0 : TFT_BLACK,
-                      s_turbo_audio_22k ? 0x07E0 : 0x8410,
-                      2);
+    /* P12R6A4: one TURBO button cycles BLACK -> GREEN -> RED. */
+    const uint32_t turbo_mode = tab5_video_turbo_mode();
+    const bool turbo = (turbo_mode != 0u);
+    const uint16_t turbo_fill = turbo_mode >= 2u ? 0x7800 :
+                                (turbo_mode == 1u ? 0x03E0 : TFT_BLACK);
+    const uint16_t turbo_edge = turbo_mode >= 2u ? 0xF800 :
+                                (turbo_mode == 1u ? 0x07E0 : 0x8410);
+    draw_panel_button(31, 296, 98, 58, "TURBO",
+                      turbo_fill, turbo_edge, 2);
+
+    /* MULTISCAN remains AUTO/status-only.  Relocate it below TURBO so mode
+     * detection stays visible without stealing the button. */
+    const uint32_t monitor_class = WinX68k_GetMonitorClass();
+    const char *monitor_label = monitor_class == 15u ? "15k" :
+                                (monitor_class == 24u ? "24k" :
+                                (monitor_class == 31u ? "31k" : "AUTO"));
+    char scan_line[20];
+    std::snprintf(scan_line, sizeof(scan_line), "SCAN %s", monitor_label);
+    M5.Display.setTextDatum(textdatum_t::middle_center);
+    M5.Display.setTextSize(1);
+    M5.Display.setTextColor(0x8410, TFT_BLACK);
+    M5.Display.drawString(scan_line, 80, 389);
+    if (turbo) {
+        char fps_line[20];
+        std::snprintf(fps_line, sizeof(fps_line), "%ufps",
+                      (unsigned)tab5_video_turbo_fps_r128());
+        M5.Display.setTextColor(turbo_mode >= 2u ? 0xF800 : 0x07E0, TFT_BLACK);
+        M5.Display.drawString(fps_line, 80, 410);
+    }
+    M5.Display.setTextDatum(textdatum_t::top_left);
 
     draw_dpad_button(53, 520, 54, 54, 'U');
     draw_dpad_button(17, 577, 56, 60, 'L');
@@ -812,8 +766,6 @@ static uint32_t s_touch_transition_target_pitch = 0u;
 static bool s_touch_transition_active = false;
 static bool s_touch_transition_present_guard = false;
 static uint8_t s_touch_transition_release_stable = 0u;
-static uint32_t s_touch_transition_arm_count = 0u;
-static uint32_t s_touch_transition_rearm_count = 0u;
 static bool s_force_game_redraw = false;
 static int s_media_overlay_drive = 0; /* 0=FDD0, 1=FDD1, 2=HDD0 */
 static size_t s_media_overlay_page = 0;
@@ -832,6 +784,15 @@ static bool s_softkbd_touch_down = false;
 static bool s_softkbd_shift = false;
 static bool s_softkbd_ctrl = false;
 
+/* R57E125A: never transfer LCD/touch ownership to FILE/KEY while the opening
+ * finger is still down.  R124 device logs reproduced a presenter liveness loss
+ * exactly when KEY became active with GPIO23 low/contact=1 just after a geometry
+ * transition.  Queue the ownership request, require two released samples after
+ * the transition fence is fully rearmed, then open the overlay. */
+enum : uint8_t { TOUCH125_UI_NONE=0u, TOUCH125_UI_KEY=1u, TOUCH125_UI_FILE=2u };
+static uint8_t s_touch125_ui_pending = TOUCH125_UI_NONE;
+static uint8_t s_touch125_ui_release_stable = 0u;
+
 /* Build 6.12o: compose locally, preview, then SEND.  One buffered item is one
  * X68000 key tap plus the SHIFT/CTRL state captured when it was entered. */
 typedef struct {
@@ -844,9 +805,10 @@ static soft_input_event_t s_soft_input[kSoftInputMax] = {};
 static size_t s_soft_input_count = 0;
 
 enum : uint8_t {
-    SOFTKEY_NORMAL = 0,
-    SOFTKEY_SHIFT  = 1,
-    SOFTKEY_CTRL   = 2,
+    SOFTKEY_NORMAL   = 0,
+    SOFTKEY_SHIFT    = 1,
+    SOFTKEY_CTRL     = 2,
+    SOFTKEY_RET_SEND = 3,
 };
 
 typedef struct {
@@ -878,7 +840,7 @@ static const soft_key_t kSoftRow2[] = {
 static const soft_key_t kSoftRow3[] = {
     {"CTRL",0x71,2,SOFTKEY_CTRL},{"A",0x1E,1,0},{"S",0x1F,1,0},{"D",0x20,1,0},
     {"F",0x21,1,0},{"G",0x22,1,0},{"H",0x23,1,0},{"J",0x24,1,0},{"K",0x25,1,0},
-    {"L",0x26,1,0},{";",0x27,1,0},{":",0x28,1,0},{"]",0x29,1,0},{"RET",0x1D,2,0},
+    {"L",0x26,1,0},{";",0x27,1,0},{":",0x28,1,0},{"]",0x29,1,0},{"RET+SEND",0x1D,2,SOFTKEY_RET_SEND},
 };
 static const soft_key_t kSoftRow4[] = {
     {"SHIFT",0x70,2,SOFTKEY_SHIFT},{"Z",0x2A,1,0},{"X",0x2B,1,0},{"C",0x2C,1,0},
@@ -950,7 +912,7 @@ static void softkbd_build_preview(char *out,size_t cap)
         char tok[20] = {};
         if (!std::strcmp(lab,"SPACE")) {
             std::strcpy(tok," ");
-        } else if (!std::strcmp(lab,"RET")) {
+        } else if (!std::strcmp(lab,"RET") || !std::strcmp(lab,"RET+SEND")) {
             std::strcpy(tok,"<RET>");
         } else if (std::strlen(lab)==1 && std::isalpha((unsigned char)lab[0])) {
             char c=lab[0];
@@ -1029,7 +991,10 @@ static void draw_soft_keyboard_unlocked(void)
             M5.Display.fillRoundRect(x,y,w,h,5,fill);
             M5.Display.drawRoundRect(x,y,w,h,5,border);
             M5.Display.setTextDatum(textdatum_t::middle_center);
-            M5.Display.setTextSize((std::strlen(k.label)>=5)?1:2);
+            const bool normal_size_long =
+                !std::strcmp(k.label,"SHIFT") || !std::strcmp(k.label,"SPACE") ||
+                !std::strcmp(k.label,"RIGHT") || !std::strcmp(k.label,"RET+SEND");
+            M5.Display.setTextSize((std::strlen(k.label)>=5 && !normal_size_long)?1:2);
             M5.Display.setTextColor(TFT_WHITE,fill);
             M5.Display.drawString(k.label,x+w/2,y+h/2);
         }
@@ -1111,6 +1076,11 @@ static void softkbd_click(int x,int y)
             const soft_key_t &k=row.keys[i];
             if (k.kind==SOFTKEY_SHIFT) { s_softkbd_shift=!s_softkbd_shift; s_softkbd_redraw=true; return; }
             if (k.kind==SOFTKEY_CTRL)  { s_softkbd_ctrl=!s_softkbd_ctrl; s_softkbd_redraw=true; return; }
+            if (k.kind==SOFTKEY_RET_SEND) {
+                softkbd_buffer_key(k);
+                if (softkbd_send_buffer()) softkbd_close_to_guest();
+                return;
+            }
             softkbd_buffer_key(k);
             return;
         }
@@ -1161,11 +1131,8 @@ static bool touch_transition_consume_pending(void)
     s_touch_dpad_press_us = 0;
     update_game_touch_keyboard(0);
     tab5_touch_joy_publish(0);
-    ++s_touch_transition_arm_count;
-
     ESP_LOGI(TAG,
-             "PX68K_TOUCHR57E3: transition fence ARM #%lu epoch=%lu target=%lux%lu pitch=%lu; touch actions held until matching present + release",
-             (unsigned long)s_touch_transition_arm_count,
+             "PX68K_TOUCHR57E3: transition fence ARM epoch=%lu target=%lux%lu pitch=%lu; touch actions held until matching present + release",
              (unsigned long)epoch,
              (unsigned long)s_touch_transition_target_w,
              (unsigned long)s_touch_transition_target_h,
@@ -1197,7 +1164,35 @@ static EXT_RAM_BSS_ATTR char s_runtime_hdd0[TAB5_VIDEO_MEDIA_PATH_MAX] = {};
 static EXT_RAM_BSS_ATTR char s_media_pending_fdd0[TAB5_VIDEO_MEDIA_PATH_MAX] = {};
 static EXT_RAM_BSS_ATTR char s_media_pending_fdd1[TAB5_VIDEO_MEDIA_PATH_MAX] = {};
 static EXT_RAM_BSS_ATTR char s_media_pending_hdd0[TAB5_VIDEO_MEDIA_PATH_MAX] = {};
-static portMUX_TYPE s_runtime_media_mux = portMUX_INITIALIZER_UNLOCKED;
+/* HF3: runtime mounted-media state is published by CPU1 with a seqlock.
+ * CPU0 UI takes at most one snapshot attempt and never spins on CPU1. */
+static volatile uint32_t s_runtime_media_seq = 0u;
+static volatile uint32_t s_runtime_media_refresh_pending = 0u;
+
+/* HF3 seqlock payload uses atomic byte accesses as well: the epoch detects a
+ * mixed snapshot, while atomic bytes keep the cross-core C++ access itself
+ * data-race-free.  This path is FILE-control-only, never the render hot path. */
+static void runtime_media_atomic_store_path(char *dst, const char *src)
+{
+    if (!dst) return;
+    const char *p = src ? src : "";
+    size_t i = 0u;
+    for (; i + 1u < TAB5_VIDEO_MEDIA_PATH_MAX && p[i]; ++i)
+        __atomic_store_n(&dst[i], p[i], __ATOMIC_RELAXED);
+    __atomic_store_n(&dst[i], '\0', __ATOMIC_RELAXED);
+}
+
+static void runtime_media_atomic_load_path(char *dst, const char *src)
+{
+    if (!dst || !src) return;
+    size_t i = 0u;
+    for (; i + 1u < TAB5_VIDEO_MEDIA_PATH_MAX; ++i) {
+        const char c = __atomic_load_n(&src[i], __ATOMIC_RELAXED);
+        dst[i] = c;
+        if (!c) return;
+    }
+    dst[TAB5_VIDEO_MEDIA_PATH_MAX - 1u] = '\0';
+}
 
 static void runtime_media_scan(void)
 {
@@ -1227,14 +1222,37 @@ static bool queue_ui_action(tab5_video_action_type_t type, const char *path)
     return xQueueSend(s_ui_actions, &a, 0) == pdTRUE;
 }
 
-static void snapshot_runtime_media_to_pending(void)
+static bool snapshot_runtime_media_once(char *fdd0, char *fdd1, char *hdd0, int *boot_source)
 {
-    portENTER_CRITICAL(&s_runtime_media_mux);
-    std::snprintf(s_media_pending_fdd0, sizeof(s_media_pending_fdd0), "%s", s_runtime_fdd0);
-    std::snprintf(s_media_pending_fdd1, sizeof(s_media_pending_fdd1), "%s", s_runtime_fdd1);
-    std::snprintf(s_media_pending_hdd0, sizeof(s_media_pending_hdd0), "%s", s_runtime_hdd0);
-    s_media_overlay_boot_source = s_runtime_boot_source;
-    portEXIT_CRITICAL(&s_runtime_media_mux);
+    const uint32_t seq0 = __atomic_load_n(&s_runtime_media_seq, __ATOMIC_ACQUIRE);
+    if (seq0 & 1u) return false;
+    runtime_media_atomic_load_path(fdd0, s_runtime_fdd0);
+    runtime_media_atomic_load_path(fdd1, s_runtime_fdd1);
+    runtime_media_atomic_load_path(hdd0, s_runtime_hdd0);
+    const int boot = __atomic_load_n(&s_runtime_boot_source, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    const uint32_t seq1 = __atomic_load_n(&s_runtime_media_seq, __ATOMIC_ACQUIRE);
+    if (seq0 != seq1 || (seq1 & 1u)) return false;
+    if (boot_source) *boot_source = boot;
+    return true;
+}
+
+static bool snapshot_runtime_media_to_pending(void)
+{
+    char f0[TAB5_VIDEO_MEDIA_PATH_MAX] = {};
+    char f1[TAB5_VIDEO_MEDIA_PATH_MAX] = {};
+    char hd[TAB5_VIDEO_MEDIA_PATH_MAX] = {};
+    int boot = TAB5_LAUNCH_BOOT_FLOPPY0;
+    if (!snapshot_runtime_media_once(f0, f1, hd, &boot)) {
+        __atomic_store_n(&s_runtime_media_refresh_pending, 1u, __ATOMIC_RELEASE);
+        return false;
+    }
+    std::snprintf(s_media_pending_fdd0, sizeof(s_media_pending_fdd0), "%s", f0);
+    std::snprintf(s_media_pending_fdd1, sizeof(s_media_pending_fdd1), "%s", f1);
+    std::snprintf(s_media_pending_hdd0, sizeof(s_media_pending_hdd0), "%s", hd);
+    s_media_overlay_boot_source = boot;
+    __atomic_store_n(&s_runtime_media_refresh_pending, 0u, __ATOMIC_RELEASE);
+    return true;
 }
 
 static void close_media_overlay(void)
@@ -1314,11 +1332,14 @@ static bool apply_runtime_media_selection(int drive, const char *path)
     const char *requested = path ? path : "";
 
     char current[TAB5_VIDEO_MEDIA_PATH_MAX] = {};
-    portENTER_CRITICAL(&s_runtime_media_mux);
-    const char *runtime_ro = drive == 0 ? s_runtime_fdd0 :
-                             (drive == 1 ? s_runtime_fdd1 : s_runtime_hdd0);
-    std::snprintf(current, sizeof(current), "%s", runtime_ro);
-    portEXIT_CRITICAL(&s_runtime_media_mux);
+    char f0[TAB5_VIDEO_MEDIA_PATH_MAX] = {};
+    char f1[TAB5_VIDEO_MEDIA_PATH_MAX] = {};
+    char hd[TAB5_VIDEO_MEDIA_PATH_MAX] = {};
+    int boot_ignored = TAB5_LAUNCH_BOOT_FLOPPY0;
+    if (snapshot_runtime_media_once(f0, f1, hd, &boot_ignored)) {
+        const char *runtime_ro = drive == 0 ? f0 : (drive == 1 ? f1 : hd);
+        std::snprintf(current, sizeof(current), "%s", runtime_ro);
+    }
     if (!std::strcmp(current, requested)) {
         ESP_LOGI(TAG, "Runtime Media Setup immediate change: drive=%d unchanged (%s)",
                  drive, requested[0] ? requested : "<empty>");
@@ -1330,13 +1351,8 @@ static bool apply_runtime_media_selection(int drive, const char *path)
         return false;
     }
 
-    /* The action is consumed by CPU1 at the next guest frame boundary. Mirror
-     * the requested path into the UI state now; main.c publishes the actual
-     * mounted path back after the action, including any mount failure. */
-    portENTER_CRITICAL(&s_runtime_media_mux);
-    char *runtime = drive == 0 ? s_runtime_fdd0 : (drive == 1 ? s_runtime_fdd1 : s_runtime_hdd0);
-    std::snprintf(runtime, TAB5_VIDEO_MEDIA_PATH_MAX, "%s", requested);
-    portEXIT_CRITICAL(&s_runtime_media_mux);
+    /* CPU0 keeps only optimistic UI pending state. CPU1 remains the sole
+     * publisher of actual mounted paths after the guest-frame action. */
 
     ESP_LOGI(TAG, "Runtime Media Setup immediate change: drive=%d media=%s",
              drive, requested[0] ? requested : "<empty>");
@@ -1346,16 +1362,18 @@ static bool apply_runtime_media_selection(int drive, const char *path)
 static bool queue_runtime_media_guest_reboot(void)
 {
     const bool hdd_boot = s_media_overlay_boot_source == TAB5_LAUNCH_BOOT_HDD0;
+    const bool fdd1_boot = s_media_overlay_boot_source == TAB5_LAUNCH_BOOT_FLOPPY1;
     if (hdd_boot) {
         if (!s_media_pending_hdd0[0]) return false;
+    } else if (fdd1_boot) {
+        if (!s_media_pending_fdd1[0]) return false;
     } else {
         if (!s_media_pending_fdd0[0]) return false;
     }
 
-    /* Build 6.12u: the running CPU1 task already owns the authoritative media
-     * paths because CHANGE applies immediately. Queue only the desired boot
-     * source; CPU1 performs a guest-only reset at the next frame boundary. */
-    return queue_ui_action(TAB5_VIDEO_ACTION_REBOOT_GUEST, hdd_boot ? "HDD0" : "FDD0");
+    /* P12R1: queue an exact boot-drive identity. CPU1 performs guest-only reset. */
+    return queue_ui_action(TAB5_VIDEO_ACTION_REBOOT_GUEST,
+                           hdd_boot ? "HDD0" : (fdd1_boot ? "FDD1" : "FDD0"));
 }
 
 static void media_overlay_click(int x, int y)
@@ -1367,6 +1385,10 @@ static void media_overlay_click(int x, int y)
                 return;
             case TAB5_MEDIA_UI_SETUP_BOOT_FDD0:
                 s_media_overlay_boot_source = TAB5_LAUNCH_BOOT_FLOPPY0;
+                s_media_overlay_redraw = true;
+                return;
+            case TAB5_MEDIA_UI_SETUP_BOOT_FDD1:
+                if (s_media_pending_fdd1[0]) s_media_overlay_boot_source = TAB5_LAUNCH_BOOT_FLOPPY1;
                 s_media_overlay_redraw = true;
                 return;
             case TAB5_MEDIA_UI_SETUP_BOOT_HDD0:
@@ -1458,20 +1480,6 @@ static uint16_t poll_game_controls(uint8_t sample_reason)
      * buttons/power helpers that the guest touch chrome does not use. */
     M5.Touch.update((uint32_t)(touch_t0 / 1000));
     s_touch_last_sample_us = touch_t0;
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-    const uint32_t touch_us = (uint32_t)(esp_timer_get_time() - touch_t0);
-    __atomic_add_fetch(&s_touch_update_count, 1u, __ATOMIC_RELAXED);
-    __atomic_add_fetch(&s_touch_update_us, touch_us, __ATOMIC_RELAXED);
-    uint32_t old_max = __atomic_load_n(&s_touch_update_max_us, __ATOMIC_RELAXED);
-    while (touch_us > old_max &&
-           !__atomic_compare_exchange_n(&s_touch_update_max_us, &old_max, touch_us,
-                                        false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
-    if (sample_reason == 1u) __atomic_add_fetch(&s_touch_irq_samples, 1u, __ATOMIC_RELAXED);
-    else if (sample_reason == 2u) __atomic_add_fetch(&s_touch_active_samples, 1u, __ATOMIC_RELAXED);
-    else __atomic_add_fetch(&s_touch_safety_samples, 1u, __ATOMIC_RELAXED);
-#else
-    (void)sample_reason;
-#endif
 
     const size_t count=M5.Touch.getCount();
     bool any_pressed=false;
@@ -1505,11 +1513,55 @@ static uint16_t poll_game_controls(uint8_t sample_reason)
         if (s_touch_transition_active) {
             s_touch_transition_active=false;
             s_touch_transition_release_stable=0u;
-            ++s_touch_transition_rearm_count;
             ESP_LOGI(TAG,
-                     "PX68K_TOUCHR57E3: touch REARM #%lu after confirmed present + release",
-                     (unsigned long)s_touch_transition_rearm_count);
+                     "PX68K_TOUCHR57E3: touch REARM after confirmed present + release");
         }
+    }
+
+    /* R57E125A two-phase UI handoff: after a KEY/FILE edge has been
+     * accepted, keep guest controls released while the opening finger remains
+     * down.  Only after two consecutive released samples and a fully-cleared
+     * geometry fence do we transfer LCD/touch ownership to the overlay. */
+    if (s_touch125_ui_pending != TOUCH125_UI_NONE) {
+        update_game_touch_keyboard(0);
+        tab5_touch_joy_publish(0);
+        if (any_pressed || s_touch_transition_active ||
+            s_touch_transition_present_guard || s_game_touch_suppress_until_release) {
+            s_touch125_ui_release_stable = 0u;
+            return 0;
+        }
+        if (++s_touch125_ui_release_stable < 2u)
+            return 0;
+
+        const uint8_t open = s_touch125_ui_pending;
+        s_touch125_ui_pending = TOUCH125_UI_NONE;
+        s_touch125_ui_release_stable = 0u;
+        s_utility_prev_mask = 0u;
+        s_touch_dpad_prev = 0u;
+        s_touch_dpad_press_us = 0;
+
+        if (open == TOUCH125_UI_KEY) {
+            s_softkbd_active = true;
+            s_softkbd_redraw = true;
+            s_softkbd_touch_down = false;
+            s_softkbd_shift = false;
+            s_softkbd_ctrl = false;
+            s_soft_input_count = 0;
+            ESP_LOGI(TAG,
+                     "PX68K_TOUCH125: KEY ownership OPEN after release");
+        } else {
+            runtime_media_scan();
+            snapshot_runtime_media_to_pending();
+            s_media_overlay_drive = 0;
+            s_media_overlay_page = 0;
+            s_media_overlay_browser = false;
+            s_media_overlay_active = true;
+            s_media_overlay_redraw = true;
+            s_media_overlay_touch_down = false;
+            ESP_LOGI(TAG,
+                     "PX68K_TOUCH125: FILE ownership OPEN after release");
+        }
+        return 0;
     }
 
     if (s_media_overlay_active) {
@@ -1605,26 +1657,31 @@ static uint16_t poll_game_controls(uint8_t sample_reason)
     if (rising & UTIL_VOLP) (void)tab5_audio_step_volume(+1);
     if (rising & UTIL_VOLM) (void)tab5_audio_step_volume(-1);
     if (rising & UTIL_TURBO) {
-        s_turbo_audio_22k = !s_turbo_audio_22k;
-        tab5_audio_set_high_load_22k(s_turbo_audio_22k ? 1 : 0);
+        const uint32_t old_mode = tab5_video_turbo_mode();
+        const uint32_t new_mode = (old_mode + 1u) % 3u;
+
+        /* Audio transition first, visible BLACK/GREEN/RED state second. */
+        if (new_mode)
+            tab5_video_set_turbo_fps_r128(15u);
+        tab5_audio_set_turbo_profile(new_mode);
+        __atomic_store_n(&s_p12r6_turbo, new_mode, __ATOMIC_RELEASE);
+        s_pace_next_us = 0;
+        s_pace_active_logged = false;
         s_force_game_redraw = true;
         ESP_LOGI(TAG,
-                 "PX68K_TURBO_R57E97T: mode=%s sampleRate=%uHz videoBias=%s target=%s; buffers unchanged",
-                 s_turbo_audio_22k ? "Turbo" : "N/A",
-                 s_turbo_audio_22k ? 22050u : 44100u,
-                 s_turbo_audio_22k ? "AGGRESSIVE" : "AUDIO-SAFE",
-                 s_turbo_audio_22k ? "30fps" : "R94");
+                 "PX68K_TURBO_P12R6A4: mode=%u guest=12MHz exact peripheral=10MHz exact audio=%uHz video=%s",
+                 (unsigned)new_mode,
+                 (unsigned)(new_mode >= 2u ? 11025u : (new_mode == 1u ? 22050u : 44100u)),
+                 new_mode ? "adaptive15/20/24 MAX24" : "P12R5 normal");
     }
     if (rising & UTIL_KEYBOARD) {
-        s_softkbd_active=true;
-        s_softkbd_redraw=true;
-        s_softkbd_touch_down=true; /* opening finger must be released first */
-        s_softkbd_shift=false;
-        s_softkbd_ctrl=false;
-        s_soft_input_count=0;
+        /* Do not open/draw the keyboard while this physical press is down. */
+        s_touch125_ui_pending = TOUCH125_UI_KEY;
+        s_touch125_ui_release_stable = 0u;
         update_game_touch_keyboard(0);
         joy=0;
         tab5_touch_joy_publish(0);
+        ESP_LOGI(TAG, "PX68K_TOUCH125: KEY ownership PENDING until release");
     }
     if (rising & UTIL_PANIC) {
         /* Build 6.12s: never reboot the ESP32-P4 for the in-game PANIC button.
@@ -1642,17 +1699,13 @@ static uint16_t poll_game_controls(uint8_t sample_reason)
         }
     }
     if (rising & UTIL_FILE) {
-        runtime_media_scan();
-        snapshot_runtime_media_to_pending();
-        s_media_overlay_drive=0;
-        s_media_overlay_page=0;
-        s_media_overlay_browser=false;
-        s_media_overlay_active=true;
-        s_media_overlay_redraw=true;
-        s_media_overlay_touch_down=true; /* require release before first menu click */
+        /* Same ownership rule as KEY: scan/open only after the opening press is
+         * physically released, so geometry/DBFB transitions cannot overlap it. */
+        s_touch125_ui_pending = TOUCH125_UI_FILE;
+        s_touch125_ui_release_stable = 0u;
         joy=0;
         tab5_touch_joy_publish(0);
-        ESP_LOGI(TAG,"Runtime FILE opened shared Media Setup: per-slot CHANGE applies immediately; BACK / (re)BOOT");
+        ESP_LOGI(TAG, "PX68K_TOUCH125: FILE ownership PENDING until release");
     }
     return joy;
 }
@@ -1872,6 +1925,15 @@ static inline void display_unlock(void)
         xSemaphoreGive(s_display_mutex);
 }
 
+/* R57E125A overlay ownership must never park the presenter forever behind an
+ * unrelated display owner.  Normal frame presentation keeps the existing
+ * correctness lock; FILE/KEY UI uses this bounded acquisition and retries on
+ * the next 10-ms presenter quantum. */
+static inline bool display_try_lock_ticks(TickType_t ticks)
+{
+    return !s_display_mutex || xSemaphoreTake(s_display_mutex, ticks) == pdTRUE;
+}
+
 
 #if defined(CONFIG_IDF_TARGET_ESP32P4)
 static bool dbfb615h17_refresh_cb(esp_lcd_panel_handle_t panel,
@@ -1879,10 +1941,6 @@ static bool dbfb615h17_refresh_cb(esp_lcd_panel_handle_t panel,
                                   void *user_ctx)
 {
     (void)panel; (void)edata; (void)user_ctx;
-    const uint32_t now = (uint32_t)esp_timer_get_time();
-    const uint32_t prev = __atomic_exchange_n(&s_dsi_refresh_last_us, now, __ATOMIC_RELAXED);
-    if (prev != 0u)
-        __atomic_store_n(&s_dsi_refresh_period_us, now - prev, __ATOMIC_RELAXED);
     __atomic_add_fetch(&s_dsi_refresh_seq, 1u, __ATOMIC_RELEASE);
 
     BaseType_t hp = pdFALSE;
@@ -1908,7 +1966,6 @@ static bool dbfb615h17_wait_refresh(void)
     if (!s_dsi_double_live || !s_dsi_swap_wait_refresh)
         return true;
 
-    const int64_t t0 = esp_timer_get_time();
     uint32_t timeouts = 0;
     while (__atomic_load_n(&s_dsi_refresh_seq, __ATOMIC_ACQUIRE) == s_dsi_swap_refresh_seq)
     {
@@ -1916,14 +1973,12 @@ static bool dbfb615h17_wait_refresh(void)
             xSemaphoreTake(s_dsi_refresh_event, pdMS_TO_TICKS(50)) != pdTRUE)
         {
             ++timeouts;
-            ++s_dbfb_refresh_timeouts;
             if (timeouts == 1u)
                 ESP_LOGW(TAG, "PX68K_DBFB615H17: waiting for physical DSI refresh_done after swap");
             if (timeouts >= 20u)
                 return false;
         }
     }
-    s_dbfb_refresh_wait_us += (uint64_t)(esp_timer_get_time() - t0);
     s_dsi_swap_wait_refresh = false;
     return true;
 }
@@ -2008,7 +2063,6 @@ static bool dbfb615h17_copy_front_to_back_rect(uint32_t x0, uint32_t y0,
     if (!front || !back)
         return false;
 
-    const int64_t t0 = esp_timer_get_time();
     size_t bytes = 0;
 
     /* Full sync is naturally contiguous in the native 720x1280 memory layout. */
@@ -2060,12 +2114,6 @@ static bool dbfb615h17_copy_front_to_back_rect(uint32_t x0, uint32_t y0,
         }
     }
 
-    s_dbfb_sync_us += (uint64_t)(esp_timer_get_time() - t0);
-    s_dbfb_sync_bytes += bytes;
-    ++s_dbfb_sync_count;
-    ++s_dbfb_sync_fallback;
-    if (full_sync) ++s_dbfb_sync_full_count;
-    else ++s_dbfb_sync_repair_count;
     return true;
 }
 
@@ -2109,7 +2157,6 @@ static bool dbfb615h17_flush_back_rect(uint32_t x0, uint32_t y0,
     if (!back)
         return false;
 
-    const int64_t t0 = esp_timer_get_time();
     size_t bytes = 0;
     esp_err_t er = ESP_OK;
 
@@ -2137,9 +2184,6 @@ static bool dbfb615h17_flush_back_rect(uint32_t x0, uint32_t y0,
         }
     }
 
-    s_dbfb_flush_us += (uint64_t)(esp_timer_get_time() - t0);
-    s_dbfb_flush_bytes += bytes;
-    ++s_dbfb_flush_count;
     if (er != ESP_OK)
     {
         ESP_LOGW(TAG,
@@ -2191,7 +2235,6 @@ static bool dbfb615h17_swap_back_to_front(uint32_t changed_x0, uint32_t changed_
     s_dsi_repair_x1 = changed_x1;
     s_dsi_repair_y1 = changed_y1;
     s_dsi_repair_pending = changed_x1 > changed_x0 && changed_y1 > changed_y0;
-    ++s_dbfb_swap_count;
     return true;
 }
 
@@ -2480,13 +2523,8 @@ r35_swrot_band(uint16_t *front, const uint16_t *stage,
 {
     uint32_t tiles = 0u;
     uint32_t scalars = 0u;
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-    uint32_t pack_us = 0u;
-    uint32_t pack_stripes = 0u;
-#else
     (void)pack_us_out;
     (void)pack_stripes_out;
-#endif
     uint32_t y = y0;
 
     while (y < y1 && ((logical_y + y) & 7u) != 0u)
@@ -2509,16 +2547,9 @@ r35_swrot_band(uint16_t *front, const uint16_t *stage,
         const uint32_t stripe_bytes = pic_w * 8u * sizeof(uint16_t);
         while (y + 8u <= y1)
         {
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-            const int64_t p0 = esp_timer_get_time();
-#endif
             tab5_pie_graphics_copy(s_r35_pack8,
                                    stage + (size_t)y * pic_w,
                                    stripe_bytes);
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-            pack_us += (uint32_t)(esp_timer_get_time() - p0);
-            ++pack_stripes;
-#endif
 
             for (uint32_t x = 0; x < pic_w; x += 8u)
             {
@@ -2541,10 +2572,6 @@ r35_swrot_band(uint16_t *front, const uint16_t *stage,
     }
 
     if (scalar_pixels) *scalar_pixels += scalars;
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-    if (pack_us_out) *pack_us_out += pack_us;
-    if (pack_stripes_out) *pack_stripes_out += pack_stripes;
-#endif
     return tiles;
 }
 
@@ -2713,14 +2740,6 @@ static bool r34_direct_front_present(const uint16_t *stage,
     if (merged_count == 0u)
         return false;
 
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-    const int64_t rot0 = esp_timer_get_time();
-    uint32_t rows = 0u;
-    uint32_t tiles = 0u;
-    uint32_t scalar_pixels = 0u;
-    uint32_t pack_us = 0u;
-    uint32_t pack_stripes = 0u;
-#endif
     for (uint32_t i = 0; i < merged_count; ++i)
     {
         const uint32_t y0 = merged[i].y0;
@@ -2729,33 +2748,16 @@ static bool r34_direct_front_present(const uint16_t *stage,
 #if PX68K_TAB5_R35_INTERNAL_STRIPE
         if (s_r35_pack8)
         {
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-            tiles += r35_swrot_band(front, stage, pic_w, logical_x, logical_y,
-                                    y0, y1, &scalar_pixels, &pack_us, &pack_stripes);
-#else
             (void)r35_swrot_band(front, stage, pic_w, logical_x, logical_y,
                                  y0, y1, nullptr, nullptr, nullptr);
-#endif
         }
         else
 #endif
         {
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-            tiles += r34_swrot_band(front, stage, pic_w, logical_x, logical_y,
-                                    y0, y1, &scalar_pixels);
-#else
             (void)r34_swrot_band(front, stage, pic_w, logical_x, logical_y,
                                  y0, y1, nullptr);
-#endif
         }
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-        rows += y1 - y0;
-#endif
     }
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-    const uint32_t rot_us = (uint32_t)(esp_timer_get_time() - rot0);
-    const int64_t sync0 = esp_timer_get_time();
-#endif
     for (uint32_t i = 0; i < merged_count; ++i)
     {
         if (!r34_sync_front_band(front, pic_w, logical_x, logical_y,
@@ -2767,9 +2769,6 @@ static bool r34_direct_front_present(const uint16_t *stage,
             return false;
         }
     }
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-    const uint32_t sync_us = (uint32_t)(esp_timer_get_time() - sync0);
-#endif
 
     s_dsi_need_full_sync = false;
     s_dsi_repair_pending = false;
@@ -2780,53 +2779,6 @@ static bool r34_direct_front_present(const uint16_t *stage,
     s_dsi_ppa_geom_x = logical_x;
     s_dsi_ppa_geom_y = logical_y;
 
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-    ++s_r34_frames;
-    s_r34_rotate_us += rot_us;
-    s_r34_sync_us += sync_us;
-    s_r34_rows += rows;
-    s_r34_tiles += tiles;
-    s_r34_scalar_pixels += scalar_pixels;
-#if PX68K_TAB5_R35_INTERNAL_STRIPE
-    s_r35_pack_us += pack_us;
-    s_r35_pack_stripes += pack_stripes;
-#endif
-
-    if ((s_r34_frames % 60u) == 0u)
-    {
-#if PX68K_TAB5_R35_INTERNAL_STRIPE
-        if (s_r35_pack8)
-        {
-            ESP_LOGI(TAG,
-                     "PX68K_LCDR35: PACK8 frames=%llu avgROT=%lluus avgPACK=%lluus avgSYNC=%lluus avgRows=%llu avgTiles=%llu stripes=%llu scalarPix=%llu lineScratch=%s swapsHeld=%llu front=%u",
-                     (unsigned long long)s_r34_frames,
-                     (unsigned long long)(s_r34_rotate_us / s_r34_frames),
-                     (unsigned long long)(s_r35_pack_us / s_r34_frames),
-                     (unsigned long long)(s_r34_sync_us / s_r34_frames),
-                     (unsigned long long)(s_r34_rows / s_r34_frames),
-                     (unsigned long long)(s_r34_tiles / s_r34_frames),
-                     (unsigned long long)s_r35_pack_stripes,
-                     (unsigned long long)s_r34_scalar_pixels,
-                     s_r35_line_scratch_internal ? "INTERNAL" : "PSRAM",
-                     (unsigned long long)s_dbfb_swap_count,
-                     (unsigned)s_dsi_front_idx);
-        }
-        else
-#endif
-        {
-            ESP_LOGI(TAG,
-                     "PX68K_LCDR34: SWROT frames=%llu avgROT=%lluus avgSYNC=%lluus avgRows=%llu avgTiles=%llu scalarPix=%llu swapsHeld=%llu front=%u",
-                     (unsigned long long)s_r34_frames,
-                     (unsigned long long)(s_r34_rotate_us / s_r34_frames),
-                     (unsigned long long)(s_r34_sync_us / s_r34_frames),
-                     (unsigned long long)(s_r34_rows / s_r34_frames),
-                     (unsigned long long)(s_r34_tiles / s_r34_frames),
-                     (unsigned long long)s_r34_scalar_pixels,
-                     (unsigned long long)s_dbfb_swap_count,
-                     (unsigned)s_dsi_front_idx);
-        }
-    }
-#endif
     return true;
 #endif
 }
@@ -2878,9 +2830,6 @@ static bool r32_direct_front_present(const uint16_t *stage,
 
     const size_t native_bytes = (size_t)kDsiPhysWidth *
                                 (size_t)kDsiPhysHeight * sizeof(uint16_t);
-    const int64_t t0 = esp_timer_get_time();
-    uint32_t submitted = 0u;
-    uint32_t submitted_rows = 0u;
 
     for (uint32_t i = 0; i < merged_count; ++i)
     {
@@ -2934,42 +2883,8 @@ static bool r32_direct_front_present(const uint16_t *stage,
             s_dsi_need_full_sync = true;
             return false;
         }
-        ++submitted;
-        submitted_rows += band_h;
     }
 
-    const uint32_t ppa_us = (uint32_t)(esp_timer_get_time() - t0);
-    s_dsi_need_full_sync = false;
-    s_dsi_repair_pending = false;
-    s_dsi_ppa_prime_other = false;
-    s_dsi_ppa_prev_band_count = 0u;
-    s_dsi_ppa_geom_w = pic_w;
-    s_dsi_ppa_geom_h = pic_h;
-    s_dsi_ppa_geom_x = logical_x;
-    s_dsi_ppa_geom_y = logical_y;
-
-    s_dsi_ppa_us += ppa_us;
-    s_dsi_ppa_pixels += (uint64_t)pic_w * (uint64_t)submitted_rows;
-    s_dsi_ppa_rows += submitted_rows;
-    s_dsi_ppa_ops += submitted;
-    ++s_dsi_ppa_frames;
-    ++s_r32_direct_frames;
-    s_r32_direct_ppa_us += ppa_us;
-    s_r32_direct_rows += submitted_rows;
-    s_r32_direct_ops += submitted;
-
-    if ((s_r32_direct_frames % 60u) == 0u)
-    {
-        ESP_LOGI(TAG,
-                 "PX68K_LCDR34-FALLBACK: DIRECT-FRONT+PPA32 frames=%llu avgPPA=%lluus avgRows=%llu avgOps=%llu.%02llu swapsHeld=%llu front=%u",
-                 (unsigned long long)s_r32_direct_frames,
-                 (unsigned long long)(s_r32_direct_ppa_us / s_r32_direct_frames),
-                 (unsigned long long)(s_r32_direct_rows / s_r32_direct_frames),
-                 (unsigned long long)(s_r32_direct_ops / s_r32_direct_frames),
-                 (unsigned long long)(((s_r32_direct_ops % s_r32_direct_frames) * 100u) / s_r32_direct_frames),
-                 (unsigned long long)s_dbfb_swap_count,
-                 (unsigned)s_dsi_front_idx);
-    }
     return true;
 #endif
 }
@@ -3050,9 +2965,6 @@ static bool dbfb615h17r9_ppa_present(const uint16_t *stage,
 
     const size_t native_bytes = (size_t)kDsiPhysWidth *
                                 (size_t)kDsiPhysHeight * sizeof(uint16_t);
-    const int64_t t0 = esp_timer_get_time();
-    uint32_t submitted = 0u;
-    uint32_t submitted_rows = 0u;
 
     for (uint32_t i = 0; i < merged_count; ++i)
     {
@@ -3105,12 +3017,9 @@ static bool dbfb615h17r9_ppa_present(const uint16_t *stage,
             s_dsi_double_live = false;
             return false;
         }
-        ++submitted;
-        submitted_rows += band_h;
     }
 
 
-    const uint32_t ppa_us = (uint32_t)(esp_timer_get_time() - t0);
     const esp_err_t draw_er = esp_lcd_panel_draw_bitmap(
         s_dsi_dpi_panel, 0, 0, (int)kDsiPhysWidth, (int)kDsiPhysHeight, back);
     if (draw_er != ESP_OK)
@@ -3143,13 +3052,6 @@ static bool dbfb615h17r9_ppa_present(const uint16_t *stage,
     s_dsi_ppa_geom_h = pic_h;
     s_dsi_ppa_geom_x = logical_x;
     s_dsi_ppa_geom_y = logical_y;
-
-    s_dsi_ppa_us += ppa_us;
-    s_dsi_ppa_pixels += (uint64_t)pic_w * (uint64_t)submitted_rows;
-    s_dsi_ppa_rows += submitted_rows;
-    s_dsi_ppa_ops += submitted;
-    ++s_dsi_ppa_frames;
-    ++s_dbfb_swap_count;
 
 #if PX68K_TAB5_R32_DIRECT_FRONT
     if (!s_r32_direct_front && ++s_r32_warmup_swaps >= kR32WarmupSwapFrames)
@@ -3218,20 +3120,6 @@ static bool dbfb615h17r9_ppa_present(const uint16_t *stage,
     }
 #endif
 
-    if ((s_dsi_ppa_frames % 60u) == 0u)
-    {
-        ESP_LOGI(TAG,
-                 "PX68K_DBFB615H17R11: PPA-BANDS frames=%llu ops=%llu avgOps=%llu.%02llu avgRows=%llu avgPPAwall=%lluus lastBands=%lu lastRows=%lu full=%u mode=blocking burst=64B cap=2",
-                 (unsigned long long)s_dsi_ppa_frames,
-                 (unsigned long long)s_dsi_ppa_ops,
-                 (unsigned long long)(s_dsi_ppa_ops / s_dsi_ppa_frames),
-                 (unsigned long long)(((s_dsi_ppa_ops % s_dsi_ppa_frames) * 100u) / s_dsi_ppa_frames),
-                 (unsigned long long)(s_dsi_ppa_rows / s_dsi_ppa_frames),
-                 (unsigned long long)(s_dsi_ppa_us / s_dsi_ppa_frames),
-                 (unsigned long)submitted,
-                 (unsigned long)submitted_rows,
-                 full ? 1u : 0u);
-    }
     return true;
 }
 
@@ -3328,31 +3216,37 @@ static inline uint32_t line_generation(uint32_t y)
     return __atomic_load_n(&s_line_generation[y], __ATOMIC_ACQUIRE);
 }
 
-/* R40: consume the pending source-X union belonging to a stable generation.
- * Producer publication uses the same lock, so multiple writes are never lost. */
+/* HF3: consume one stable-generation dirty mask without taking a spinlock.
+ * A producer that races this exchange increments writer/generation state.  On
+ * that race the stolen mask is atomically ORed back, so no dirty debt is lost. */
 static bool r42_line_dirty_snapshot(uint32_t y, uint32_t expected_gen,
                                     uint32_t *tile32, uint16_t *x0, uint16_t *x1)
 {
     if (y >= kTrackedLines || !tile32 || !x0 || !x1) return false;
-    bool ok = false;
-    portENTER_CRITICAL(&s_line_dirty_span_mux);
-    const uint32_t g0 = __atomic_load_n(&s_line_generation[y], __ATOMIC_ACQUIRE);
-    const uint32_t w0 = __atomic_load_n(&s_line_writers[y], __ATOMIC_ACQUIRE);
-    const uint16_t a = s_line_dirty_x0[y];
-    const uint16_t b = s_line_dirty_x1[y];
-    const uint32_t m = s_line_dirty_tile32[y];
+    if (__atomic_load_n(&s_line_writers[y], __ATOMIC_ACQUIRE) != 0u) return false;
+    if (__atomic_load_n(&s_line_generation[y], __ATOMIC_ACQUIRE) != expected_gen) return false;
+
+    const uint32_t m = __atomic_exchange_n(&s_line_dirty_tile32[y], 0u, __ATOMIC_ACQ_REL);
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
     const uint32_t g1 = __atomic_load_n(&s_line_generation[y], __ATOMIC_ACQUIRE);
     const uint32_t w1 = __atomic_load_n(&s_line_writers[y], __ATOMIC_ACQUIRE);
-    if (w0 == 0u && w1 == 0u && g0 == expected_gen && g1 == expected_gen)
-    {
-        *tile32 = m; *x0 = a; *x1 = b;
-        s_line_dirty_x0[y] = 0u;
-        s_line_dirty_x1[y] = 0u;
-        s_line_dirty_tile32[y] = 0u;
-        ok = true;
+    if (w1 != 0u || g1 != expected_gen) {
+        if (m) __atomic_fetch_or(&s_line_dirty_tile32[y], m, __ATOMIC_RELEASE);
+        return false;
     }
-    portEXIT_CRITICAL(&s_line_dirty_span_mux);
-    return ok;
+
+    *tile32 = m;
+    if (m == 0xffffffffu) {
+        *x0 = 0u; *x1 = 0xffffu;
+    } else if (m != 0u) {
+        const uint32_t first = (uint32_t)__builtin_ctz(m);
+        const uint32_t last = 31u - (uint32_t)__builtin_clz(m);
+        *x0 = (uint16_t)(first << 5);
+        *x1 = (uint16_t)((last + 1u) << 5);
+    } else {
+        *x0 = 0u; *x1 = 0u;
+    }
+    return true;
 }
 
 static bool r40_line_dirty_span_snapshot(uint32_t y, uint32_t expected_gen,
@@ -3669,16 +3563,9 @@ static bool r38_direct_native_present(const present_request_t &req,
         s_r34_front_cache_primed = true;
     }
 
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-    ++s_r36_calls;
-#endif
     std::memset(s_r41_tile_mask, 0, sizeof(s_r41_tile_mask));
 
     uint32_t retries = 0u, unstable = 0u;
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-    uint64_t gen_rows = 0u, gen_changed = 0u, writer_nochange = 0u;
-    const int64_t scan0 = esp_timer_get_time();
-#endif
 
     /* R41 keeps R38/R39's producer-exact generation contract, but preserves
      * the producer's X-span as a sparse 8x8 tile mask.  Multiple changed rows
@@ -3699,9 +3586,6 @@ static bool r38_direct_native_present(const present_request_t &req,
             continue;
         }
 
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-        ++gen_rows;
-#endif
         uint32_t attempt = 0u, stable_gen = observed;
         bool stable = false;
         while (attempt < kLiveRowRetryLimit)
@@ -3733,9 +3617,6 @@ static bool r38_direct_native_present(const present_request_t &req,
         s_aspect_seen_generation[sy] = stable_gen;
         if (changed)
         {
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-            ++gen_changed;
-#endif
             const uint32_t b0 = dy >> 3, b1 = (dy_end - 1u) >> 3;
             bool sparse_done = false;
             if (full_front)
@@ -3761,17 +3642,11 @@ static bool r38_direct_native_present(const present_request_t &req,
                     if (src_mask != 0u && src_mask != 0xffffffffu &&
                         (src_mask & ~useful_mask) == 0u)
                     {
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-                        ++s_r42_src_tile_rows;
-#endif
                         uint32_t m = src_mask;
                         while (m)
                         {
                             const uint32_t bit = (uint32_t)__builtin_ctz(m);
                             m &= m - 1u;
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-                            ++s_r42_src_tiles;
-#endif
                             const uint32_t tsx0 = bit << 5;
                             const uint32_t tsx1 = std::min<uint32_t>(req.width, tsx0 + 32u);
                             uint32_t dx0 = 0u, dx1 = out_w;
@@ -3792,37 +3667,18 @@ static bool r38_direct_native_present(const present_request_t &req,
                     }
                     else
                     {
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-                        ++s_r42_src_mask_fallbacks;
-#endif
                     }
                 }
                 else
                 {
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-                    ++s_r41_span_fallbacks;
-#endif
                 }
             }
             if (!sparse_done)
                 for (uint32_t b = b0; b <= b1; ++b)
                     r41_tilemask_mark(b, 0u, out_w);
         }
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-        else
-        {
-            ++writer_nochange;
-        }
-#endif
         dy = dy_end;
     }
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-    const uint32_t scan_us = (uint32_t)(esp_timer_get_time() - scan0);
-    s_r36_scan_us += scan_us;
-    s_r37_rows_tested += gen_rows;
-    s_r37_rows_changed += gen_changed;
-    s_r37_rows_same += writer_nochange;
-#endif
 
     if (retry_count) *retry_count += retries;
     if (unstable_count) *unstable_count += unstable;
@@ -3836,11 +3692,6 @@ static bool r38_direct_native_present(const present_request_t &req,
     if (full_front) ++s_aspect_full_frames;
     if (!dirty_blocks) return true;
 
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-    uint32_t scale_us = 0u, store_us = 0u;
-    uint64_t frame_run_width_sum = 0u, frame_logical_pixels = 0u;
-    uint32_t frame_dirty_tiles = 0u, frame_tile_runs = 0u;
-#endif
     std::memset(s_r40_sync_rects, 0, sizeof(s_r40_sync_rects));
     uint32_t sync_rect_count = 0u;
     bool sync_overflow = false;
@@ -3859,12 +3710,6 @@ static bool r38_direct_native_present(const present_request_t &req,
             const uint32_t bx1 = std::min<uint32_t>(out_w, t1 * 8u);
             if (bx1 <= bx0) continue;
 
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-            ++frame_tile_runs;
-            frame_dirty_tiles += t1 - t0;
-            frame_run_width_sum += bx1 - bx0;
-            frame_logical_pixels += (uint64_t)(bx1 - bx0) * 8u;
-#endif
             if (!verify_tile_valid)
             {
                 verify_tile_valid = true;
@@ -3872,9 +3717,6 @@ static bool r38_direct_native_present(const present_request_t &req,
                 verify_ty = by;
             }
 
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-            const int64_t scale0 = esp_timer_get_time();
-#endif
             uint32_t prev_sy = 0xffffffffu;
             for (uint32_t j = 0u; j < 8u; ++j)
             {
@@ -3893,19 +3735,10 @@ static bool r38_direct_native_present(const present_request_t &req,
                 }
                 prev_sy = sy;
             }
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-            scale_us += (uint32_t)(esp_timer_get_time() - scale0);
-#endif
 
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-            const int64_t store0 = esp_timer_get_time();
-#endif
             for (uint32_t x = bx0; x < bx1; x += 8u)
                 r35_swrot_tile8_packed(front, s_r35_pack8, out_w,
                                         logical_x, logical_y, x, by);
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-            store_us += (uint32_t)(esp_timer_get_time() - store0);
-#endif
 
             /* Cache-sync rectangles can coalesce vertically when the same X
              * tile run repeats in the next 8-row block.  Unlike R40, distant
@@ -3940,14 +3773,8 @@ static bool r38_direct_native_present(const present_request_t &req,
     if (retry_count) *retry_count += retries;
     if (unstable_count) *unstable_count += unstable;
 
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-    const int64_t sync0 = esp_timer_get_time();
-#endif
     if (sync_overflow)
     {
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-        ++s_r41_sync_overflows;
-#endif
         if (!r40_sync_front_rect(front, logical_x, logical_y,
                                  0u, out_w, 0u, out_h))
         {
@@ -3970,9 +3797,6 @@ static bool r38_direct_native_present(const present_request_t &req,
             }
         }
     }
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-    const uint32_t sync_us = (uint32_t)(esp_timer_get_time() - sync0);
-#endif
 
     /* One written tile every 16 dirty updates is checked end-to-end.  No
      * periodic success log is emitted: only the aggregate appears in the
@@ -3986,9 +3810,6 @@ static bool r38_direct_native_present(const present_request_t &req,
                                     verify_tx, verify_ty,
                                     &bad_x, &bad_y, &expected, &got))
         {
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-            ++s_r41_verify_skip;
-#endif
         }
         else if (bad_x != 0xffffffffu)
         {
@@ -4001,20 +3822,11 @@ static bool r38_direct_native_present(const present_request_t &req,
                          (unsigned)verify_tx, (unsigned)verify_ty,
                          (unsigned long long)s_r41_verify_fail);
         }
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-        else
-        {
-            ++s_r41_verify_ok;
-        }
-#endif
     }
 
     if (full_front)
     {
         s_r49_force_full_front = false;
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-        ++s_r49_full_repaints;
-#endif
     }
     s_dsi_need_full_sync = false; s_dsi_repair_pending = false;
     s_dsi_ppa_prev_band_count = 0u; s_dsi_ppa_prime_other = false;
@@ -4022,50 +3834,6 @@ static bool r38_direct_native_present(const present_request_t &req,
     s_dsi_ppa_geom_x = logical_x; s_dsi_ppa_geom_y = logical_y;
 
     ++s_r36_updates;
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-    s_r36_scale_us += scale_us; s_r36_store_us += store_us; s_r36_sync_us += sync_us;
-    s_r36_blocks += dirty_blocks;
-    s_r40_block_width_sum += frame_run_width_sum;
-    s_r40_logical_pixels += frame_logical_pixels;
-    s_r41_dirty_tiles += frame_dirty_tiles;
-    s_r41_tile_runs += frame_tile_runs;
-    s_r41_sync_rects_total += sync_overflow ? 1u : sync_rect_count;
-    s_aspect_dirty_rows += (uint64_t)dirty_blocks * 8u;
-    s_aspect_dirty_bands += sync_overflow ? 1u : sync_rect_count;
-
-    if ((s_r36_updates % (PX68K_TAB5_R43_QUIET_RUNTIME ? 480u : 120u)) == 0u)
-    {
-        const uint64_t calls = s_r36_calls ? s_r36_calls : 1u;
-        const uint64_t updates = s_r36_updates ? s_r36_updates : 1u;
-        ESP_LOGI(TAG,
-                 "PX68K_LCDR49: PRODUCER-TILE32 updates=%llu calls=%llu avgGENscan=%lluus avgSCALEupd=%lluus avgSTOREupd=%lluus avgSYNCupd=%lluus avgBlocks=%llu avgRuns=%llu avgTiles=%llu avgRunW=%llu logicalPix=%llu genRows=%llu genChanged=%llu srcTileRows=%llu srcTiles=%llu spanFallback=%llu maskFallback=%llu syncOv=%llu verify=%llu/%llu/%llu stage960RW=0 rawCompare=0 swapsHeld=%llu front=%u epochDrop=%llu noFlip=1 fullReq=%llu fullDone=%llu pinFail=%llu",
-                 (unsigned long long)s_r36_updates, (unsigned long long)s_r36_calls,
-                 (unsigned long long)(s_r36_scan_us / calls),
-                 (unsigned long long)(s_r36_scale_us / updates),
-                 (unsigned long long)(s_r36_store_us / updates),
-                 (unsigned long long)(s_r36_sync_us / updates),
-                 (unsigned long long)(s_r36_blocks / updates),
-                 (unsigned long long)(s_r41_tile_runs / updates),
-                 (unsigned long long)(s_r41_dirty_tiles / updates),
-                 (unsigned long long)(s_r41_tile_runs ? (s_r40_block_width_sum / s_r41_tile_runs) : 0u),
-                 (unsigned long long)s_r40_logical_pixels,
-                 (unsigned long long)s_r37_rows_tested,
-                 (unsigned long long)s_r37_rows_changed,
-                 (unsigned long long)s_r42_src_tile_rows,
-                 (unsigned long long)s_r42_src_tiles,
-                 (unsigned long long)s_r41_span_fallbacks,
-                 (unsigned long long)s_r42_src_mask_fallbacks,
-                 (unsigned long long)s_r41_sync_overflows,
-                 (unsigned long long)s_r41_verify_ok,
-                 (unsigned long long)s_r41_verify_skip,
-                 (unsigned long long)s_r41_verify_fail,
-                 (unsigned long long)s_dbfb_swap_count, (unsigned)s_dsi_front_idx,
-                 (unsigned long long)s_live_epoch_drops,
-                 (unsigned long long)s_r49_full_repaint_requests,
-                 (unsigned long long)s_r49_full_repaints,
-                 (unsigned long long)s_r49_fb0_pin_failures);
-    }
-#endif
     return true;
 }
 #endif
@@ -4131,7 +3899,6 @@ static bool r84_managed_direct_native_present(const present_request_t &req,
         s_r34_front_cache_primed = true;
     }
 
-    const int64_t wall0 = esp_timer_get_time();
     std::memset(s_r41_tile_mask, 0, sizeof(s_r41_tile_mask));
 
     /* Convert exact source-row 32px dirty masks into destination 8x8 tiles. */
@@ -4181,10 +3948,6 @@ static bool r84_managed_direct_native_present(const present_request_t &req,
     std::memset(s_r40_sync_rects, 0, sizeof(s_r40_sync_rects));
     uint32_t sync_rect_count = 0u;
     bool sync_overflow = false;
-    uint32_t frame_runs = 0u;
-    uint32_t frame_tiles = 0u;
-    uint64_t source_pixels = 0u;
-    uint64_t preserved_pixels = 0u;
 
     for (uint32_t b = 0u; b < kR41TileRows; ++b)
     {
@@ -4201,8 +3964,6 @@ static bool r84_managed_direct_native_present(const present_request_t &req,
             if (bx1 <= bx0)
                 continue;
 
-            ++frame_runs;
-            frame_tiles += t1 - t0;
 
             /* Build one logical 8x8 tile at a time in Internal SRAM.
              * Dirty pixels come from the immutable sparse slot. Clean pixels
@@ -4234,7 +3995,6 @@ static bool r84_managed_direct_native_present(const present_request_t &req,
                         if (pixel_dirty)
                         {
                             packed[i] = src[sx];
-                            ++source_pixels;
                         }
                         else
                         {
@@ -4244,7 +4004,6 @@ static bool r84_managed_direct_native_present(const present_request_t &req,
                             packed[i] = front[
                                 (size_t)native_y * kDsiPhysStridePixels +
                                 native_x];
-                            ++preserved_pixels;
                         }
                     }
                 }
@@ -4278,7 +4037,6 @@ static bool r84_managed_direct_native_present(const present_request_t &req,
         }
     }
 
-    const int64_t sync0 = esp_timer_get_time();
     bool sync_ok = true;
     if (sync_overflow)
     {
@@ -4298,7 +4056,6 @@ static bool r84_managed_direct_native_present(const present_request_t &req,
             }
         }
     }
-    const uint64_t sync_us = (uint64_t)(esp_timer_get_time() - sync0);
     if (!sync_ok)
     {
         s_dsi_need_full_sync = true;
@@ -4323,16 +4080,6 @@ static bool r84_managed_direct_native_present(const present_request_t &req,
         __atomic_load_n(&s_dsi_refresh_seq, __ATOMIC_ACQUIRE);
     s_dsi_swap_wait_refresh = true;
 
-    const uint64_t wall_us = (uint64_t)(esp_timer_get_time() - wall0);
-    portENTER_CRITICAL(&s_stats_mux);
-    ++s_r84_native_frames;
-    s_r84_native_tile_runs += frame_runs;
-    s_r84_native_tiles += frame_tiles;
-    s_r84_native_wall_us += wall_us;
-    s_r84_native_sync_us += sync_us;
-    s_r84_native_source_pixels += source_pixels;
-    s_r84_native_preserved_pixels += preserved_pixels;
-    portEXIT_CRITICAL(&s_stats_mux);
     return true;
 #endif
 }
@@ -4349,6 +4096,83 @@ static void push_snapshot(const present_request_t &req)
     const int y = (lcd_h - (int)slot.height) / 2;
 
     M5.Display.pushImage(x, y, (int)slot.width, (int)slot.height, slot.pixels);
+}
+
+/* P12R5 CPU0-only presentation geometry filter.  It never mutates guest
+ * CRTC/WinDraw state and never blocks CPU1. */
+static void p12r5_geometry_gate(const present_request_t &req, bool *suppress_present)
+{
+    if (suppress_present) *suppress_present = false;
+    if (req.mode != PRESENT_MANAGED || !req.width || !req.height || !req.pitch_pixels)
+        return;
+
+    if (!s_p12r5_geom_stable_w)
+    {
+        s_p12r5_geom_stable_w = req.width;
+        s_p12r5_geom_stable_h = req.height;
+        s_p12r5_geom_stable_pitch = req.pitch_pixels;
+        s_p12r5_geom_pending_count = 0u;
+        __atomic_store_n(&s_p12r5_geom_force_full_next, 0u, __ATOMIC_RELEASE);
+        return;
+    }
+
+    const bool is_stable =
+        req.width == s_p12r5_geom_stable_w &&
+        req.height == s_p12r5_geom_stable_h &&
+        req.pitch_pixels == s_p12r5_geom_stable_pitch;
+
+    if (is_stable)
+    {
+        if (s_p12r5_geom_pending_count)
+        {
+            ++s_p12r5_geom_rejected_transient;
+            s_p12r5_geom_pending_count = 0u;
+            s_p12r5_geom_pending_w = 0u;
+            s_p12r5_geom_pending_h = 0u;
+            s_p12r5_geom_pending_pitch = 0u;
+            __atomic_store_n(&s_p12r5_geom_force_full_next, 0u, __ATOMIC_RELEASE);
+        }
+        return;
+    }
+
+    const bool same_pending =
+        s_p12r5_geom_pending_count &&
+        req.width == s_p12r5_geom_pending_w &&
+        req.height == s_p12r5_geom_pending_h &&
+        req.pitch_pixels == s_p12r5_geom_pending_pitch;
+
+    if (!same_pending)
+    {
+        s_p12r5_geom_pending_w = req.width;
+        s_p12r5_geom_pending_h = req.height;
+        s_p12r5_geom_pending_pitch = req.pitch_pixels;
+        s_p12r5_geom_pending_count = 1u;
+        ++s_p12r5_geom_candidates;
+    }
+    else if (s_p12r5_geom_pending_count < 0xffu)
+    {
+        ++s_p12r5_geom_pending_count;
+    }
+
+    /* The first observation is never shown.  Force the producer-side presenter
+     * slot to be complete on the next opportunity so a real mode switch can be
+     * adopted safely without reading stale clean rows from an R82 sparse slot. */
+    if (s_p12r5_geom_pending_count < 2u || req.managed_sparse)
+    {
+        __atomic_store_n(&s_p12r5_geom_force_full_next, 1u, __ATOMIC_RELEASE);
+        if (suppress_present) *suppress_present = true;
+        return;
+    }
+
+    s_p12r5_geom_stable_w = s_p12r5_geom_pending_w;
+    s_p12r5_geom_stable_h = s_p12r5_geom_pending_h;
+    s_p12r5_geom_stable_pitch = s_p12r5_geom_pending_pitch;
+    s_p12r5_geom_pending_count = 0u;
+    s_p12r5_geom_pending_w = 0u;
+    s_p12r5_geom_pending_h = 0u;
+    s_p12r5_geom_pending_pitch = 0u;
+    __atomic_store_n(&s_p12r5_geom_force_full_next, 0u, __ATOMIC_RELEASE);
+    ++s_p12r5_geom_accepted;
 }
 
 static bool push_live_frame(const present_request_t &req,
@@ -4381,6 +4205,11 @@ static bool push_live_frame(const present_request_t &req,
     if (!out_w || !out_h)
         return false;
 
+    bool p12r5_suppress_present = false;
+    p12r5_geometry_gate(req, &p12r5_suppress_present);
+    if (p12r5_suppress_present)
+        return true;
+
     const int x = (lcd_w - (int)out_w) / 2;
     const int y0 = (lcd_h - (int)out_h) / 2;
     /* R56d: materialize presenter staging before deciding whether the request
@@ -4392,8 +4221,9 @@ static bool push_live_frame(const present_request_t &req,
 
     bool direct_fb = false;
 #if defined(CONFIG_IDF_TARGET_ESP32P4)
-    /* R56d: managed ScreenVersions are an independent Back-FB transaction.
-     * R49's s_dsi_ppa_live flag describes only the legacy LIVE presenter. */
+    /* R56d/R84: managed ScreenVersions own the raw DSI presentation path.
+     * Full/recovery frames use Back-FB/PPA; steady sparse frames use Front
+     * direct-native stores. R49's s_dsi_ppa_live remains legacy-LIVE only. */
     const bool managed_backfb = (req.mode == PRESENT_MANAGED);
     direct_fb = s_dsi_double_live && (s_dsi_ppa_live || managed_backfb) &&
                 s_dsi_fb[s_dsi_back_idx] && s_aspect_frame &&
@@ -4470,14 +4300,8 @@ static bool push_live_frame(const present_request_t &req,
 
     if (req.mode == PRESENT_MANAGED && req.managed_sparse &&
         managed_physical_full) {
-        portENTER_CRITICAL(&s_stats_mux);
-        ++s_r82_slot_forcefull_rejects;
-        portEXIT_CRITICAL(&s_stats_mux);
         return false;
     }
-
-    if (managed_map)
-        ++s_r74_managed_map_frames;
 
     if (s_aspect_log_src_w != req.width || s_aspect_log_src_h != req.height)
     {
@@ -4516,9 +4340,6 @@ static bool push_live_frame(const present_request_t &req,
                 req, out_w, out_h, (uint32_t)x, (uint32_t)y0))
             return true;
 
-        portENTER_CRITICAL(&s_stats_mux);
-        ++s_r84_native_fallbacks;
-        portEXIT_CRITICAL(&s_stats_mux);
     }
 
     /* R38: producer-published exact generations eliminate all LCD-side raw
@@ -4610,12 +4431,10 @@ static bool push_live_frame(const present_request_t &req,
 
         if (!source_dirty)
         {
-            if (managed_map) ++s_r74_managed_rows_skipped;
             note_clean_group(dy, dy_end);
             dy = dy_end;
             continue;
         }
-        if (managed_map) ++s_r74_managed_rows_scanned;
 
         uint16_t *dst0 = live_dst_row(dy);
         uint16_t *render0 = s_aspect_line_scratch ? s_aspect_line_scratch : dst0;
@@ -4692,9 +4511,6 @@ static bool push_live_frame(const present_request_t &req,
              * of pretending a logical LCD row is contiguous in memory. */
             if (!force_full)
             {
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-                ++s_vdiff_tested_src_rows;
-#endif
                 if (render0 != dst0)
                 {
                     pixel_changed = tab5_pie_graphics_diff(
@@ -4703,16 +4519,9 @@ static bool push_live_frame(const present_request_t &req,
 
                 if (pixel_changed)
                 {
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-                    ++s_vdiff_changed_src_rows;
-#endif
                 }
                 else
                 {
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-                    ++s_vdiff_same_src_rows;
-                    s_vdiff_identical_dst_rows += (uint64_t)(dy_end - dy);
-#endif
                 }
             }
 
@@ -4756,20 +4565,11 @@ static bool push_live_frame(const present_request_t &req,
     if (direct_fb && frame_dirty_rows != 0u)
     {
         const bool r9_force_full = force_full || frame_dirty_band_overflow;
-        const int64_t r83_ppa_t0 =
-            (req.mode == PRESENT_MANAGED) ? esp_timer_get_time() : 0;
         const bool r83_ppa_ok = dbfb615h17r9_ppa_present(
                 s_aspect_frame, out_w, out_h,
                 (uint32_t)x, (uint32_t)y0,
                 frame_dirty_band_list, frame_dirty_band_count, r9_force_full,
                 req.mode != PRESENT_MANAGED);
-        if (r83_ppa_t0 != 0)
-        {
-            const uint64_t dt = (uint64_t)(esp_timer_get_time() - r83_ppa_t0);
-            portENTER_CRITICAL(&s_stats_mux);
-            s_r83_ppa_us += dt;
-            portEXIT_CRITICAL(&s_stats_mux);
-        }
         if (!r83_ppa_ok)
         {
             present_ok = false;
@@ -4783,10 +4583,6 @@ static bool push_live_frame(const present_request_t &req,
 
     ++s_aspect_dirty_frames;
     if (force_full) ++s_aspect_full_frames;
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-    s_aspect_dirty_bands += frame_dirty_bands;
-    s_aspect_dirty_rows += frame_dirty_rows;
-#endif
 
     if (force_full)
     {
@@ -4796,53 +4592,6 @@ static bool push_live_frame(const present_request_t &req,
                  (unsigned long)frame_dirty_rows,
                  (unsigned long)frame_dirty_bands);
     }
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-    else if ((s_aspect_dirty_frames % 300u) == 0u)
-    {
-        const uint32_t avg_rows = s_aspect_dirty_frames
-            ? (s_aspect_dirty_rows / s_aspect_dirty_frames) : 0u;
-        const uint32_t avg_bands = s_aspect_dirty_frames
-            ? (s_aspect_dirty_bands / s_aspect_dirty_frames) : 0u;
-        ESP_LOGI(TAG,
-                 "Build 5.98a DIRTY stats: frames=%lu full=%lu avgLCDrows=%lu/720 avgBands=%lu lastRows=%lu lastBands=%lu",
-                 (unsigned long)s_aspect_dirty_frames,
-                 (unsigned long)s_aspect_full_frames,
-                 (unsigned long)avg_rows,
-                 (unsigned long)avg_bands,
-                 (unsigned long)frame_dirty_rows,
-                 (unsigned long)frame_dirty_bands);
-        ESP_LOGI(TAG,
-                 "PX68K_VDIFF598G8: tested_src=%llu same=%llu changed=%llu identical_dst_rows=%llu scratch=%s",
-                 (unsigned long long)s_vdiff_tested_src_rows,
-                 (unsigned long long)s_vdiff_same_src_rows,
-                 (unsigned long long)s_vdiff_changed_src_rows,
-                 (unsigned long long)s_vdiff_identical_dst_rows,
-                 s_aspect_line_scratch ? "PIE-DIFF" : "DISABLED");
-#if defined(CONFIG_IDF_TARGET_ESP32P4)
-        const uint32_t phys_us = __atomic_load_n(&s_dsi_refresh_period_us, __ATOMIC_RELAXED);
-        const uint32_t phys_millihz = phys_us ? (uint32_t)(1000000000ULL / phys_us) : 0u;
-        const uint64_t avg_sync = s_dbfb_sync_count ? (s_dbfb_sync_us / s_dbfb_sync_count) : 0u;
-        ESP_LOGI(TAG,
-                 "PX68K_DBFB615H17: active=%u front=%u fb0=%p fb1=%p swaps=%llu sync=%llu(full=%llu repair=%llu) avgSync=%lluus bytes=%llu pieSync=%llu flush=%llu/%lluus/%lluB refresh=%lu.%03luHz wait=%lluus timeouts=%llu",
-                 s_dsi_double_live ? 1u : 0u, (unsigned)s_dsi_front_idx,
-                 (void *)s_dsi_fb[0], (void *)s_dsi_fb[1],
-                 (unsigned long long)s_dbfb_swap_count,
-                 (unsigned long long)s_dbfb_sync_count,
-                 (unsigned long long)s_dbfb_sync_full_count,
-                 (unsigned long long)s_dbfb_sync_repair_count,
-                 (unsigned long long)avg_sync,
-                 (unsigned long long)s_dbfb_sync_bytes,
-                 (unsigned long long)s_dbfb_sync_fallback,
-                 (unsigned long long)s_dbfb_flush_count,
-                 (unsigned long long)s_dbfb_flush_us,
-                 (unsigned long long)s_dbfb_flush_bytes,
-                 (unsigned long)(phys_millihz / 1000u),
-                 (unsigned long)(phys_millihz % 1000u),
-                 (unsigned long long)s_dbfb_refresh_wait_us,
-                 (unsigned long long)s_dbfb_refresh_timeouts);
-#endif
-    }
-#endif
 
     if (retry_count) *retry_count = retries_total;
     if (unstable_count) *unstable_count = unstable_total;
@@ -4855,12 +4604,26 @@ static bool push_live_frame(const present_request_t &req,
  * frames below that rate. The optimization is the DSI framebuffer bypass. */
 static constexpr uint32_t kLiveLCDCadenceDiv = 1u;
 
+/* PX68K_LCD_R57E116
+ * Turbo physical LCD work is a host-side MAX24 budget, independent from the
+ * 45Hz Screen ingress cadence.  The pacing wait occurs before display_lock(),
+ * sparse native conversion, PPA and refresh fencing, so CPU0 LCD work itself
+ * cannot run at the old ~55-61Hz guest-derived cadence in Turbo.
+ *
+ * Managed ScreenVersions are NOT dropped/coalesced here: their sparse dirty
+ * maps are delta-relative to queued snapshots.  The existing two-slot queue
+ * provides bounded backpressure while preserving exact delta order.
+ * CPU1 still never waits for LCD. */
+/* P12R1: panel-work ceiling is 62.5 Hz, above the X68000 normal 61.46 Hz
+ * and high-resolution ~55.46 Hz source cadence. It prevents host overdrive
+ * without imposing the retired 15 fps product limit. */
+static constexpr uint32_t kNALCDPeriodUsR117 = 16000u;
+
 static inline uint32_t video_pace_period_us(void)
 {
-    /* Same guest cadence used by the production speed meter in main.c,
-     * multiplied only for the host LCD presenter. */
-    const uint32_t guest_period = (CRTC_Regs[0x29] & 0x10u) ? 18031u : 16271u;
-    return guest_period * kLiveLCDCadenceDiv;
+    if (__atomic_load_n(&s_p12r6_turbo, __ATOMIC_ACQUIRE))
+        return tab5_video_turbo_period_us_r128();
+    return kNALCDPeriodUsR117;
 }
 
 static void video_pace_timer_cb(void *)
@@ -4892,9 +4655,6 @@ static void video_pace_keep_latest_live(present_request_t *req)
             break;
         }
         *req = newer;
-        portENTER_CRITICAL(&s_stats_mux);
-        ++s_pace_coalesced_frames;
-        portEXIT_CRITICAL(&s_stats_mux);
     }
 }
 
@@ -4911,10 +4671,11 @@ static void video_pace_wait_live(const present_request_t &req)
     if (!s_pace_active_logged)
     {
         ESP_LOGI(TAG,
-                 "PX68K_LCD615H17: guest-derived host target=%uus (~%lu.%02luHz); LIVE path=%s; swaps additionally gated by physical DSI refresh_done",
+                 "PX68K_PRODUCT_P12R6A4_LCD: host target=%uus (~%lu.%02luHz), profile=%s, guest source cadence preserved; path=%s",
                  (unsigned)period,
                  (unsigned long)(1000000u / period),
                  (unsigned long)(((100000000u / period) % 100u)),
+                 tab5_video_turbo_mode() >= 2u ? "RED" : (tab5_video_turbo_mode() == 1u ? "GREEN" : "NORMAL"),
                  s_dsi_double_live ? "DSI-DOUBLEFB" : "M5GFX-FALLBACK");
         s_pace_active_logged = true;
     }
@@ -4928,14 +4689,11 @@ static void video_pace_wait_live(const present_request_t &req)
     }
 
     int64_t deadline = s_pace_next_us;
-    uint32_t skipped = 0;
     while (now > deadline + (int64_t)(period / 2u))
     {
         deadline += period;
-        ++skipped;
     }
 
-    uint32_t waited = 0;
     if (now < deadline)
     {
         const uint64_t delay_us = (uint64_t)(deadline - now);
@@ -4946,45 +4704,27 @@ static void video_pace_wait_live(const present_request_t &req)
         {
             (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
             const int64_t after = esp_timer_get_time();
-            waited = (after > now) ? (uint32_t)(after - now) : 0u;
             now = after;
         }
     }
 
-    const uint32_t interval = (s_pace_last_present_us > 0 && now > s_pace_last_present_us)
-        ? (uint32_t)(now - s_pace_last_present_us) : 0u;
-    s_pace_last_present_us = now;
-    s_pace_next_us = deadline + period;
-
-    portENTER_CRITICAL(&s_stats_mux);
-    if (waited)
-    {
-        ++s_pace_waits;
-        s_pace_wait_us += waited;
-    }
-    s_pace_last_wait_us = waited;
-    s_pace_skipped_slots += skipped;
-    s_pace_last_interval_us = interval;
-    portEXIT_CRITICAL(&s_stats_mux);
 }
 
 #if defined(CONFIG_IDF_TARGET_ESP32P4)
 static void IRAM_ATTR r57e12_touch_irq_isr(void *)
 {
     __atomic_store_n(&s_touch_irq_pending, 1u, __ATOMIC_RELEASE);
-    __atomic_add_fetch(&s_touch_irq_count, 1u, __ATOMIC_RELAXED);
 }
 
 static bool r57e12_touch_irq_init(void)
 {
-    /* M5Stack Tab5 ST7123 touch INT is GPIO23. M5.begin() already configured
+    /* M5Stack Tab5 ST712x touch INT is GPIO23. M5.begin() already configured
      * the touch device/pin, so leave direction/pulls untouched and only add
      * the edge handler. Active-contact polling detects release even though the
      * IRQ is falling-edge only. */
     esp_err_t er = gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
     if (er != ESP_OK && er != ESP_ERR_INVALID_STATE) {
         ESP_LOGW(TAG, "PX68K_TOUCHR57E12: gpio ISR service unavailable err=%d; sparse-poll fallback", (int)er);
-        __atomic_store_n(&s_touch_irq_fallback, 1u, __ATOMIC_RELAXED);
         return false;
     }
     er = gpio_set_intr_type(GPIO_NUM_23, GPIO_INTR_NEGEDGE);
@@ -4992,25 +4732,15 @@ static bool r57e12_touch_irq_init(void)
     if (er == ESP_OK) er = gpio_intr_enable(GPIO_NUM_23);
     if (er != ESP_OK) {
         ESP_LOGW(TAG, "PX68K_TOUCHR57E12: GPIO23 IRQ attach failed err=%d; sparse-poll fallback", (int)er);
-        __atomic_store_n(&s_touch_irq_fallback, 1u, __ATOMIC_RELAXED);
         return false;
     }
-    ESP_LOGI(TAG, "PX68K_TOUCHR57E12: GPIO23 atomic-edge IRQ ACTIVE; Touch-only read on IRQ, active=10ms, idle safety=80ms; no guest-path M5.update()");
+    ESP_LOGI(TAG, "PX68K_TOUCH_R57E125A: RELEASE-HANDOFF + bounded overlay draw ACTIVE; R123 20ms self-heal retained; periodic heartbeat RETIRED");
     return true;
 }
 #endif
 
 static void video_present_task(void *)
 {
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-    {
-        const uintptr_t r56k5_base = (uintptr_t)pxTaskGetStackStart(NULL);
-        esp_rom_printf("R56K5_TASKSELF name=px68k_lcd core=%d base=0x%08x top=0x%08x bytes=8192 hwm=%u\n",
-                       (int)xPortGetCoreID(), (unsigned)r56k5_base,
-                       (unsigned)(r56k5_base + 8192u),
-                       (unsigned)uxTaskGetStackHighWaterMark(NULL));
-    }
-#endif
     present_request_t req = {};
 
     for (;;)
@@ -5027,21 +4757,24 @@ static void video_present_task(void *)
         const TickType_t wait_ticks = pdMS_TO_TICKS(10);
         const bool have_req = xQueueReceive(s_ready_requests, &req, wait_ticks) == pdTRUE;
         bool touch_due = false;
-        uint8_t touch_reason = 0u; /* 1=IRQ, 2=active follow, 3=safety/fallback */
+        uint8_t touch_reason = 0u; /* 1=IRQ, 2=active follow, 3=safety, 4=GPIO-low */
+        const int64_t now_touch_us = esp_timer_get_time();
+        const bool gpio_low = gpio_get_level(GPIO_NUM_23) == 0;
         if (s_game_controls_enabled) {
             if (__atomic_exchange_n(&s_touch_irq_pending, 0u, __ATOMIC_ACQ_REL)) {
                 touch_due = true; touch_reason = 1u;
             } else if (s_touch_contact_active ||
                        (s_game_touch_suppress_until_release && !s_touch_transition_present_guard)) {
                 touch_due = true; touch_reason = 2u;
-            } else {
-                const int64_t now_touch_us = esp_timer_get_time();
-                const int64_t safety_us = s_touch_irq_enabled ? 80000 : 20000;
-                if (!s_touch_last_sample_us || now_touch_us - s_touch_last_sample_us >= safety_us) {
-                    touch_due = true; touch_reason = 3u;
-                }
+            } else if (gpio_low &&
+                       (!s_touch_last_sample_us || now_touch_us - s_touch_last_sample_us >= 10000)) {
+                touch_due = true; touch_reason = 4u;
+            } else if (!s_touch_last_sample_us || now_touch_us - s_touch_last_sample_us >= 20000) {
+                touch_due = true; touch_reason = 3u;
             }
         }
+
+        /* R139A6A3: periodic touch heartbeat retired. */
 
         /* Build 6.12u: runtime launcher owns the panel while CPU1 is paused.
          * Drain stale snapshots but never touch LCD/touch until ownership returns. */
@@ -5077,13 +4810,28 @@ static void video_present_task(void *)
          * no video request arrived, while still draining queued snapshots. */
         if (s_media_overlay_active)
         {
-            display_lock();
+            if (__atomic_load_n(&s_runtime_media_refresh_pending, __ATOMIC_ACQUIRE)) {
+                if (snapshot_runtime_media_to_pending())
+                    s_media_overlay_redraw = true;
+            }
+            /* R125A: touch-only loops do zero display work.  Redraw attempts are
+             * bounded and retried instead of parking the presenter forever. */
+            if (s_media_overlay_redraw) {
+                if (display_try_lock_ticks(pdMS_TO_TICKS(5))) {
+                    bool ui_ready = true;
 #if defined(CONFIG_IDF_TARGET_ESP32P4)
-            (void)dbfb615h17_prepare_m5gfx_front();
+                    if (s_dsi_double_live &&
+                        (__atomic_load_n(&s_dsi_sync_pending, __ATOMIC_ACQUIRE) ||
+                         (s_dsi_swap_wait_refresh &&
+                          __atomic_load_n(&s_dsi_refresh_seq, __ATOMIC_ACQUIRE) == s_dsi_swap_refresh_seq)))
+                        ui_ready = false;
+                    if (ui_ready) ui_ready = dbfb615h17_prepare_m5gfx_front();
 #endif
-            if (s_media_overlay_redraw)
-                draw_media_overlay_unlocked();
-            display_unlock();
+                    if (ui_ready) draw_media_overlay_unlocked();
+                    display_unlock();
+                } else {
+                }
+            }
             if (have_req &&
                 (req.mode == PRESENT_SNAPSHOT || req.mode == PRESENT_LIVE_FROZEN || req.mode == PRESENT_MANAGED) &&
                 req.slot_index < kPresentSlots)
@@ -5097,13 +4845,22 @@ static void video_present_task(void *)
 
         if (s_softkbd_active)
         {
-            display_lock();
+            if (s_softkbd_redraw) {
+                if (display_try_lock_ticks(pdMS_TO_TICKS(5))) {
+                    bool ui_ready = true;
 #if defined(CONFIG_IDF_TARGET_ESP32P4)
-            (void)dbfb615h17_prepare_m5gfx_front();
+                    if (s_dsi_double_live &&
+                        (__atomic_load_n(&s_dsi_sync_pending, __ATOMIC_ACQUIRE) ||
+                         (s_dsi_swap_wait_refresh &&
+                          __atomic_load_n(&s_dsi_refresh_seq, __ATOMIC_ACQUIRE) == s_dsi_swap_refresh_seq)))
+                        ui_ready = false;
+                    if (ui_ready) ui_ready = dbfb615h17_prepare_m5gfx_front();
 #endif
-            if (s_softkbd_redraw)
-                draw_soft_keyboard_unlocked();
-            display_unlock();
+                    if (ui_ready) draw_soft_keyboard_unlocked();
+                    display_unlock();
+                } else {
+                }
+            }
             if (have_req &&
                 (req.mode == PRESENT_SNAPSHOT || req.mode == PRESENT_LIVE_FROZEN || req.mode == PRESENT_MANAGED) &&
                 req.slot_index < kPresentSlots)
@@ -5140,20 +4897,10 @@ static void video_present_task(void *)
             continue;
         }
 
-        const int64_t t0 = esp_timer_get_time();
         uint32_t live_retries = 0;
         uint32_t live_unstable = 0;
 
-        const int64_t r83_lock_t0 =
-            (req.mode == PRESENT_MANAGED) ? esp_timer_get_time() : 0;
         display_lock();
-        if (r83_lock_t0 != 0)
-        {
-            const uint64_t dt = (uint64_t)(esp_timer_get_time() - r83_lock_t0);
-            portENTER_CRITICAL(&s_stats_mux);
-            s_r83_display_lock_us += dt;
-            portEXIT_CRITICAL(&s_stats_mux);
-        }
         if ((req.mode == PRESENT_LIVE_FB || req.mode == PRESENT_LIVE_FROZEN) &&
             req.live_epoch != __atomic_load_n(&s_live_present_epoch, __ATOMIC_ACQUIRE)) {
             ++s_live_epoch_drops;
@@ -5177,21 +4924,21 @@ static void video_present_task(void *)
                 tab5_screen_manager_present_complete(req.screen_token, 0);
             continue;
         }
-        if (!s_present_started || s_force_game_redraw)
+        if (__atomic_load_n(&s_present_started, __ATOMIC_ACQUIRE) == 0u || s_force_game_redraw)
         {
 #if defined(CONFIG_IDF_TARGET_ESP32P4)
             (void)dbfb615h17_prepare_m5gfx_front();
 #endif
             M5.Display.fillScreen(0x0000);
             draw_game_controls_unlocked();
-            s_present_started = true;
+            __atomic_store_n(&s_present_started, 1u, __ATOMIC_RELEASE);
             s_force_game_redraw = false;
         }
-        /* R84 ownership boundary at the physical presenter:
+        /* R84/P12R5 ownership boundary at the physical presenter:
          * managed ScreenVersions are immutable. Steady sparse frames update
-         * pinned FB0 directly; full/recovery frames retain the proven
-         * PPA->Back-FB->swap fallback. Neither raw-panel path is wrapped in an
-         * M5GFX transaction. UI/chrome drawing above still marks full sync. */
+         * the confirmed scanout Front directly; full/recovery frames retain
+         * the proven PPA->Back-FB->swap fallback. Neither raw-panel path is
+         * wrapped in an M5GFX transaction. */
         if (req.mode != PRESENT_LIVE_FB && req.mode != PRESENT_MANAGED)
         {
 #if defined(CONFIG_IDF_TARGET_ESP32P4)
@@ -5202,15 +4949,8 @@ static void video_present_task(void *)
         bool managed_present_ok = true;
         if (req.mode == PRESENT_MANAGED) {
 #if defined(CONFIG_IDF_TARGET_ESP32P4)
-            const int64_t r83_push_t0 = esp_timer_get_time();
             managed_present_ok = s_dsi_double_live &&
                 push_live_frame(req, &live_retries, &live_unstable, false);
-            {
-                const uint64_t dt = (uint64_t)(esp_timer_get_time() - r83_push_t0);
-                portENTER_CRITICAL(&s_stats_mux);
-                s_r83_push_frame_us += dt;
-                portEXIT_CRITICAL(&s_stats_mux);
-            }
 #else
             managed_present_ok = false;
 #endif
@@ -5240,14 +4980,7 @@ static void video_present_task(void *)
              * the Back framebuffer (direct-front is bypassed above), and this
              * wait confirms that this exact swap crossed the physical DSI
              * refresh boundary before Screen Manager retires the old VISIBLE. */
-            const int64_t r83_refresh_t0 = esp_timer_get_time();
             managed_present_ok = dbfb615h17_wait_refresh();
-            {
-                const uint64_t dt = (uint64_t)(esp_timer_get_time() - r83_refresh_t0);
-                portENTER_CRITICAL(&s_stats_mux);
-                s_r83_refresh_wait_us += dt;
-                portEXIT_CRITICAL(&s_stats_mux);
-            }
         }
         if (req.mode == PRESENT_MANAGED)
             s_r74_managed_force_full_next = !managed_present_ok;
@@ -5257,32 +4990,7 @@ static void video_present_task(void *)
         touch_transition_present_complete(
             req, req.mode != PRESENT_MANAGED || managed_present_ok);
 
-        if (req.mode == PRESENT_MANAGED) {
-            static uint32_t r56d_stack_samples = 0u;
-            if (r56d_stack_samples < 4u) {
-                ++r56d_stack_samples;
-                ESP_LOGI(TAG,
-                         "PX68K_SCREEN_R56D: managed present return sample=%lu ok=%u lcdStackHighWater=%lu",
-                         (unsigned long)r56d_stack_samples,
-                         managed_present_ok ? 1u : 0u,
-                         (unsigned long)uxTaskGetStackHighWaterMark(NULL));
-            }
-        }
 
-        const uint32_t push_us = (uint32_t)(esp_timer_get_time() - t0);
-        portENTER_CRITICAL(&s_stats_mux);
-        ++s_presented_frames;
-        s_last_push_us = push_us;
-        s_cpu0_push_total_us += push_us;
-        if (req.mode == PRESENT_LIVE_FB || req.mode == PRESENT_LIVE_FROZEN || req.mode == PRESENT_MANAGED)
-        {
-            ++s_live_presented_frames;
-            s_live_row_retries += live_retries;
-            s_live_unstable_rows += live_unstable;
-        }
-        if (req.mode == PRESENT_LIVE_FROZEN)
-            ++s_r52_frozen_presented;
-        portEXIT_CRITICAL(&s_stats_mux);
 
         if ((req.mode == PRESENT_SNAPSHOT || req.mode == PRESENT_LIVE_FROZEN || req.mode == PRESENT_MANAGED) &&
             req.slot_index < kPresentSlots)
@@ -5540,7 +5248,6 @@ static bool init_async_present(void)
     s_touch_irq_enabled = r57e12_touch_irq_init();
 #else
     s_touch_irq_enabled = false;
-    __atomic_store_n(&s_touch_irq_fallback, 1u, __ATOMIC_RELAXED);
 #endif
 
 #if portNUM_PROCESSORS > 1
@@ -5565,6 +5272,8 @@ static bool init_async_present(void)
              "PX68K_LCD_R57E84: managed sparse DIRECT-NATIVE FB0 ACTIVE; exact dirty32 -> 8x8 native stores; full/recovery stays PPA; completion waits next refresh_done");
     ESP_LOGI(TAG,
              "PX68K_LCD_R57E85: managed native ARM FIX ACTIVE; legacy R49 full-front token no longer gates managed path; writes follow confirmed front_idx");
+    ESP_LOGI(TAG,
+             "PX68K_AV_P12R6A4: BLACK=44.1k, GREEN=22.05k, RED=11.025k; Turbo adaptive15/20/24 MAX24; guest clocks unchanged");
     ESP_LOGI(TAG, "PX68K_LCD_R57E92: A164 180-degree rotation-aware native/PPA mapping compiled in; inactive unless keyboard detected");
     ESP_LOGI(TAG,
              "PX68K_HOST_R56K: LCD presenter prio=3 queue-blocking + IRQ-flag touch sampling boundary-yield stack=8192");
@@ -5596,25 +5305,12 @@ void tab5_video_fb_line_write_end_changed_span(uint32_t y, int changed,
                                                uint32_t x0, uint32_t x1)
 {
     if (y >= kTrackedLines) return;
+    (void)x0; (void)x1;
     if (changed)
     {
-        uint16_t nx0 = (uint16_t)std::min<uint32_t>(x0, 0xffffu);
-        uint16_t nx1 = (uint16_t)std::min<uint32_t>(x1, 0xffffu);
-        if (nx1 <= nx0) { nx0 = 0u; nx1 = 0xffffu; }
-        portENTER_CRITICAL(&s_line_dirty_span_mux);
-        s_line_dirty_tile32[y] = 0xffffffffu; /* generic/span writer => conservative full row for R42 */
-        if (s_line_dirty_x1[y] <= s_line_dirty_x0[y])
-        {
-            s_line_dirty_x0[y] = nx0;
-            s_line_dirty_x1[y] = nx1;
-        }
-        else
-        {
-            if (nx0 < s_line_dirty_x0[y]) s_line_dirty_x0[y] = nx0;
-            if (nx1 > s_line_dirty_x1[y]) s_line_dirty_x1[y] = nx1;
-        }
+        /* Generic/span writers remain conservative exactly as R42 intended. */
+        (void)__atomic_fetch_or(&s_line_dirty_tile32[y], 0xffffffffu, __ATOMIC_RELEASE);
         (void)__atomic_add_fetch(&s_line_generation[y], 1u, __ATOMIC_RELEASE);
-        portEXIT_CRITICAL(&s_line_dirty_span_mux);
     }
     (void)__atomic_sub_fetch(&s_line_writers[y], 1u, __ATOMIC_RELEASE);
 }
@@ -5630,28 +5326,8 @@ void tab5_video_fb_line_write_end_changed_tiles32(uint32_t y, int changed,
             (tiles ? ((1u << tiles) - 1u) : 0u);
         uint32_t m = tile_mask & useful;
         if (!m) m = useful ? useful : 0xffffffffu; /* defensive full-row publication */
-        portENTER_CRITICAL(&s_line_dirty_span_mux);
-        if (s_line_dirty_tile32[y] == 0xffffffffu || m == 0xffffffffu)
-            s_line_dirty_tile32[y] = 0xffffffffu;
-        else
-            s_line_dirty_tile32[y] |= m;
-        /* Keep a conservative envelope for fallback/debug consumers. */
-        uint32_t first = (uint32_t)__builtin_ctz(m);
-        uint32_t last = 31u - (uint32_t)__builtin_clz(m);
-        uint16_t nx0 = (uint16_t)std::min<uint32_t>(first << 5, 0xffffu);
-        uint16_t nx1 = (uint16_t)std::min<uint32_t>(width_pixels, (last + 1u) << 5);
-        if (s_line_dirty_x1[y] <= s_line_dirty_x0[y])
-        {
-            s_line_dirty_x0[y] = nx0;
-            s_line_dirty_x1[y] = nx1;
-        }
-        else
-        {
-            if (nx0 < s_line_dirty_x0[y]) s_line_dirty_x0[y] = nx0;
-            if (nx1 > s_line_dirty_x1[y]) s_line_dirty_x1[y] = nx1;
-        }
+        (void)__atomic_fetch_or(&s_line_dirty_tile32[y], m, __ATOMIC_RELEASE);
         (void)__atomic_add_fetch(&s_line_generation[y], 1u, __ATOMIC_RELEASE);
-        portEXIT_CRITICAL(&s_line_dirty_span_mux);
     }
     (void)__atomic_sub_fetch(&s_line_writers[y], 1u, __ATOMIC_RELEASE);
 }
@@ -5684,7 +5360,16 @@ void tab5_video_fb_range_write_end(uint32_t y, uint32_t count)
 
 void tab5_video_set_game_controls_enabled(int enabled)
 {
-    s_game_controls_enabled = enabled != 0;
+    const bool next_enabled = enabled != 0;
+    if (s_game_controls_enabled != next_enabled) {
+        ESP_LOGI(TAG, "PX68K_TOUCH125 controls %s -> %s core=%d hostui=%u overlay=%u pending=%u",
+                 s_game_controls_enabled ? "ON" : "OFF", next_enabled ? "ON" : "OFF",
+                 (int)xPortGetCoreID(),
+                 __atomic_load_n(&s_host_ui_exclusive, __ATOMIC_ACQUIRE)?1u:0u,
+                 (s_media_overlay_active || s_softkbd_active)?1u:0u,
+                 (unsigned)s_touch125_ui_pending);
+    }
+    s_game_controls_enabled = next_enabled;
     s_utility_prev_mask = 0;
     s_touch_dpad_prev = 0;
     s_touch_dpad_press_us = 0;
@@ -5698,6 +5383,8 @@ void tab5_video_set_game_controls_enabled(int enabled)
         s_softkbd_shift = false;
         s_softkbd_ctrl = false;
         s_soft_input_count = 0;
+        s_touch125_ui_pending = TOUCH125_UI_NONE;
+        s_touch125_ui_release_stable = 0u;
         s_game_touch_key_prev = 0;
         /* This function is called from CPU1 for runtime ownership changes.
          * Apply zero immediately on CPU1 and tell LP to discard any older
@@ -5706,7 +5393,7 @@ void tab5_video_set_game_controls_enabled(int enabled)
         if (xPortGetCoreID() == 1)
             (void)tab5_lp_broker_touch_control_publish(0);
     } else {
-        s_present_started = false;
+        __atomic_store_n(&s_present_started, 0u, __ATOMIC_RELEASE);
         s_aspect_seen_frame = nullptr;
         tab5_video_touch_transition_begin(0u, 0u, 0u);
     }
@@ -5723,29 +5410,23 @@ void tab5_video_set_runtime_media_paths(const char *fdd0,
                                         const char *fdd1,
                                         const char *hdd0)
 {
-    portENTER_CRITICAL(&s_runtime_media_mux);
-    std::snprintf(s_runtime_fdd0, sizeof(s_runtime_fdd0), "%s", fdd0 ? fdd0 : "");
-    std::snprintf(s_runtime_fdd1, sizeof(s_runtime_fdd1), "%s", fdd1 ? fdd1 : "");
-    std::snprintf(s_runtime_hdd0, sizeof(s_runtime_hdd0), "%s", hdd0 ? hdd0 : "");
-    /* While FILE is open, CPU1 is the source of truth after each immediate
-     * mount/eject action. Mirror the actual result back into the shared UI so
-     * a failed mount cannot leave a stale filename on screen. */
-    if (s_media_overlay_active) {
-        std::snprintf(s_media_pending_fdd0, sizeof(s_media_pending_fdd0), "%s", s_runtime_fdd0);
-        std::snprintf(s_media_pending_fdd1, sizeof(s_media_pending_fdd1), "%s", s_runtime_fdd1);
-        std::snprintf(s_media_pending_hdd0, sizeof(s_media_pending_hdd0), "%s", s_runtime_hdd0);
-    }
-    portEXIT_CRITICAL(&s_runtime_media_mux);
-    if (s_media_overlay_active)
-        s_media_overlay_redraw = true;
+    (void)__atomic_add_fetch(&s_runtime_media_seq, 1u, __ATOMIC_ACQ_REL); /* odd */
+    runtime_media_atomic_store_path(s_runtime_fdd0, fdd0);
+    runtime_media_atomic_store_path(s_runtime_fdd1, fdd1);
+    runtime_media_atomic_store_path(s_runtime_hdd0, hdd0);
+    (void)__atomic_add_fetch(&s_runtime_media_seq, 1u, __ATOMIC_RELEASE); /* even */
+    __atomic_store_n(&s_runtime_media_refresh_pending, 1u, __ATOMIC_RELEASE);
 }
 
 void tab5_video_set_runtime_boot_source(int boot_source)
 {
-    portENTER_CRITICAL(&s_runtime_media_mux);
-    s_runtime_boot_source = boot_source == TAB5_LAUNCH_BOOT_HDD0 ?
-                            TAB5_LAUNCH_BOOT_HDD0 : TAB5_LAUNCH_BOOT_FLOPPY0;
-    portEXIT_CRITICAL(&s_runtime_media_mux);
+    (void)__atomic_add_fetch(&s_runtime_media_seq, 1u, __ATOMIC_ACQ_REL); /* odd */
+    __atomic_store_n(&s_runtime_boot_source,
+                     boot_source == TAB5_LAUNCH_BOOT_HDD0 ?
+                     TAB5_LAUNCH_BOOT_HDD0 : TAB5_LAUNCH_BOOT_FLOPPY0,
+                     __ATOMIC_RELAXED);
+    (void)__atomic_add_fetch(&s_runtime_media_seq, 1u, __ATOMIC_RELEASE); /* even */
+    __atomic_store_n(&s_runtime_media_refresh_pending, 1u, __ATOMIC_RELEASE);
 }
 
 static void drain_present_requests_for_host_ui(void)
@@ -5773,7 +5454,7 @@ void tab5_video_begin_host_ui(void)
     (void)dbfb615h17_prepare_m5gfx_front();
 #endif
     M5.Display.fillScreen(TFT_BLACK);
-    s_present_started = false;
+    __atomic_store_n(&s_present_started, 0u, __ATOMIC_RELEASE);
     s_force_game_redraw = false;
     s_aspect_seen_frame = nullptr;
     std::memset(s_aspect_seen_generation, 0, sizeof(s_aspect_seen_generation));
@@ -5786,7 +5467,7 @@ void tab5_video_end_host_ui(void)
 {
     drain_present_requests_for_host_ui();
     display_lock();
-    s_present_started = false;
+    __atomic_store_n(&s_present_started, 0u, __ATOMIC_RELEASE);
     s_force_game_redraw = true;
     s_aspect_seen_frame = nullptr;
     std::memset(s_aspect_seen_generation, 0, sizeof(s_aspect_seen_generation));
@@ -5842,7 +5523,7 @@ void tab5_video_set_panic_compat_enabled(int enabled)
         s_aspect_map_src_h = s_aspect_map_dst_h = 0;
         s_aspect_log_src_w = s_aspect_log_src_h = 0;
         s_force_game_redraw = false;
-        s_present_started = true;
+        __atomic_store_n(&s_present_started, 1u, __ATOMIC_RELEASE);
         display_unlock();
         ESP_LOGI(TAG, "PANIC display transition: previous guest frame cleared; host LCD/audio kept alive");
     }
@@ -5893,7 +5574,6 @@ void tab5_video_init(void)
     display_unlock();
 
     ESP_LOGI(TAG, "Display initialized: %d x %d", M5.Display.width(), M5.Display.height());
-    ESP_LOGI(TAG, "PX68K_TURBO_R57E97T: UI compiled; N/A=44.1k audio-safe, Turbo=22.05k + aggressive video bias/target30fps; button x=31 y=296 98x58");
 
     s_async_ready = init_async_present();
     if (s_async_ready)
@@ -5925,14 +5605,18 @@ void tab5_video_show_message(const char *line1, const char *line2)
 
 void tab5_video_status(const char *line1, const char *line2)
 {
-    /* Build 5.98a: status banners are useful during launcher/boot, but once
-     * emulator presentation starts they become debug text painted over the
-     * top of the game.  Runtime state is still reported on serial logs.
-     * Check while holding the display mutex so the first emulator full-clear
-     * and a late USB status message cannot race each other. */
+    /* HF3 CPU1 NO-WAIT: once guest presentation has started, runtime status is
+     * serial-only.  Do not wait for CPU0's display owner merely to discover
+     * that the banner would be suppressed.  During boot, a busy display also
+     * means drop this optional banner rather than stall the caller. */
+    if (__atomic_load_n(&s_present_started, __ATOMIC_ACQUIRE) != 0u ||
+        s_media_overlay_active)
+        return;
     const int lcd_w = M5.Display.width();
-    display_lock();
-    if (s_present_started || s_media_overlay_active)
+    if (!display_try_lock_ticks(0))
+        return;
+    if (__atomic_load_n(&s_present_started, __ATOMIC_ACQUIRE) != 0u ||
+        s_media_overlay_active)
     {
         display_unlock();
         return;
@@ -5973,9 +5657,6 @@ void tab5_video_present_px68k(const uint16_t *frame,
         uint8_t slot_index = 0;
         if (xQueueReceive(s_free_slots, &slot_index, 0) != pdTRUE)
         {
-            portENTER_CRITICAL(&s_stats_mux);
-            ++s_dropped_frames;
-            portEXIT_CRITICAL(&s_stats_mux);
             return;
         }
 
@@ -5984,13 +5665,9 @@ void tab5_video_present_px68k(const uint16_t *frame,
         if (pixels > s_slot_capacity_pixels)
         {
             (void)xQueueSend(s_free_slots, &slot_index, 0);
-            portENTER_CRITICAL(&s_stats_mux);
-            ++s_dropped_frames;
-            portEXIT_CRITICAL(&s_stats_mux);
             return;
         }
 
-        const int64_t t0 = esp_timer_get_time();
         uint16_t *dst = slot.pixels;
         if (pitch_pixels == width)
         {
@@ -6007,7 +5684,6 @@ void tab5_video_present_px68k(const uint16_t *frame,
         }
         slot.width = width;
         slot.height = height;
-        const uint32_t copy_us = (uint32_t)(esp_timer_get_time() - t0);
 
         present_request_t req = {};
         req.mode = PRESENT_SNAPSHOT;
@@ -6017,28 +5693,24 @@ void tab5_video_present_px68k(const uint16_t *frame,
         if (xQueueSend(s_ready_requests, &req, 0) != pdTRUE)
         {
             (void)xQueueSend(s_free_slots, &slot_index, 0);
-            portENTER_CRITICAL(&s_stats_mux);
-            ++s_dropped_frames;
-            portEXIT_CRITICAL(&s_stats_mux);
             return;
         }
 
-        portENTER_CRITICAL(&s_stats_mux);
-        ++s_submitted_frames;
-        s_last_copy_us = copy_us;
-        portEXIT_CRITICAL(&s_stats_mux);
         return;
     }
 
-    /* Allocation/task failure fallback: preserve the proven synchronous path. */
+    /* Allocation/task failure fallback: remain CPU1 NO-WAIT.  If CPU0 owns
+     * the display right now, drop this fallback frame rather than serialize
+     * guest time behind the panel. */
     const int x = ((int)lcd_w - (int)width) / 2;
     const int y = ((int)lcd_h - (int)height) / 2;
-    display_lock();
-    if (!s_present_started || s_force_game_redraw)
+    if (!display_try_lock_ticks(0))
+        return;
+    if (__atomic_load_n(&s_present_started, __ATOMIC_ACQUIRE) == 0u || s_force_game_redraw)
     {
         M5.Display.fillScreen(0x0000);
         if (s_game_controls_enabled) draw_game_controls_unlocked();
-        s_present_started = true;
+        __atomic_store_n(&s_present_started, 1u, __ATOMIC_RELEASE);
         s_force_game_redraw = false;
     }
     M5.Display.startWrite();
@@ -6083,16 +5755,9 @@ void tab5_video_present_px68k_live(const uint16_t *frame,
 
         if (xQueueSend(s_ready_requests, &req, 0) != pdTRUE)
         {
-            portENTER_CRITICAL(&s_stats_mux);
-            ++s_dropped_frames;
-            portEXIT_CRITICAL(&s_stats_mux);
             return;
         }
 
-        portENTER_CRITICAL(&s_stats_mux);
-        ++s_submitted_frames;
-        s_last_copy_us = 0;
-        portEXIT_CRITICAL(&s_stats_mux);
         return;
     }
 
@@ -6143,7 +5808,6 @@ int tab5_video_present_px68k_live_frozen(const uint16_t *frame,
     /* Remove an acknowledgement left behind by a previous timed-out request. */
     while (xSemaphoreTake(s_frozen_present_done, 0) == pdTRUE) {}
 
-    const int64_t copy_t0 = esp_timer_get_time();
     uint16_t *dst = slot.pixels;
     if (pitch_pixels == width)
     {
@@ -6160,7 +5824,6 @@ int tab5_video_present_px68k_live_frozen(const uint16_t *frame,
     }
     slot.width = width;
     slot.height = height;
-    const uint32_t copy_us = (uint32_t)(esp_timer_get_time() - copy_t0);
 
     present_request_t req = {};
     req.mode = PRESENT_LIVE_FROZEN;
@@ -6178,44 +5841,17 @@ int tab5_video_present_px68k_live_frozen(const uint16_t *frame,
         return 0;
     }
 
-    portENTER_CRITICAL(&s_stats_mux);
-    ++s_submitted_frames;
-    ++s_r52_frozen_submits;
-    s_last_copy_us = copy_us;
-    s_r52_frozen_copy_us += copy_us;
-    portEXIT_CRITICAL(&s_stats_mux);
 
-    const int64_t wait_t0 = esp_timer_get_time();
     const BaseType_t ack = xSemaphoreTake(s_frozen_present_done, pdMS_TO_TICKS(500));
-    const uint32_t wait_us = (uint32_t)(esp_timer_get_time() - wait_t0);
 
-    portENTER_CRITICAL(&s_stats_mux);
-    s_r52_frozen_wait_us += wait_us;
-    if (ack != pdTRUE)
-        ++s_r52_frozen_timeouts;
-    const uint64_t submit_count = s_r52_frozen_submits;
-    const uint64_t present_count = s_r52_frozen_presented;
-    const uint64_t timeout_count = s_r52_frozen_timeouts;
-    portEXIT_CRITICAL(&s_stats_mux);
 
     if (ack != pdTRUE)
     {
-        ESP_LOGE(TAG,
-                 "PX68K_R52: frozen LIVE PRESENT TIMEOUT src=%lux%lu copy=%luus wait=%luus submit=%llu shown=%llu timeouts=%llu",
-                 (unsigned long)width, (unsigned long)height,
-                 (unsigned long)copy_us, (unsigned long)wait_us,
-                 (unsigned long long)submit_count,
-                 (unsigned long long)present_count,
-                 (unsigned long long)timeout_count);
+        ESP_LOGE(TAG, "PX68K_R52: frozen LIVE PRESENT TIMEOUT src=%lux%lu",
+                 (unsigned long)width, (unsigned long)height);
         return 0;
     }
 
-    ESP_LOGI(TAG,
-             "PX68K_R52: FROZEN LIVE shown src=%lux%lu copy=%luus wait=%luus submit=%llu shown=%llu",
-             (unsigned long)width, (unsigned long)height,
-             (unsigned long)copy_us, (unsigned long)wait_us,
-             (unsigned long long)submit_count,
-             (unsigned long long)present_count);
     return 1;
 }
 
@@ -6276,17 +5912,14 @@ int tab5_video_present_px68k_managed(const uint16_t *frame,
         return 0;
     }
 
-    const int64_t r83_slot_copy_t0 = esp_timer_get_time();
     uint16_t *dst = slot.pixels;
 
     const bool geometry_submit_changed =
         (s_r82_submit_w != width) || (s_r82_submit_h != height);
     const bool full_snapshot =
-        !dirty_tiles32 || geometry_submit_changed || s_r74_managed_force_full_next;
+        !dirty_tiles32 || geometry_submit_changed || s_r74_managed_force_full_next ||
+        (__atomic_load_n(&s_p12r5_geom_force_full_next, __ATOMIC_ACQUIRE) != 0u);
 
-    uint32_t copied_rows = 0u;
-    uint32_t skipped_rows = 0u;
-    uint64_t copied_bytes = 0u;
 
     if (full_snapshot)
     {
@@ -6303,8 +5936,6 @@ int tab5_video_present_px68k_managed(const uint16_t *frame,
                             (size_t)width * sizeof(uint16_t));
             }
         }
-        copied_rows = height;
-        copied_bytes = (uint64_t)width * (uint64_t)height * sizeof(uint16_t);
         slot.managed_sparse = 0u;
         s_r82_submit_w = width;
         s_r82_submit_h = height;
@@ -6318,24 +5949,14 @@ int tab5_video_present_px68k_managed(const uint16_t *frame,
                 std::memcpy(dst + (size_t)row * width,
                             frame + (size_t)row * pitch_pixels,
                             (size_t)width * sizeof(uint16_t));
-                ++copied_rows;
             }
             else
             {
-                ++skipped_rows;
             }
         }
-        copied_bytes = (uint64_t)copied_rows * (uint64_t)width * sizeof(uint16_t);
         slot.managed_sparse = 1u;
     }
 
-    portENTER_CRITICAL(&s_stats_mux);
-    if (full_snapshot) ++s_r82_slot_full_frames;
-    else ++s_r82_slot_sparse_frames;
-    s_r82_slot_rows_copied += copied_rows;
-    s_r82_slot_rows_skipped += skipped_rows;
-    s_r82_slot_bytes_copied += copied_bytes;
-    portEXIT_CRITICAL(&s_stats_mux);
 
     slot.width = width;
     slot.height = height;
@@ -6349,12 +5970,6 @@ int tab5_video_present_px68k_managed(const uint16_t *frame,
             for (uint32_t y = 0; y < height; ++y)
                 slot.managed_dirty_tiles[y] = full;
         }
-    }
-    {
-        const uint64_t dt = (uint64_t)(esp_timer_get_time() - r83_slot_copy_t0);
-        portENTER_CRITICAL(&s_stats_mux);
-        s_r83_slot_copy_us += dt;
-        portEXIT_CRITICAL(&s_stats_mux);
     }
 
     present_request_t req = {};
@@ -6375,10 +5990,6 @@ int tab5_video_present_px68k_managed(const uint16_t *frame,
         return 0;
     }
 
-    portENTER_CRITICAL(&s_stats_mux);
-    ++s_submitted_frames;
-    s_last_copy_us = 0;
-    portEXIT_CRITICAL(&s_stats_mux);
     return 1;
 }
 
@@ -6432,74 +6043,4 @@ uint32_t tab5_video_live_epoch_current(void)
     return __atomic_load_n(&s_live_present_epoch, __ATOMIC_ACQUIRE);
 }
 
-void tab5_video_get_touch_irq_stats(tab5_video_touch_irq_stats_t *out)
-{
-    if (!out) return;
-    out->irq_count = __atomic_load_n(&s_touch_irq_count, __ATOMIC_RELAXED);
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-    out->update_count = __atomic_load_n(&s_touch_update_count, __ATOMIC_RELAXED);
-    out->irq_samples = __atomic_load_n(&s_touch_irq_samples, __ATOMIC_RELAXED);
-    out->active_samples = __atomic_load_n(&s_touch_active_samples, __ATOMIC_RELAXED);
-    out->safety_samples = __atomic_load_n(&s_touch_safety_samples, __ATOMIC_RELAXED);
-    out->update_total_us = __atomic_load_n(&s_touch_update_us, __ATOMIC_RELAXED);
-    out->update_max_us = __atomic_load_n(&s_touch_update_max_us, __ATOMIC_RELAXED);
-#else
-    out->update_count = out->irq_samples = out->active_samples = out->safety_samples = 0;
-    out->update_total_us = out->update_max_us = 0;
-#endif
-    out->contact_active = s_touch_contact_active ? 1u : 0u;
-    out->irq_enabled = s_touch_irq_enabled ? 1u : 0u;
-    out->fallback_poll = __atomic_load_n(&s_touch_irq_fallback, __ATOMIC_RELAXED);
-}
-
-void tab5_video_get_async_stats(tab5_video_async_stats_t *out)
-{
-    if (!out) return;
-    portENTER_CRITICAL(&s_stats_mux);
-    out->submitted_frames = s_submitted_frames;
-    out->presented_frames = s_presented_frames;
-    out->dropped_frames = s_dropped_frames;
-    out->last_copy_us = s_last_copy_us;
-    out->last_push_us = s_last_push_us;
-    out->live_presented_frames = s_live_presented_frames;
-    out->live_row_retries = s_live_row_retries;
-    out->live_unstable_rows = s_live_unstable_rows;
-    out->pace_waits = s_pace_waits;
-    out->pace_wait_us = s_pace_wait_us;
-    out->pace_last_wait_us = s_pace_last_wait_us;
-    out->pace_coalesced_frames = s_pace_coalesced_frames;
-    out->pace_skipped_slots = s_pace_skipped_slots;
-    out->pace_last_interval_us = s_pace_last_interval_us;
-    out->cpu0_push_total_us = s_cpu0_push_total_us;
-    out->managed_rows_scanned = s_r74_managed_rows_scanned;
-    out->managed_rows_skipped = s_r74_managed_rows_skipped;
-    out->managed_map_frames = s_r74_managed_map_frames;
-    out->managed_slot_sparse_frames = s_r82_slot_sparse_frames;
-    out->managed_slot_full_frames = s_r82_slot_full_frames;
-    out->managed_slot_rows_copied = s_r82_slot_rows_copied;
-    out->managed_slot_rows_skipped = s_r82_slot_rows_skipped;
-    out->managed_slot_forcefull_rejects = s_r82_slot_forcefull_rejects;
-    out->managed_slot_bytes_copied = s_r82_slot_bytes_copied;
-    out->managed_slot_copy_us = s_r83_slot_copy_us;
-    out->managed_display_lock_us = s_r83_display_lock_us;
-    out->managed_push_frame_us = s_r83_push_frame_us;
-    out->managed_ppa_us = s_r83_ppa_us;
-    out->managed_refresh_wait_us = s_r83_refresh_wait_us;
-    out->managed_native_frames = s_r84_native_frames;
-    out->managed_native_fallbacks = s_r84_native_fallbacks;
-    out->managed_native_tile_runs = s_r84_native_tile_runs;
-    out->managed_native_tiles = s_r84_native_tiles;
-    out->managed_native_wall_us = s_r84_native_wall_us;
-    out->managed_native_sync_us = s_r84_native_sync_us;
-    out->managed_native_source_pixels = s_r84_native_source_pixels;
-    out->managed_native_preserved_pixels = s_r84_native_preserved_pixels;
-    portEXIT_CRITICAL(&s_stats_mux);
-    out->queued_frames = s_ready_requests ? (uint32_t)uxQueueMessagesWaiting(s_ready_requests) : 0u;
-}
-
 } // extern "C"
-
-extern "C" uint32_t tab5_video_stack_highwater(void)
-{
-    return s_present_task ? (uint32_t)uxTaskGetStackHighWaterMark(s_present_task) : 0u;
-}

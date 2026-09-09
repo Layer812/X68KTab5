@@ -13,6 +13,7 @@
 extern "C" {
 #endif
 
+/* R140F1R2: restore ABI declarations required by the current compositor source. */
 typedef struct {
     uint32_t submitted_lines;
     uint32_t completed_lines;
@@ -114,6 +115,7 @@ typedef struct {
     uint32_t last_legacy_final_render_us;
 } tab5_compose_stats_t;
 
+
 int tab5_compose_reserve_arena(void);
 uint32_t tab5_compose_stack_highwater(void);
 int tab5_compose_init(void);
@@ -210,6 +212,7 @@ int tab5_compose_submit_gbt_scrollcache_line(uint32_t y, uint32_t width,
  * state only; CPU0 reconstructs cached 65K GRP + BG/Sprite + TEXT and final
  * priority composition. Returns nonzero when CPU0 owns the destination line. */
 /* R57E53: producer-side pressure preflight keeps visual queue saturation off CPU1 hot preparation. */
+/* R140F1R2: declaration already implemented by current tab5_compose.c. */
 void tab5_compose_gbt65k_begin_frame(int render_enabled, int budget_mode);
 /* R57E54: cheap producer/host governor input; single atomic load only. */
 uint32_t tab5_compose_gbt65k_pending(void);
@@ -256,8 +259,8 @@ void tab5_compose_wait_idle(void);
 /* Legacy R51 ABI helper. R56 Screen Manager does not call this guest-time
  * drain barrier; immutable request snapshots and tickets provide correctness. */
 uint32_t tab5_compose_wait_source_frame_idle(void);
-
 void tab5_compose_get_stats(tab5_compose_stats_t *out);
+
 
 #ifdef __cplusplus
 }

@@ -340,7 +340,6 @@ typedef char px68k_musashi_sint64_must_be_8_bytes[(sizeof(sint64) == 8) ? 1 : -1
 #define CPU_TYPE         m68ki_cpu.cpu_type
 
 #define REG_DA           m68ki_cpu.dar /* easy access to data and address regs */
-#define REG_DA_SAVE           m68ki_cpu.dar_save
 #define REG_D            m68ki_cpu.dar
 #define REG_A            (m68ki_cpu.dar+8)
 #define REG_PPC 		 m68ki_cpu.ppc
@@ -926,8 +925,6 @@ typedef struct
 {
 	uint cpu_type;     /* CPU Type: 68000, 68008, 68010, 68EC020, 68020, 68EC030, 68030, 68EC040, or 68040 */
 	uint dar[16];      /* Data and Address Registers */
-	uint dar_save[16];  /* Saved Data and Address Registers (pushed onto the
-						   stack when a bus error occurs)*/
 	uint ppc;		   /* Previous program counter */
 	uint pc;           /* Program Counter */
 	uint sp[7];        /* User, Interrupt, and Master Stack Pointers */
@@ -1137,15 +1134,164 @@ static inline __attribute__((always_inline)) void tab5_data584_native_word_store
     __builtin_memcpy(p, &w, sizeof(w));
 }
 
-/* R57E70C: slice-local PC/opcode fetch cache generation.  Any guest RAM
- * write during m68k_execute invalidates cached instruction words immediately.
- * External/device writes occur outside m68k_execute and are covered by the
- * generation bump at the next slice entry. */
-extern uint32_t g_tab5_fetch70c_epoch;
-static inline __attribute__((always_inline)) void tab5_fetch70c_note_ram_write(void)
+/* R57E123A: persistent fused PC -> {opcode,handler,cycles,post-flags} cache.
+ * The cache survives m68k_execute() scheduler slices.  CPU RAM writes invalidate
+ * only the touched direct-map word set; bulk/device writers call the public
+ * range/all invalidators below.  This preserves self-modifying-code coherency
+ * without paying the old R70C whole-cache epoch bump every ~200 guest cycles. */
+/* R57E138A: R123 persistent fused cache is retired by the X68P4 predecoded
+ * page executor.  Keep a one-entry ABI sentinel so old invalidate callers and
+ * archived research code continue to link during the cutover. */
+#define TAB5_EXEC123_BITS 0u
+#define TAB5_EXEC123_SIZE 1u
+#define TAB5_EXEC123_MASK 0u
+typedef struct {
+    uint32_t pc;
+    uint32_t epoch;
+    uint32_t sig_cycles;
+    uintptr_t handler;
+} tab5_exec123_entry_t;
+extern tab5_exec123_entry_t g_tab5_exec123_cache[TAB5_EXEC123_SIZE];
+extern uint32_t g_tab5_exec123_epoch;
+/* R57E139A6 X68P4 production-clean coherent write barrier.
+ *
+ * The decoded payload remains 64 KiB and uses 128-byte guest pages, but the
+ * 128 slots are organized as 64 sets x 2 ways.  A 4 KiB RAM-region resident
+ * count is the write-side first-level gate: ordinary data stores to regions
+ * that contain no resident X68P4 code return after one byte load, without
+ * paying page hash/tag traffic.  Exact resident-page invalidation remains the
+ * second level, so CPU stores, CPU wrapper stores and HD63450 DMA stores share
+ * one coherency directory and preserve SMC correctness. */
+#define X68P4_PRE139_PAGE_SHIFT 7u
+#define X68P4_PRE139_PAGE_BYTES (1u << X68P4_PRE139_PAGE_SHIFT)
+#define X68P4_PRE139_PAGE_MASK (X68P4_PRE139_PAGE_BYTES - 1u)
+#define X68P4_PRE139_PAGE_SLOTS 128u
+#define X68P4_PRE139_WAYS 2u
+#define X68P4_PRE139_SET_COUNT (X68P4_PRE139_PAGE_SLOTS / X68P4_PRE139_WAYS)
+#define X68P4_PRE139_SET_MASK (X68P4_PRE139_SET_COUNT - 1u)
+#define X68P4_PRE139_INVALID_TAG 0xffffffffu
+#define X68P4_PRE139_REGION_SHIFT 12u
+#define X68P4_PRE139_REGION_BYTES (1u << X68P4_PRE139_REGION_SHIFT)
+#define X68P4_PRE139_RAM_BYTES 0x00c00000u
+#define X68P4_PRE139_REGION_COUNT (X68P4_PRE139_RAM_BYTES >> X68P4_PRE139_REGION_SHIFT)
+extern uint32_t g_x68p4_pre139_page_tag[X68P4_PRE139_PAGE_SLOTS];
+extern uint32_t g_x68p4_pre139_page_version[X68P4_PRE139_PAGE_SLOTS];
+extern uint8_t g_x68p4_pre139_region_count[X68P4_PRE139_REGION_COUNT];
+extern uint32_t g_x68p4_pre139_enabled;
+/* R140P1: one scalar execution-cache coherency epoch.  The exact per-slot
+ * tag/version directory remains authoritative for M2/S2 certification, while
+ * the ordinary same-page resolver avoids an indexed version load every op. */
+extern uint32_t g_x68p4_pre139_epoch;
+
+static inline __attribute__((always_inline)) void
+m68k_tab5_x68p4_bump_epoch(void)
 {
-    ++g_tab5_fetch70c_epoch;
+    uint32_t e = g_x68p4_pre139_epoch + 1u;
+    g_x68p4_pre139_epoch = e ? e : 1u;
 }
+
+static inline __attribute__((always_inline)) unsigned
+m68k_tab5_x68p4_set_for_page(uint32_t page)
+{
+    uint32_t pn = page >> X68P4_PRE139_PAGE_SHIFT;
+    pn ^= pn >> 7;
+    pn ^= pn >> 14;
+    return (unsigned)(pn & X68P4_PRE139_SET_MASK);
+}
+
+static inline __attribute__((always_inline)) void
+m68k_tab5_x68p4_note_code_page(uint32_t address)
+{
+    const uint32_t a = address & 0x00ffffffu;
+    if (__builtin_expect(!g_x68p4_pre139_enabled || a >= X68P4_PRE139_RAM_BYTES, 0))
+        return;
+
+    const unsigned region = (unsigned)(a >> X68P4_PRE139_REGION_SHIFT);
+    if (__builtin_expect(g_x68p4_pre139_region_count[region] == 0u, 1))
+        return;
+
+    const uint32_t page = a & ~X68P4_PRE139_PAGE_MASK;
+    const unsigned first = m68k_tab5_x68p4_set_for_page(page) << 1;
+    for (unsigned way = 0; way < X68P4_PRE139_WAYS; ++way) {
+        const unsigned slot = first + way;
+        if (__builtin_expect(g_x68p4_pre139_page_tag[slot] == page, 0)) {
+            g_x68p4_pre139_page_tag[slot] = X68P4_PRE139_INVALID_TAG;
+            uint32_t v = g_x68p4_pre139_page_version[slot] + 1u;
+            g_x68p4_pre139_page_version[slot] = v ? v : 1u;
+            m68k_tab5_x68p4_bump_epoch();
+            uint8_t rc = g_x68p4_pre139_region_count[region];
+            if (rc) {
+                --rc;
+                g_x68p4_pre139_region_count[region] = rc;
+            }
+            break;
+        }
+    }
+}
+static inline __attribute__((always_inline)) void
+m68k_tab5_x68p4_note_code_write(uint32_t address, uint32_t bytes)
+{
+    if (!bytes) return;
+    const uint32_t a0 = address & 0x00ffffffu;
+    m68k_tab5_x68p4_note_code_page(a0);
+    const uint32_t a1 = (a0 + bytes - 1u) & 0x00ffffffu;
+    if (__builtin_expect((a0 ^ a1) & ~X68P4_PRE139_PAGE_MASK, 0))
+        m68k_tab5_x68p4_note_code_page(a1);
+}
+
+/* R139A6 production Machine Kernel: no stats object crosses the hot path. */
+int m68k_tab5_x68p4_machine_run_scanline(
+    uint32_t line, uint32_t total_lines, int cpu_cycles,
+    unsigned int midi_delay, int *periph_cycles_out);
+void m68k_tab5_x68p4_machine_finish_scanline(int periph_cycles,
+                                               int key_int_period,
+                                               int mouse_int_period);
+void m68k_tab5_x68p4_machine_frame_end(void);
+void m68k_tab5_x68p4_machine_stats(uint64_t *lines, uint64_t *slices,
+                                    uint64_t *periph_cycles);
+/* R57E134A trace-code epoch covers only the measured hot code page/range. */
+#define TAB5_TRACE134_PC_LO 0x00199300u
+#define TAB5_TRACE134_PC_HI 0x001993bcu
+#ifdef ESP_PLATFORM
+extern uint32_t g_tab5_trace134_code_epoch;
+void m68k_tab5_trace134_invalidate_all(void);
+void m68k_tab5_trace134_invalidate_range(uint32_t address, uint32_t bytes);
+#endif
+void m68k_tab5_exec123_invalidate_all(void);
+void m68k_tab5_exec123_invalidate_range(uint32_t address, uint32_t bytes);
+static inline __attribute__((always_inline)) unsigned tab5_exec123_index(uint32_t pc)
+{
+    return (unsigned)((pc >> 1) & TAB5_EXEC123_MASK);
+}
+static inline __attribute__((always_inline)) void m68k_tab5_exec123_note_ram_write8(uint32_t address)
+{
+    /* R139A5: R123 is ABI-only; do not touch its sentinel on the store hot path. */
+    m68k_tab5_x68p4_note_code_write(address, 1u);
+}
+static inline __attribute__((always_inline)) void m68k_tab5_exec123_note_ram_write16(uint32_t address)
+{
+    m68k_tab5_x68p4_note_code_write(address, 2u);
+}
+static inline __attribute__((always_inline)) void m68k_tab5_exec123_note_ram_write32(uint32_t address)
+{
+    m68k_tab5_x68p4_note_code_write(address, 4u);
+}
+
+/* R140P1 production flatten: these are the authoritative PX68K byte-bus
+ * wrappers, called directly from Musashi for non-RAM/IPL operands.  This
+ * removes the redundant m68000.c wrapper frame while preserving the exact
+ * byte-wise device semantics in mem_wrap.c. */
+uint32_t cpu_readmem24(uint32_t addr);
+uint32_t cpu_readmem24_word(uint32_t addr);
+uint32_t cpu_readmem24_dword(uint32_t addr);
+void cpu_writemem24(uint32_t addr, uint32_t val);
+void cpu_writemem24_word(uint32_t addr, uint32_t val);
+void cpu_writemem24_dword(uint32_t addr, uint32_t val);
+
+
+#ifdef ESP_PLATFORM
+/* P12R1 production: CPU1 flight-recorder ABI is not linked into hot MMIO. */
+#endif
 
 static inline __attribute__((always_inline)) uint tab5_data584_read8_bus(uint32 bus)
 {
@@ -1153,7 +1299,7 @@ static inline __attribute__((always_inline)) uint tab5_data584_read8_bus(uint32 
         return (uint)MEM[bus ^ 1u];
     if (__builtin_expect(bus >= 0x00fc0000u, 0))
         return (uint)IPL[(bus & 0x0003ffffu) ^ 1u];
-    return (uint)m68k_read_memory_8(bus);
+    return (uint)cpu_readmem24(bus);
 }
 
 static inline __attribute__((always_inline)) uint tab5_data584_read16_bus(uint32 bus)
@@ -1166,7 +1312,7 @@ static inline __attribute__((always_inline)) uint tab5_data584_read16_bus(uint32
         BusErrFlag = 0;
         return (uint)tab5_data584_native_word_load(IPL + (bus & 0x0003ffffu));
     }
-    return (uint)m68k_read_memory_16(bus);
+    return (uint)cpu_readmem24_word(bus);
 }
 
 static inline __attribute__((always_inline)) uint tab5_data584_read32_bus(uint32 bus)
@@ -1184,7 +1330,7 @@ static inline __attribute__((always_inline)) uint tab5_data584_read32_bus(uint32
         BusErrFlag = 0;
         return (uint)((hi << 16) | lo);
     }
-    return (uint)m68k_read_memory_32(bus);
+    return (uint)cpu_readmem24_dword(bus);
 }
 
 static inline __attribute__((always_inline)) void tab5_data584_write8_bus(uint32 bus, uint value)
@@ -1192,10 +1338,10 @@ static inline __attribute__((always_inline)) void tab5_data584_write8_bus(uint32
     if (__builtin_expect(bus < 0x00c00000u, 1)) {
         BusErrFlag = 0;
         MEM[bus ^ 1u] = (uint8)value;
-        tab5_fetch70c_note_ram_write();
+        m68k_tab5_exec123_note_ram_write8(bus);
         return;
     }
-    m68k_write_memory_8(bus, value);
+    cpu_writemem24(bus, value);
 }
 
 static inline __attribute__((always_inline)) void tab5_data584_write16_bus(uint32 bus, uint value)
@@ -1203,10 +1349,10 @@ static inline __attribute__((always_inline)) void tab5_data584_write16_bus(uint3
     if (__builtin_expect(!(bus & 1u) && bus <= 0x00bffffeu, 1)) {
         BusErrFlag = 0;
         tab5_data584_native_word_store(MEM + bus, (uint32)value);
-        tab5_fetch70c_note_ram_write();
+        m68k_tab5_exec123_note_ram_write16(bus);
         return;
     }
-    m68k_write_memory_16(bus, value);
+    cpu_writemem24_word(bus, value);
 }
 
 static inline __attribute__((always_inline)) void tab5_data584_write32_bus(uint32 bus, uint value)
@@ -1216,10 +1362,10 @@ static inline __attribute__((always_inline)) void tab5_data584_write32_bus(uint3
         BusErrFlag = 0;
         tab5_data584_native_word_store(MEM + bus, v >> 16);
         tab5_data584_native_word_store(MEM + bus + 2u, v);
-        tab5_fetch70c_note_ram_write();
+        m68k_tab5_exec123_note_ram_write32(bus);
         return;
     }
-    m68k_write_memory_32(bus, value);
+    cpu_writemem24_dword(bus, value);
 }
 #endif
 
@@ -2037,45 +2183,7 @@ static inline void m68ki_exception_privilege_violation(void)
 	USE_CYCLES(CYC_EXCEPTION[EXCEPTION_PRIVILEGE_VIOLATION] - CYC_INSTRUCTION[REG_IR]);
 }
 
-extern jmp_buf m68ki_bus_error_jmp_buf;
-
-#define m68ki_check_bus_error_trap() setjmp(m68ki_bus_error_jmp_buf)
-
-/* Exception for bus error */
-static inline void m68ki_exception_bus_error(void)
-{
-	int i;
-
-	/* If we were processing a bus error, address error, or reset,
-	 * while writing the stack frame, this is a catastrophic failure.
-	 * Halt the CPU
-	 */
-	if(CPU_RUN_MODE == RUN_MODE_BERR_AERR_RESET_WSF)
-	{
-		m68k_read_memory_8(0x00ffff01);
-		CPU_STOPPED = STOP_LEVEL_HALT;
-		return;
-	}
-	CPU_RUN_MODE = RUN_MODE_BERR_AERR_RESET_WSF;
-
-	/* Use up some clock cycles and undo the instruction's cycles */
-	USE_CYCLES(CYC_EXCEPTION[EXCEPTION_BUS_ERROR] - CYC_INSTRUCTION[REG_IR]);
-
-	for (i = 15; i >= 0; i--){
-		REG_DA[i] = REG_DA_SAVE[i];
-	}
-
-	uint sr = m68ki_init_exception();
-
-	/* Note: This is implemented for 68010 only! */
-	m68ki_stack_frame_1000(REG_PPC, sr, EXCEPTION_BUS_ERROR);
-
-	m68ki_jump_vector(EXCEPTION_BUS_ERROR);
-
-	CPU_RUN_MODE = RUN_MODE_BERR_AERR_RESET;
-
-	longjmp(m68ki_bus_error_jmp_buf, 1);
-}
+/* R140N2R6 SAFELEAN: unreachable host bus-error rollback/longjmp path removed. */
 
 extern int cpu_log_enabled;
 

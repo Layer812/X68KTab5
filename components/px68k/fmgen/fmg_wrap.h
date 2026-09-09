@@ -51,6 +51,7 @@ int OPM_StateAction(StateMem *sm, int load, int data_only);
 int OPM_AsyncReserveRing(void);
 int OPM_AsyncRingPlacement(void);
 int OPM_AsyncEnabled(void);
+void OPM_AsyncSetSourceRate(uint32_t rate);
 int OPM_AsyncRender(uint32_t frames, int profile);
 uint32_t OPM_AsyncFramesAvail(void);
 int OPM_AsyncMixRead(int16_t *dst, int frames);

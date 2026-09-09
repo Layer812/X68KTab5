@@ -37,12 +37,6 @@ int    tab5_guest_input_busy(void);
 size_t tab5_guest_input_pending(void);
 uint32_t tab5_guest_input_sent_chars(void);
 
-/* Real-time physical-input diagnostics. */
-size_t   tab5_guest_input_realtime_pending(void);
-uint32_t tab5_guest_input_realtime_events(void);
-uint32_t tab5_guest_input_realtime_dropped(void);
-uint32_t tab5_guest_input_mouse_events(void);
-uint32_t tab5_guest_input_joypad_events(void);
 uint16_t tab5_guest_input_joypad_state(void);
 
 #ifdef __cplusplus

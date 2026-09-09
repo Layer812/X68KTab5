@@ -68,7 +68,7 @@ static void LoadDefaults(void)
 	Config.JoyOrMouse = 1;
 
 	Config.NoWaitMode = 0;
-	Config.AdjustFrameRates = 1;
+	Config.AdjustFrameRates = 0;
 	Config.AudioDesyncHack = 0;
 
 	for (i = 0; i < 2; i++)

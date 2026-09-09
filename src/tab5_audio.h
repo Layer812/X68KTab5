@@ -1,6 +1,6 @@
 /*
  * Tab5 port-specific implementation.
- * Intent: Public interface for the Tab5 CPU0 audio worker and its pitch-safe output policy.
+ * Intent: Public interface for the Tab5 CPU0 44.1-kHz product audio worker.
  * Layer8 Aug/17/2026
  */
 #ifndef TAB5_AUDIO_H
@@ -34,24 +34,27 @@ typedef struct
     uint32_t speaker_queued_frames;
     /* Build 5.66: cumulative real one-tick waits while both M5 speaker slots are full. */
     uint32_t speaker_full_waits;
-    /* Build 5.98g9b: pitch-safe 44.1/22.05-kHz quality-mode diagnostics. */
+    /* Legacy ABI fields retained as zero for source compatibility. */
     uint32_t producer_rate_hz;
     uint32_t speaker_rate_hz;
-    uint32_t rate_servo_active; /* 1 = pitch-safe 22.05-kHz quality mode */
+    uint32_t rate_servo_active; /* P12R1 always 0 */
     uint32_t rate_changes;
     uint32_t cpu0_mix_work_us;      /* Build 6.15g cumulative host final-mix/pull work */
     uint32_t cpu0_speaker_work_us;  /* Build 6.15g cumulative speaker staging work */
 } tab5_audio_stats_t;
 
 int tab5_audio_init(void);
-void tab5_audio_kick(void);
+/* P12R6A4 three-stage host A/V profile.
+ * 0=NORMAL 44.1k, 1=GREEN TURBO true22.05k, 2=RED TURBO true11.025k.
+ * Guest CPU/device timing is unchanged in every profile. */
+void tab5_audio_set_turbo_profile(uint32_t profile);
+/* Legacy two-state ABI retained for any older caller. */
 void tab5_audio_set_high_load_22k(int enable);
 void tab5_audio_flush(void);
 void tab5_audio_get_stats(tab5_audio_stats_t *out);
 /* Runtime master-volume stepper. direction >0 = louder, <0 = quieter. */
 int tab5_audio_step_volume(int direction);
 int tab5_audio_get_volume(void);
-uint32_t tab5_audio_stack_highwater(void);
 
 #ifdef __cplusplus
 }

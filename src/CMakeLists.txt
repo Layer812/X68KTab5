@@ -1,7 +1,6 @@
 idf_component_register(
     SRCS
         "main.c"
-        "tab5_cpu_clock.c"
         "tab5_dynarec_arena.c"
         "tab5_video.cpp"
         "tab5_ppa.c"
@@ -64,19 +63,11 @@ idf_component_register(
 target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-error=stringop-truncation -Wno-error=format-truncation -Wno-error=maybe-uninitialized -Wno-error=multistatement-macros -Wno-error=shift-count-overflow -Wno-error=overflow -Wno-error=deprecated-declarations -Wno-error=discarded-qualifiers -Wno-error=incompatible-pointer-types -Wno-error=int-conversion)
 
 
-# R57E69 Native Profile Bridge
-# The profile values are supplied by scripts/native_build_from_platformio.py.
-# sdkconfig intentionally remains at the validated ESP32-P4 360 MHz boot setup;
-# Turbo400 performs the HP-core switch at app_main via tab5_cpu_clock.c.
-set(PX68K_TAB5_P4_TURBO400 "0" CACHE STRING "R57E69 experimental P4 400 MHz runtime profile")
-set(PX68K_TAB5_HOST_CPU_MHZ "360" CACHE STRING "R57E69 measured host CPU profile")
-target_compile_definitions(${COMPONENT_LIB} PRIVATE
-    PX68K_TAB5_P4_TURBO400=${PX68K_TAB5_P4_TURBO400}
-    PX68K_TAB5_HOST_CPU_MHZ=${PX68K_TAB5_HOST_CPU_MHZ}
-)
+# P12R1 product: ESP32-P4 host CPU remains at the validated ESP-IDF 360 MHz profile.
+# The retired 400 MHz runtime experiment has no build option or code path.
 
 
-# BAT146 LPFAB R4: R3 DIRTY retained + independent 1/1024 EXACT hash certification; R57 production unchanged
+# R139A6A3: LP TouchJoy latest/control transport only; mirrored-R57 observer retired
 set(ulp_app_name ulp_px68k_lpbr)
 set(ulp_sources "ulp/lp_broker.c")
 set(ulp_exp_dep_srcs "tab5_lp_broker.c")

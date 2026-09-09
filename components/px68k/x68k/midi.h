@@ -13,6 +13,10 @@ void FASTCALL MIDI_Timer(uint32_t clk);
 int MIDI_SetMimpiMap(char *filename);
 int MIDI_EnableMimpiDef(int enable);
 void MIDI_DelayOut(unsigned int delay);
+#ifdef ESP_PLATFORM
+extern uint8_t MIDI_R127DelayPending;
+extern uint8_t MIDI_R127TimerActive;
+#endif
 int MIDI_StateAction(StateMem *sm, int load, int data_only);
 
 #endif /* _WINX68K_MIDI_H */

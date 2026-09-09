@@ -10,67 +10,6 @@
 
 #define TAB5_VIDEO_MEDIA_PATH_MAX 512
 
-typedef struct
-{
-    uint32_t submitted_frames;
-    uint32_t presented_frames;
-    uint32_t dropped_frames;
-    uint32_t last_copy_us;
-    uint32_t last_push_us;
-    uint32_t queued_frames;
-    uint32_t live_presented_frames;
-    uint32_t live_row_retries;
-    uint32_t live_unstable_rows;
-    /* Build 6.14d: host-side display cadence / latest-frame pacing stats. */
-    uint32_t pace_waits;
-    uint32_t pace_wait_us;
-    uint32_t pace_last_wait_us;
-    uint32_t pace_coalesced_frames;
-    uint32_t pace_skipped_slots;
-    uint32_t pace_last_interval_us;
-    uint32_t cpu0_push_total_us; /* Build 6.15g cumulative LCD push work */
-    uint32_t managed_rows_scanned;
-    uint32_t managed_rows_skipped;
-    uint32_t managed_map_frames;
-    uint32_t managed_slot_sparse_frames;
-    uint32_t managed_slot_full_frames;
-    uint32_t managed_slot_rows_copied;
-    uint32_t managed_slot_rows_skipped;
-    uint32_t managed_slot_forcefull_rejects;
-    uint64_t managed_slot_bytes_copied;
-
-    /* R57E83: cumulative managed presenter phase attribution. */
-    uint64_t managed_slot_copy_us;
-    uint64_t managed_display_lock_us;
-    uint64_t managed_push_frame_us;
-    uint64_t managed_ppa_us;
-    uint64_t managed_refresh_wait_us;
-
-    /* R57E84: managed direct-native steady-state path. */
-    uint32_t managed_native_frames;
-    uint32_t managed_native_fallbacks;
-    uint32_t managed_native_tile_runs;
-    uint32_t managed_native_tiles;
-    uint64_t managed_native_wall_us;
-    uint64_t managed_native_sync_us;
-    uint64_t managed_native_source_pixels;
-    uint64_t managed_native_preserved_pixels;
-} tab5_video_async_stats_t;
-
-typedef struct
-{
-    uint32_t irq_count;
-    uint32_t update_count;
-    uint32_t irq_samples;
-    uint32_t active_samples;
-    uint32_t safety_samples;
-    uint32_t update_total_us;
-    uint32_t update_max_us;
-    uint32_t contact_active;
-    uint32_t irq_enabled;
-    uint32_t fallback_poll;
-} tab5_video_touch_irq_stats_t;
-
 typedef enum
 {
     TAB5_VIDEO_ACTION_NONE = 0,
@@ -195,9 +134,6 @@ void tab5_video_fb_range_write_end(uint32_t y, uint32_t count);
 
 int tab5_video_width(void);
 int tab5_video_height(void);
-void tab5_video_get_async_stats(tab5_video_async_stats_t *out);
-void tab5_video_get_touch_irq_stats(tab5_video_touch_irq_stats_t *out);
-uint32_t tab5_video_stack_highwater(void);
 
 #ifdef __cplusplus
 }

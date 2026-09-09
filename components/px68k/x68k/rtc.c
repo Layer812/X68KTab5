@@ -143,6 +143,32 @@ void FASTCALL RTC_Write(uint32_t adr, uint8_t data)
 		RTC_Regs[0][15] = RTC_Regs[1][15] = data & 0x0c;
 }
 
+/* R140J2: RTC only constrains CPU execution when its output can reach the
+ * currently-unmasked MFP IRQ15 path.  Otherwise RTC accumulators are advanced
+ * in bulk at another deadline/scanline edge. */
+int RTC_R140J2NextIRQDeadline(int max_clock)
+{
+   int best = max_clock;
+   const uint8_t flag = 0x01u; /* MFP IRQ15 -> IERB/IMRB/ISRB bit0 */
+   if (best <= 1)
+      return best;
+   if (!(MFP[MFP_IERB] & flag) || !(MFP[MFP_IMRB] & flag) ||
+       (MFP[MFP_ISRB] & flag))
+      return best;
+
+   if (!(RTC_Regs[0][15] & 8u)) {
+      int due = 10000000 - RTC_Timer1;
+      if (due < 1) due = 1;
+      if (due < best) best = due;
+   }
+   if (!(RTC_Regs[0][15] & 4u)) {
+      int due = 625000 - RTC_Timer16;
+      if (due < 1) due = 1;
+      if (due < best) best = due;
+   }
+   return best;
+}
+
 /* Build 5.91 slow path: RTC_Timer() in rtc.h has already added the
  * current slice clocks.  This function is called only on a threshold-crossing
  * slice, preserving the exact old interrupt granularity and one-subtraction

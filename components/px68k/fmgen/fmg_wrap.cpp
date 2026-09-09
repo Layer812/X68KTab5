@@ -20,9 +20,6 @@ extern "C" {
 };
 
 #ifdef ESP_PLATFORM
-#ifndef PX68K_TAB5_RELEASE_DIAGNOSTICS
-#define PX68K_TAB5_RELEASE_DIAGNOSTICS 0
-#endif
 #ifndef PX68K_TAB5_R57E63_AUDIO_AUDIT
 #define PX68K_TAB5_R57E63_AUDIO_AUDIT 0
 #endif
@@ -36,9 +33,11 @@ extern "C" {
 #include "vgmm5_ym2151.h"
 #include <string.h>
 
-/* Build 5.23b: avoid a direct esp_timer component-header dependency here.
- * dswin.c already uses the same IDF symbol this way; the app links esp_timer. */
-extern "C" int64_t esp_timer_get_time(void);
+extern "C" int DSound_AbsTimelineActive(void);
+extern "C" int DSound_AbsTimelineOPMWrite(uint8_t reg,uint8_t data);
+extern "C" int DSound_AbsTimelineOPMCSM(void);
+extern "C" int DSound_AbsTimelineOPMReset(void);
+extern "C" int DSound_AbsTimelineOPMVolume(uint8_t vol);
 
 /* Intent: Keep YM2151 waveform synthesis off CPU1; only guest-visible timer/status/IRQ state stays on the guest core.  Layer8 Aug/17/2026 */
 /* Sparse CPU0 waveform-worker CSM notification; defined after the async backend. */
@@ -388,6 +387,12 @@ static DRAM_ATTR TaskHandle_t s_audio_task = NULL;
 static DRAM_ATTR uint8_t s_audio_task_internal_caps = 0;
 static DRAM_ATTR __attribute__((aligned(64))) int16_t
     s_audio_ring_storage[ASYNC_OPM_RING_FRAMES * 2];
+/* R140P4: keep the FM ring lock only around a bounded Internal-SRAM copy.
+ * Saturating FM+ADPCM arithmetic runs outside the spin-critical section so
+ * CPU0 interrupts and the equal-priority YM producer are not held off for
+ * hundreds/thousands of sample operations. */
+static DRAM_ATTR __attribute__((aligned(64))) int16_t
+    s_audio_mix_read_scratch[ASYNC_OPM_SCRATCH_FRAMES * 2];
 static DRAM_ATTR int16_t *s_audio_ring = NULL;
 static DRAM_ATTR int s_audio_ring_placement = 0; /* R23: INTERNAL only; PSRAM fallback is forbidden. */
 static DRAM_ATTR size_t s_audio_rd = 0;
@@ -395,6 +400,15 @@ static DRAM_ATTR size_t s_audio_wr = 0;
 static DRAM_ATTR size_t s_audio_count = 0;
 static DRAM_ATTR portMUX_TYPE s_audio_mux = portMUX_INITIALIZER_UNLOCKED;
 static DRAM_ATTR volatile int s_audio_async_enabled = 0;
+/* R140P1: C-side production audio paths read this ready latch directly,
+ * avoiding repeated cross-TU OPM_AsyncEnabled() calls.  It mirrors the
+ * existing async state and changes only at backend init/cleanup. */
+extern "C" {
+DRAM_ATTR volatile int g_x68p4_opm_async_ready = 0;
+}
+static DRAM_ATTR volatile uint32_t s_r120a_audio_rate_req = 44100u;
+static DRAM_ATTR uint32_t s_r120a_audio_rate_applied = 44100u;
+
 #if defined(SPM_DRAM_ATTR)
 static SPM_DRAM_ATTR uint8_t s_audio_selected_reg = 0;
 #elif defined(TCM_DRAM_ATTR)
@@ -404,6 +418,8 @@ static DRAM_ATTR uint8_t s_audio_selected_reg = 0;
 #endif
 static DRAM_ATTR volatile uint32_t s_audio_event_drops = 0;
 static DRAM_ATTR volatile uint32_t s_audio_ring_overruns = 0;
+/* Production clean: steady FM demand/work/timing counters retired.
+ * Functional queue/ring state and exceptional drop counters remain. */
 #if PX68K_TAB5_R57E63_AUDIO_AUDIT
 /* R57E64 focused release audit: count saturation in the actual CPU0 final
  * FM+ADPCM sum.  32-bit counters are deliberate so CPU1 can sample them with
@@ -412,22 +428,12 @@ static DRAM_ATTR volatile uint32_t s_r57e64_mix_samples = 0;
 static DRAM_ATTR volatile uint32_t s_r57e64_mix_clips = 0;
 static DRAM_ATTR volatile uint32_t s_r57e64_mix_max_raw_abs = 0;
 #endif
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-static DRAM_ATTR volatile uint32_t s_audio_profile_us = 0;
-static DRAM_ATTR volatile uint32_t s_audio_profile_calls = 0;
-static DRAM_ATTR volatile uint32_t s_audio_profile_frames = 0;
-static DRAM_ATTR volatile uint32_t s_audio_work_us = 0;
-static DRAM_ATTR volatile uint32_t s_audio_work_calls = 0;
-static DRAM_ATTR volatile uint32_t s_audio_work_frames = 0;
-#endif
 
 /* R56k7/BAT177NW0: event taxonomy + chronology-preserving pressure telemetry.
  * CPU1 never blocks on CPU0. The ordered SPSC ring is sized so saturation is
  * not expected in production; any overflow is an explicit NO-WAIT fault. */
-static DRAM_ATTR volatile uint32_t s_r56_write_attempt = 0;
 static DRAM_ATTR volatile uint32_t s_r56_write_drop = 0;
 static DRAM_ATTR volatile uint32_t s_r56_write_drop_frames = 0;
-static DRAM_ATTR volatile uint32_t s_r56_render_attempt = 0;
 static DRAM_ATTR volatile uint32_t s_r56_render_drop = 0;
 static DRAM_ATTR volatile uint32_t s_r56_render_drop_frames = 0;
 static DRAM_ATTR volatile uint32_t s_r56_reset_drop = 0;
@@ -486,9 +492,6 @@ static IRAM_ATTR void async_vgm_render(size_t wr, uint32_t frames)
 static void r56l_render_discard(uint32_t frames, uint8_t profile)
 {
     if (!frames) return;
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-    const int64_t t0 = esp_timer_get_time();
-#endif
     uint32_t remain = frames;
     while (remain)
     {
@@ -507,20 +510,7 @@ static void r56l_render_discard(uint32_t frames, uint8_t profile)
         }
         remain -= n;
     }
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-    const uint32_t work_us = (uint32_t)(esp_timer_get_time() - t0);
-    s_audio_work_us += work_us;
-    ++s_audio_work_calls;
-    s_audio_work_frames += frames;
-    if (profile)
-    {
-        s_audio_profile_us += work_us;
-        ++s_audio_profile_calls;
-        s_audio_profile_frames += frames;
-    }
-#else
     (void)profile;
-#endif
     ++s_r56l_discard_events;
     s_r56l_discard_frames += frames;
 }
@@ -545,34 +535,22 @@ static int async_render_publish(uint32_t frames, uint8_t profile)
 
     if (!s_audio_vgm)
         async_ring_zero(wr, frames);
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-    const int64_t t0 = esp_timer_get_time();
-#endif
     if (s_audio_vgm)
         async_vgm_render(wr, frames);
     else if (s_audio_opm)
         s_audio_opm->Mix(&s_audio_ring[wr * 2], (int)frames,
                          (uint8_t *)s_audio_ring,
                          (uint8_t *)(s_audio_ring + ASYNC_OPM_RING_FRAMES * 2));
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-    const uint32_t work_us = (uint32_t)(esp_timer_get_time() - t0);
-    s_audio_work_us += work_us;
-    ++s_audio_work_calls;
-    s_audio_work_frames += frames;
-    if (profile)
-    {
-        s_audio_profile_us += work_us;
-        ++s_audio_profile_calls;
-        s_audio_profile_frames += frames;
-    }
-#else
     (void)profile;
-#endif
 
     portENTER_CRITICAL(&s_audio_mux);
     s_audio_wr = (s_audio_wr + frames) & ASYNC_OPM_RING_MASK;
     s_audio_count += frames;
     portEXIT_CRITICAL(&s_audio_mux);
+
+    /* A completed FM chunk can satisfy the common FM/ADPCM timeline even if
+     * the feeder previously went to sleep after seeing min(FM,ADPCM)==0. */
+    DSound_HostSourceReady();
     return 1;
 }
 
@@ -582,6 +560,7 @@ static inline uint32_t async_event_depth(void)
     const uint32_t t = __atomic_load_n(&s_audio_event_tail, __ATOMIC_ACQUIRE);
     return h - t;
 }
+
 
 static int async_event_push(const AsyncOPMEvent *ev)
 {
@@ -616,6 +595,12 @@ static void async_opm_task(void *)
             (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
         if (ev.type == ASYNC_OPM_STOP)
             break;
+        const uint32_t r120a_rate=__atomic_load_n(&s_r120a_audio_rate_req,__ATOMIC_ACQUIRE);
+        if(s_audio_vgm && r120a_rate!=s_r120a_audio_rate_applied){
+            vgmm5_ym2151_set_sample_rate(s_audio_vgm,r120a_rate);
+            s_r120a_audio_rate_applied=r120a_rate;
+        }
+
         if (!s_audio_vgm && !s_audio_opm)
             continue;
 
@@ -700,17 +685,14 @@ static int async_opm_send(uint8_t type, uint8_t reg, uint8_t data,
     ev.frames = frames;
     ev.profile = profile;
 
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-    if (type == ASYNC_OPM_WRITE) ++s_r56_write_attempt;
-    else if (type == ASYNC_OPM_RENDER) ++s_r56_render_attempt;
-#endif
-
     /* BAT177NW0 CPU1 NO-WAIT: ordered SPSC transport, zero timeout, zero
      * producer retry. The 1024-entry Internal ring doubles the former queue
      * capacity. Saturation is an explicit correctness fault to be surfaced in
      * telemetry; CPU1 guest time is never delayed by CPU0 synthesis. */
     if (async_event_push(&ev))
+    {
         return 1;
+    }
 
     ++s_audio_event_drops;
     ++s_r56l_bp_events;
@@ -728,8 +710,9 @@ static int async_opm_send(uint8_t type, uint8_t reg, uint8_t data,
 
 static void audio_csm_notify(void)
 {
-    if (s_audio_async_enabled)
-        (void)async_opm_send(ASYNC_OPM_CSM, 0, 0, 0, 0);
+    if (!s_audio_async_enabled) return;
+    if (DSound_AbsTimelineActive()) (void)DSound_AbsTimelineOPMCSM();
+    else (void)async_opm_send(ASYNC_OPM_CSM, 0, 0, 0, 0);
 }
 
 int OPM_AsyncReserveRing(void)
@@ -770,6 +753,13 @@ int OPM_AsyncRingPlacement(void)
     return s_audio_ring_placement;
 }
 
+void OPM_AsyncSetSourceRate(uint32_t rate)
+{
+    const uint32_t r=(rate <= 11025u) ? 11025u : ((rate <= 22050u) ? 22050u : 44100u);
+    __atomic_store_n(&s_r120a_audio_rate_req,r,__ATOMIC_RELEASE);
+    if(s_audio_task)xTaskNotifyGive(s_audio_task);
+}
+
 static int async_opm_init(int clock)
 {
     if (s_audio_async_enabled)
@@ -800,11 +790,11 @@ static int async_opm_init(int clock)
 
 #if portNUM_PROCESSORS > 1
     BaseType_t ok = xTaskCreatePinnedToCoreWithCaps(
-        async_opm_task, "px68k_ym2151", 6144, NULL, 3, &s_audio_task, 0,
+        async_opm_task, "px68k_ym2151", 6144, NULL, 4, &s_audio_task, 0,
         MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 #else
     BaseType_t ok = xTaskCreateWithCaps(
-        async_opm_task, "px68k_ym2151", 6144, NULL, 3, &s_audio_task,
+        async_opm_task, "px68k_ym2151", 6144, NULL, 4, &s_audio_task,
         MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 #endif
     if (ok != pdPASS)
@@ -819,15 +809,18 @@ static int async_opm_init(int clock)
     s_audio_selected_reg = 0;
     s_audio_event_drops = 0;
     s_audio_ring_overruns = 0;
-    s_r56_write_attempt = s_r56_write_drop = s_r56_write_drop_frames = 0;
-    s_r56_render_attempt = s_r56_render_drop = s_r56_render_drop_frames = 0;
+    s_r56_write_drop = s_r56_write_drop_frames = 0;
+    s_r56_render_drop = s_r56_render_drop_frames = 0;
     s_r56_reset_drop = s_r56_volume_drop = s_r56_csm_drop = 0;
     s_r56_stop_drop = s_r56_other_drop = 0;
     s_r56l_bp_events = s_r56l_bp_wait_calls = s_r56l_bp_timeouts = 0;
     s_r56l_bp_max_timeouts = 0;
     s_r56l_discard_events = s_r56l_discard_frames = 0;
+    __atomic_store_n(&s_r120a_audio_rate_req,44100u,__ATOMIC_RELEASE);
+    s_r120a_audio_rate_applied=44100u;
     s_audio_async_enabled = 1;
-    printf("PX68K_FMHOST0: Build 6.15h17R23 YM2151-only core=0; ALL realtime FM memory INTERNAL/SPM, PSRAM forbidden; ring=%u queue=%u quantum=256 prio=3\n",
+    g_x68p4_opm_async_ready = 1;
+    printf("PX68K_FMHOST0: Build 6.15h17R23 YM2151-only core=0; ALL realtime FM memory INTERNAL/SPM, PSRAM forbidden; ring=%u queue=%u quantum=256 prio=4\n",
            (unsigned)ASYNC_OPM_RING_FRAMES, (unsigned)ASYNC_OPM_QUEUE_LEN);
     return 1;
 }
@@ -878,6 +871,8 @@ int OPM_Init(int clock)
 void OPM_Cleanup(void)
 {
 #ifdef ESP_PLATFORM
+    g_x68p4_opm_async_ready = 0;
+    s_audio_async_enabled = 0;
     s_fast_opm_ready = 0;
     /* R23 ESP path never constructs legacy MyOPM. */
     opm = NULL;
@@ -894,7 +889,10 @@ void OPM_Reset(void)
     s_fast_opm_ready = 1;
     if (opm) opm->Reset();
     if (s_audio_async_enabled)
-        async_opm_send(ASYNC_OPM_RESET, 0, 0, 0, 0);
+    {
+        if (DSound_AbsTimelineActive()) (void)DSound_AbsTimelineOPMReset();
+        else (void)async_opm_send(ASYNC_OPM_RESET, 0, 0, 0, 0);
+    }
 #else
     if (opm) opm->Reset();
 #endif
@@ -979,8 +977,11 @@ void FASTCALL OPM_WriteTimed(uint32_t adr, uint8_t data, uint32_t frames)
             ++s_debug_opm_data_writes;
             if (s_audio_selected_reg == 0x08 && (data & 0x78u))
                 ++s_debug_opm_keyons;
-            (void)async_opm_send(ASYNC_OPM_WRITE, s_audio_selected_reg, data,
-                                 frames, 0);
+            if (DSound_AbsTimelineActive())
+                (void)DSound_AbsTimelineOPMWrite(s_audio_selected_reg,data);
+            else
+                (void)async_opm_send(ASYNC_OPM_WRITE, s_audio_selected_reg, data,
+                                     frames, 0);
         }
     }
     else if (opm)
@@ -1028,7 +1029,10 @@ void OPM_SetVolume(uint8_t vol)
 {
 #ifdef ESP_PLATFORM
     if (s_audio_async_enabled)
-        async_opm_send(ASYNC_OPM_VOLUME, 0, vol, 0, 0);
+    {
+        if (DSound_AbsTimelineActive()) (void)DSound_AbsTimelineOPMVolume(vol);
+        else (void)async_opm_send(ASYNC_OPM_VOLUME, 0, vol, 0, 0);
+    }
     else if (opm)
     {
         const int v = (vol)?((16-vol)*4):192;
@@ -1041,6 +1045,80 @@ void OPM_SetVolume(uint8_t vol)
 }
 
 #ifdef ESP_PLATFORM
+/* R140P4S3: CPU0 absolute-timeline waveform entry points.
+ * The timeline task is the only caller while active, so the legacy YM task
+ * remains asleep.  Rendering waits for FIFO space instead of discarding,
+ * preserving exact FM/ADPCM sample-position alignment in this correctness
+ * reference build. */
+extern "C" int OPM_AbsTimelineRenderCPU0(uint32_t frames)
+{
+    if (!s_audio_async_enabled || (!s_audio_vgm && !s_audio_opm)) return 0;
+    const uint32_t req=__atomic_load_n(&s_r120a_audio_rate_req,__ATOMIC_ACQUIRE);
+    if(s_audio_vgm && req!=s_r120a_audio_rate_applied){
+        vgmm5_ym2151_set_sample_rate(s_audio_vgm,req);
+        s_r120a_audio_rate_applied=req;
+    }
+    while (frames)
+    {
+        uint32_t n=frames>ASYNC_OPM_SCRATCH_FRAMES?ASYNC_OPM_SCRATCH_FRAMES:frames;
+        for (;;)
+        {
+            size_t free_frames;
+            portENTER_CRITICAL(&s_audio_mux);
+            free_frames=ASYNC_OPM_RING_FRAMES-s_audio_count;
+            portEXIT_CRITICAL(&s_audio_mux);
+            if (free_frames>=n) break;
+            vTaskDelay(1);
+        }
+        (void)async_render_publish(n,0);
+        frames-=n;
+    }
+    return 1;
+}
+extern "C" int OPM_AbsTimelineWriteCPU0(uint8_t reg,uint8_t data)
+{
+    if (!s_audio_async_enabled || (!s_audio_vgm && !s_audio_opm)) return 0;
+    if (s_audio_vgm) vgmm5_ym2151_write(s_audio_vgm,reg,data);
+    else s_audio_opm->WriteReg(reg,data);
+    return 1;
+}
+extern "C" int OPM_AbsTimelineResetCPU0(void)
+{
+    if (!s_audio_async_enabled) return 0;
+    if (s_audio_vgm) vgmm5_ym2151_reset(s_audio_vgm);
+    else if (s_audio_opm) { s_audio_opm->Reset(); s_audio_opm->CurCount=0; }
+    portENTER_CRITICAL(&s_audio_mux);
+    s_audio_rd=s_audio_wr=s_audio_count=0;
+    portEXIT_CRITICAL(&s_audio_mux);
+    return 1;
+}
+extern "C" int OPM_AbsTimelineVolumeCPU0(uint8_t vol)
+{
+    if (!s_audio_async_enabled) return 0;
+    if (s_audio_vgm) vgmm5_ym2151_set_px_volume(s_audio_vgm,vol);
+    else if (s_audio_opm) { const int v=vol?((16-vol)*4):192; s_audio_opm->SetVolume(-v); }
+    return 1;
+}
+extern "C" int OPM_AbsTimelineCSMCPU0(void)
+{
+    if (!s_audio_async_enabled) return 0;
+    if (s_audio_vgm) vgmm5_ym2151_csm_pulse(s_audio_vgm);
+    else if (s_audio_opm) for(uint8_t ch=0;ch<8;++ch){s_audio_opm->WriteReg(0x08,ch);s_audio_opm->WriteReg(0x08,(uint8_t)(ch|0x78u));}
+    return 1;
+}
+extern "C" void OPM_AbsTimelinePerfGet(uint32_t *frames,uint32_t *work_us)
+{
+    if(frames)*frames=0u;
+    if(work_us)*work_us=0u;
+}
+extern "C" void OPM_AbsTimelinePerfGetEx(uint32_t *frames,uint32_t *work_us,uint32_t *wait_us,uint32_t *wait_events)
+{
+    OPM_AbsTimelinePerfGet(frames,work_us);
+    if(wait_us)*wait_us=0u;
+    if(wait_events)*wait_events=0u;
+}
+
+
 int OPM_AsyncEnabled(void)
 {
 	return s_audio_async_enabled ? 1 : 0;
@@ -1062,50 +1140,92 @@ uint32_t OPM_AsyncFramesAvail(void)
 	return (uint32_t)__atomic_load_n(&s_audio_count, __ATOMIC_ACQUIRE);
 }
 
+/* Production clean: historical silent flight-recorder ABI retained as zero. */
+extern "C" void OPM_R140P4D2MixClipGet(uint64_t *samples, uint64_t *clips)
+{
+    if (samples) *samples = 0u;
+    if (clips) *clips = 0u;
+}
+
+extern "C" void OPM_R140P4D2SilentGet(uint32_t *generated_frames, uint32_t *opm_writes)
+{
+    if (generated_frames) *generated_frames = 0u;
+    if (opm_writes) *opm_writes = 0u;
+}
+
+extern "C" void OPM_R140P4D7DemandGet(uint32_t *requested_frames,
+                                        uint32_t *accepted_frames,
+                                        uint32_t *rendered_frames,
+                                        uint32_t *queue_depth,
+                                        uint32_t *queue_max)
+{
+    if (requested_frames) *requested_frames = 0u;
+    if (accepted_frames) *accepted_frames = 0u;
+    if (rendered_frames) *rendered_frames = 0u;
+    if (queue_depth) *queue_depth = async_event_depth();
+    if (queue_max) *queue_max = 0u;
+}
+
+extern "C" void OPM_R140P4D7WindowBegin(void) {}
+
 int OPM_AsyncMixRead(int16_t *dst, int frames)
 {
 	if (!s_audio_async_enabled || !dst || frames <= 0)
 		return 0;
 
-	portENTER_CRITICAL(&s_audio_mux);
-	if ((size_t)frames > s_audio_count)
-		frames = (int)s_audio_count;
-	int remain = frames;
-	int16_t *out = dst;
-	while (remain > 0)
-	{
-		size_t n = ASYNC_OPM_RING_FRAMES - s_audio_rd;
-		if (n > (size_t)remain) n = (size_t)remain;
-		const int16_t *fm = &s_audio_ring[s_audio_rd * 2];
+    int copied = 0;
+    while (copied < frames)
+    {
+        size_t n = 0;
+
+        /* Linearize consumption under the existing ring lock, but copy only
+         * one <=256-frame Internal-SRAM chunk while locked.  The expensive
+         * saturating add happens after the lock is released. */
+        portENTER_CRITICAL(&s_audio_mux);
+        if (s_audio_count)
+        {
+            n = s_audio_count;
+            const size_t want = (size_t)(frames - copied);
+            if (n > want) n = want;
+            if (n > ASYNC_OPM_SCRATCH_FRAMES) n = ASYNC_OPM_SCRATCH_FRAMES;
+            const size_t contiguous = ASYNC_OPM_RING_FRAMES - s_audio_rd;
+            if (n > contiguous) n = contiguous;
+            memcpy(s_audio_mix_read_scratch, &s_audio_ring[s_audio_rd * 2],
+                   n * 2u * sizeof(int16_t));
+            s_audio_rd = (s_audio_rd + n) & ASYNC_OPM_RING_MASK;
+            s_audio_count -= n;
+        }
+        portEXIT_CRITICAL(&s_audio_mux);
+
+        if (!n)
+            break;
+
+        int16_t *out = dst + (size_t)copied * 2u;
 #if PX68K_TAB5_R57E63_AUDIO_AUDIT
-		uint32_t clip_local = 0;
-		uint32_t max_raw_local = 0;
+        uint32_t clip_local = 0;
+        uint32_t max_raw_local = 0;
 #endif
-		for (size_t i = 0; i < n * 2; ++i)
-		{
-			int v2 = (int)out[i] + (int)fm[i];
+        for (size_t i = 0; i < n * 2u; ++i)
+        {
+            int v2 = (int)out[i] + (int)s_audio_mix_read_scratch[i];
 #if PX68K_TAB5_R57E63_AUDIO_AUDIT
-			uint32_t raw_abs = (uint32_t)(v2 < 0 ? -v2 : v2);
-			if (raw_abs > max_raw_local) max_raw_local = raw_abs;
-			if (v2 > 32767 || v2 < -32768) ++clip_local;
+            uint32_t raw_abs = (uint32_t)(v2 < 0 ? -v2 : v2);
+            if (raw_abs > max_raw_local) max_raw_local = raw_abs;
+            if (v2 > 32767 || v2 < -32768) ++clip_local;
 #endif
-			if (v2 > 32767) v2 = 32767;
-			else if (v2 < -32768) v2 = -32768;
-			out[i] = (int16_t)v2;
-		}
+            if (v2 > 32767) v2 = 32767;
+            else if (v2 < -32768) v2 = -32768;
+            out[i] = (int16_t)v2;
+        }
 #if PX68K_TAB5_R57E63_AUDIO_AUDIT
-		s_r57e64_mix_samples += (uint32_t)(n * 2u);
-		s_r57e64_mix_clips += clip_local;
-		if (max_raw_local > s_r57e64_mix_max_raw_abs)
-			s_r57e64_mix_max_raw_abs = max_raw_local;
+        s_r57e64_mix_samples += (uint32_t)(n * 2u);
+        s_r57e64_mix_clips += clip_local;
+        if (max_raw_local > s_r57e64_mix_max_raw_abs)
+            s_r57e64_mix_max_raw_abs = max_raw_local;
 #endif
-		out += n * 2;
-		s_audio_rd = (s_audio_rd + n) & ASYNC_OPM_RING_MASK;
-		s_audio_count -= n;
-		remain -= (int)n;
-	}
-	portEXIT_CRITICAL(&s_audio_mux);
-	return frames;
+        copied += (int)n;
+    }
+    return copied;
 }
 
 extern "C" void OPM_R57E64MixClipAuditGet(uint64_t *mixed_samples,
@@ -1126,30 +1246,17 @@ extern "C" void OPM_R57E64MixClipAuditGet(uint64_t *mixed_samples,
 #endif
 }
 
-void OPM_AsyncPerfBegin(void)
-{
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-	s_audio_profile_us = 0;
-	s_audio_profile_calls = 0;
-	s_audio_profile_frames = 0;
-#endif
-}
+void OPM_AsyncPerfBegin(void) {}
 
 void OPM_AsyncPerfGet(uint32_t *us, uint32_t *calls, uint32_t *frames,
                       uint32_t *qdepth, uint32_t *event_drops, uint32_t *ring_overruns)
 {
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-	if (us) *us = s_audio_profile_us;
-	if (calls) *calls = s_audio_profile_calls;
-	if (frames) *frames = s_audio_profile_frames;
-#else
-	if (us) *us = 0;
-	if (calls) *calls = 0;
-	if (frames) *frames = 0;
-#endif
-	if (qdepth) *qdepth = async_event_depth();
-	if (event_drops) *event_drops = s_audio_event_drops;
-	if (ring_overruns) *ring_overruns = s_audio_ring_overruns;
+    if (us) *us = 0u;
+    if (calls) *calls = 0u;
+    if (frames) *frames = 0u;
+    if (qdepth) *qdepth = async_event_depth();
+    if (event_drops) *event_drops = s_audio_event_drops;
+    if (ring_overruns) *ring_overruns = s_audio_ring_overruns;
 }
 
 extern "C" void WinX68k_AudioAsyncGetQueueTaxonomy(
@@ -1158,18 +1265,10 @@ extern "C" void WinX68k_AudioAsyncGetQueueTaxonomy(
     uint32_t *reset_drop, uint32_t *volume_drop, uint32_t *csm_drop,
     uint32_t *stop_drop, uint32_t *other_drop)
 {
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-    if (write_attempt) *write_attempt = s_r56_write_attempt;
-#else
-    if (write_attempt) *write_attempt = 0;
-#endif
+    if (write_attempt) *write_attempt = 0u;
     if (write_drop) *write_drop = s_r56_write_drop;
     if (write_drop_frames) *write_drop_frames = s_r56_write_drop_frames;
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-    if (render_attempt) *render_attempt = s_r56_render_attempt;
-#else
-    if (render_attempt) *render_attempt = 0;
-#endif
+    if (render_attempt) *render_attempt = 0u;
     if (render_drop) *render_drop = s_r56_render_drop;
     if (render_drop_frames) *render_drop_frames = s_r56_render_drop_frames;
     if (reset_drop) *reset_drop = s_r56_reset_drop;
@@ -1193,37 +1292,21 @@ extern "C" void WinX68k_AudioAsyncGetBackpressureStats(
 
 void OPM_AsyncWorkGet(uint32_t *us, uint32_t *calls, uint32_t *frames)
 {
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-	if (us) *us = s_audio_work_us;
-	if (calls) *calls = s_audio_work_calls;
-	if (frames) *frames = s_audio_work_frames;
-#else
-	if (us) *us = 0;
-	if (calls) *calls = 0;
-	if (frames) *frames = 0;
-#endif
+    if (us) *us = 0u;
+    if (calls) *calls = 0u;
+    if (frames) *frames = 0u;
 }
 
 void OPM_AsyncDetailProfileGet(OPMAsyncDetailProfile *out)
 {
     if (!out) return;
-    vgmm5_ym2151_profile_t p = {};
-    if (s_audio_vgm) vgmm5_ym2151_profile_get(s_audio_vgm, &p);
-    out->sampled_frames = p.sampled_frames;
-    out->total_cycles = p.total_cycles;
-    out->envelope_cycles = p.envelope_cycles;
-    out->lfo_noise_cycles = p.lfo_noise_cycles;
-    out->channel_prep_cycles = p.channel_prep_cycles;
-    out->operator_cycles = p.operator_cycles;
-    out->routing_pan_cycles = p.routing_pan_cycles;
-    out->post_cycles = p.post_cycles;
+    memset(out, 0, sizeof(*out));
 }
 
 void OPM_AsyncSemanticAlgoGet(uint32_t out[8])
 {
     if (!out) return;
-    if (s_audio_vgm) vgmm5_ym2151_semantic_algo_get(s_audio_vgm, out);
-    else for (int i = 0; i < 8; ++i) out[i] = 0;
+    for (int i = 0; i < 8; ++i) out[i] = 0u;
 }
 
 uint32_t OPM_AsyncStackHighWater(void)

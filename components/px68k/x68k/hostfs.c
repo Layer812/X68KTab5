@@ -165,6 +165,9 @@ static int hfs_guest_write(uint32_t address, const void *srcv, size_t length)
     {
         for (size_t i = 0; i < length; ++i)
             MEM[(address + (uint32_t)i) ^ 1u] = src[i];
+#ifdef ESP_PLATFORM
+        m68k_tab5_exec123_invalidate_range(address, (uint32_t)length);
+#endif
         return 1;
     }
     for (size_t i = 0; i < length; ++i)

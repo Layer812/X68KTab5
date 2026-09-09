@@ -21,6 +21,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/portmacro.h"
 
+#define printf(...) ((void)0) /* P12R1 Production Quiet */
+
 #define P4BLEND_MAX_WIDTH 800u
 
 static uint8_t s_pie_selfcheck_done;

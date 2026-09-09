@@ -27,20 +27,6 @@ typedef struct {
     uint8_t reserved[3];
 } tab5_video_flow_line_t;
 
-typedef struct {
-    uint64_t guest_frontier;
-    uint64_t compose_frontier;
-    uint64_t screen_commit_frontier;
-    uint64_t visible_frontier;
-    uint64_t cpu1_exact_commits;
-    uint64_t cpu0_final_commits;
-    uint64_t dirty_posts;
-    uint64_t snapshot_races;
-    uint64_t stale_skips;
-    uint64_t requeues;
-    uint32_t dirty_lines;
-    uint32_t dirty_max;
-} tab5_video_flow_stats_t;
 
 /* One-time buffer registration. CPU1 remains sole writer of cpu1_fb. */
 int tab5_video_flow_init(void);
@@ -56,10 +42,11 @@ void tab5_video_flow_cpu1_commit(uint32_t y, uint32_t width,
                                  uint32_t video_epoch,
                                  uint32_t visual_seq);
 
-/* CPU0 final compositor progress only. Pixels stay on CPU0 and are handed to
- * Screen Manager through its bounded result slots; video_flow owns only the
- * cross-core CPU1 authoritative publication. */
+/* R140F1R2 compatibility ABI: CPU0 final pixels are handed directly to
+ * Screen Manager in this production flow generation; no extra framebuffer or
+ * cross-core publication is needed here. */
 void tab5_video_flow_cpu0_complete(uint64_t render_seq);
+
 uint64_t tab5_video_flow_cpu1_line_seq(uint32_t y);
 
 /* Screen Manager CPU0-side latest-wins ingest. */
@@ -71,9 +58,8 @@ int tab5_video_flow_snapshot_latest(uint32_t y,
                                     tab5_video_flow_line_t *meta);
 
 uint64_t tab5_video_flow_guest_frontier(void);
-void tab5_video_flow_set_screen_commit_frontier(uint64_t seq);
-void tab5_video_flow_set_visible_frontier(uint64_t seq);
-void tab5_video_flow_get_stats(tab5_video_flow_stats_t *out);
+/* CPU0 scheduling control only; not telemetry. */
+uint32_t tab5_video_flow_dirty_lines(void);
 
 /* One-way wake only. Implemented by Screen Manager; never admits/waits. */
 void tab5_screen_no_wait_kick(void);

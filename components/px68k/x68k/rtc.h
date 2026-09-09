@@ -19,6 +19,9 @@ void FASTCALL RTC_Write(uint32_t adr, uint8_t data);
 extern int RTC_Timer1;
 extern int RTC_Timer16;
 void RTC_TimerSlow(void);
+/* R140J2: peripheral clocks until the next RTC event capable of asserting
+ * MFP IRQ15.  Returns max_clock when no earlier asynchronous event exists. */
+int RTC_R140J2NextIRQDeadline(int max_clock);
 static inline __attribute__((always_inline)) void RTC_Timer(int clock)
 {
     const int t1 = RTC_Timer1 + clock;

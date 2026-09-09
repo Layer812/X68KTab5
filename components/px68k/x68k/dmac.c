@@ -563,7 +563,9 @@ int PX68K_DEVIRAM FASTCALL DMA_Exec3ADPCMFast(void)
     ++d->MAR;
     --d->MTC;
 
+#if PX68K_TAB5_R57E63_AUDIO_AUDIT || !PX68K_TAB5_R43_QUIET_RUNTIME
     ++s_dma3_adpcm_fast_hits;
+#endif
     if (!s_dma3_adpcm_fast_logged) {
         s_dma3_adpcm_fast_logged = 1;
         printf("PX68K_DMA3R26: measured OCR=32/DCR=80/SCR=04 RAM->ADPCM fast path ACTIVE; final-byte/completion stays generic\n");

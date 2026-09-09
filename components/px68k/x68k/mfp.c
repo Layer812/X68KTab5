@@ -54,6 +54,82 @@ static const int Timer_Prescaler[8] = {1, 10, 25, 40, 125, 160, 250, 500};
 static PX68K_DEVCACHE uint8_t s_timer_prescale_sel[4] = {0, 0, 0, 0};
 PX68K_DEVCACHE uint8_t MFP_TimerActiveMask = 0;
 PX68K_DEVCACHE uint8_t MFP_TimerFastMode = 0;
+PX68K_DEVCACHE uint8_t MFP_R140J2PollGuard = 0;
+
+#define MFP_R140MK1_DEADLINE_INF 0x3fffffff
+PX68K_DEVCACHE int32_t MFP_R140MK1CachedIRQDeadline = MFP_R140MK1_DEADLINE_INF;
+PX68K_DEVCACHE uint8_t MFP_R140MK1IRQ15Open = 0;
+
+/* R140P4MFP1: Timer B is the /10,reload=13 MDX hot timer, but when its
+ * IRQ7 enable bit (IERA bit0) is clear, underflows have no interrupt/pending
+ * side effect.  Defer its counter arithmetic and accumulate peripheral clocks
+ * in one scalar.  Materialize with the existing exact timer arithmetic at
+ * every guest-visible boundary (TBDR read, TBCR/TBDR/IERA write, state save,
+ * IRQ7 re-enable, or rare overflow guard). */
+static PX68K_DEVCACHE uint32_t s_mfp_r140mfp1_timerb_lazy_clocks = 0u;
+static void mfp_r140mfp1_materialize_timerb(void);
+
+/* R140P4MK1: rebuild the exact asynchronous-timer deadline only when the
+ * guest-visible timer/IRQ topology changes, or when the cached earliest
+ * underflow has actually been crossed.  The old J2 function performed this
+ * four-channel walk on every CPU slice even though RC1 measured reason=0 for
+ * 145146/145641 slices. */
+static inline void mfp_r140mk1_refresh_irq_deadline(void)
+{
+   static const uint8_t TimerIRQ[4] = { 2u, 7u, 10u, 11u };
+   const uint8_t active = MFP_TimerActiveMask;
+   int best = MFP_R140MK1_DEADLINE_INF;
+
+   for (int chan = 0; chan < 4; ++chan) {
+      if (!(active & (uint8_t)(1u << chan)))
+         continue;
+
+      const uint8_t irq = TimerIRQ[chan];
+      uint8_t ier, imr, isr, flag;
+      if (irq < 8u) {
+         flag = (uint8_t)(0x80u >> irq);
+         ier = MFP[MFP_IERA]; imr = MFP[MFP_IMRA]; isr = MFP[MFP_ISRA];
+      } else {
+         const uint8_t q = (uint8_t)(irq - 8u);
+         flag = (uint8_t)(0x80u >> q);
+         ier = MFP[MFP_IERB]; imr = MFP[MFP_IMRB]; isr = MFP[MFP_ISRB];
+      }
+      if (!(ier & flag) || !(imr & flag) || (isr & flag))
+         continue;
+
+      const uint8_t sel = s_timer_prescale_sel[chan];
+      if (!sel)
+         continue;
+      const int prescale = Timer_Prescaler[sel];
+      const uint32_t decs = MFP[MFP_TADR + chan]
+         ? (uint32_t)MFP[MFP_TADR + chan] : 256u;
+      int64_t due = (int64_t)decs * (int64_t)prescale - (int64_t)Timer_Tick[chan];
+      if (due < 1) due = 1;
+      if (due < best) best = (int)due;
+   }
+
+   MFP_R140MK1CachedIRQDeadline = best;
+   {
+      const uint8_t flag = 0x01u; /* IRQ15 -> IERB/IMRB/ISRB bit0 */
+      MFP_R140MK1IRQ15Open = (uint8_t)(
+         (MFP[MFP_IERB] & flag) && (MFP[MFP_IMRB] & flag) && !(MFP[MFP_ISRB] & flag));
+   }
+}
+
+static inline __attribute__((always_inline)) void
+mfp_r140mk1_advance_irq_deadline(int32_t clock)
+{
+   int due = (int)MFP_R140MK1CachedIRQDeadline;
+   if (due == MFP_R140MK1_DEADLINE_INF || clock <= 0)
+      return;
+   due -= (int)clock;
+   if (__builtin_expect(due > 0, 1)) {
+      MFP_R140MK1CachedIRQDeadline = due;
+      return;
+   }
+   mfp_r140mk1_refresh_irq_deadline();
+}
+
 #ifdef ESP_PLATFORM
 static DRAM_ATTR uint32_t s_mfp_exact_bc_calls = 0;
 static DRAM_ATTR uint32_t s_mfp_fallback_calls = 0;
@@ -93,6 +169,7 @@ static inline void mfp_refresh_timer_cache(void)
 #else
    MFP_TimerFastMode = 0;
 #endif
+   mfp_r140mk1_refresh_irq_deadline();
 }
 
 /* Build 5.60: GetGPIP() used to redo two variable divisions on every read.
@@ -148,6 +225,9 @@ static inline uint32_t mfp_prescale_quotient(uint32_t accum, uint8_t sel)
 
 int MFP_StateAction(StateMem *sm, int load, int data_only)
 {
+   if (!load)
+      mfp_r140mfp1_materialize_timerb();
+
 	SFORMAT StateRegs[] = 
 	{
 		SFARRAY(MFP, 24),
@@ -159,8 +239,11 @@ int MFP_StateAction(StateMem *sm, int load, int data_only)
 	};
 
 	int ret = PX68KSS_StateAction(sm, load, data_only, StateRegs, "X68K_MFP", false);
-	if (load)
+	if (load) {
+      s_mfp_r140mfp1_timerb_lazy_clocks = 0u;
 		mfp_refresh_timer_cache();
+		MFP_R140J2PollGuard = 0u;
+	}
 
 	return ret;
 }
@@ -195,8 +278,10 @@ uint32_t FASTCALL MFP_IntCallback(uint8_t irq)
    }
 
    MFP[MFP_IPRA+offset] &= (~flag);
-   if (MFP[MFP_VR]&8)
+   if (MFP[MFP_VR]&8) {
       MFP[MFP_ISRA+offset] |= flag;
+      mfp_r140mk1_refresh_irq_deadline();
+   }
    vect |= (MFP[MFP_VR]&0xf0);
    for (flag=0x80; flag; flag>>=1)
    {
@@ -275,6 +360,9 @@ void MFP_Int(int irq)
 void MFP_Init(void)
 {
 	int i;
+#ifdef ESP_PLATFORM
+   printf("PX68K_MFP_R140P4MFP1: Timer-B IRQ7-disabled lazy materialization ACTIVE; MK1 exact IRQ-deadline shadow retained; TBDR/read-write/save boundaries exact\n");
+#endif
 	static const uint8_t initregs[24] = {
 		0x7b, 0x06, 0x00, 0x18, 0x3e, 0x00, 0x00, 0x00,
 		0x00, 0x18, 0x3e, 0x40, 0x08, 0x01, 0x77, 0x01,
@@ -287,6 +375,8 @@ void MFP_Init(void)
 	s_dbg_kbd_irq_enabled = 0;
 	s_dbg_kbd_irq_disabled = 0;
 	s_dbg_last_udr = 0;
+	MFP_R140J2PollGuard = 0u;
+   s_mfp_r140mfp1_timerb_lazy_clocks = 0u;
 	for (i=0; i<4; i++)
       Timer_Tick[i] = 0;
 	mfp_refresh_timer_cache();
@@ -322,6 +412,13 @@ uint8_t FASTCALL MFP_Read(uint32_t adr)
    {
       uint8_t reg = (uint8_t)((adr&0x3f)>>1);
 
+      if (__builtin_expect(reg == MFP_TBDR, 0))
+         mfp_r140mfp1_materialize_timerb();
+
+      if ((reg >= MFP_IERA && reg <= MFP_IMRB) ||
+          (reg >= MFP_TACR && reg <= MFP_TDDR))
+         MFP_R140J2PollGuard = 8u;
+
       switch(reg)
       {
          case MFP_GPIP:
@@ -337,6 +434,14 @@ uint8_t FASTCALL MFP_Read(uint32_t adr)
                   return MFP[reg] & 0x7f;
                return MFP[reg] | 0x80;
          default:
+               /* R140J2: if software polls timer/control/interrupt state, keep
+                * the next few scanlines at the proven legacy observation
+                * cadence.  This avoids turning a timer-poll loop into a
+                * line-granular observer while interrupt-driven workloads stay
+                * fully deadline-driven. */
+               if ((reg >= MFP_IERA && reg <= MFP_IMRB) ||
+                   (reg >= MFP_TACR && reg <= MFP_TDDR))
+                  MFP_R140J2PollGuard = 8u;
                break;
       }
       return MFP[reg];
@@ -360,6 +465,9 @@ void FASTCALL MFP_Write(uint32_t adr, uint8_t data)
    {
       uint8_t reg = (uint8_t)((adr&0x3f)>>1);
 
+      if (__builtin_expect(reg == MFP_IERA || reg == MFP_TBDR || reg == MFP_TBCR, 0))
+         mfp_r140mfp1_materialize_timerb();
+
       switch(reg)
       {
          case MFP_IERA:
@@ -367,6 +475,7 @@ void FASTCALL MFP_Write(uint32_t adr, uint8_t data)
             MFP[reg]    = data;
             MFP[reg+2] &= data;  /* Prohibited items drop IPRA/B */
             MFP_RecheckInt();
+            mfp_r140mk1_refresh_irq_deadline();
             break;
          case MFP_IPRA:
          case MFP_IPRB:
@@ -374,11 +483,13 @@ void FASTCALL MFP_Write(uint32_t adr, uint8_t data)
          case MFP_ISRB:
             MFP[reg] &= data;
             MFP_RecheckInt();
+            mfp_r140mk1_refresh_irq_deadline();
             break;
          case MFP_IMRA:
          case MFP_IMRB:
             MFP[reg] = data;
             MFP_RecheckInt();
+            mfp_r140mk1_refresh_irq_deadline();
             break;
          case MFP_TADR:
             Timer_Reload[0] = MFP[reg] = data;
@@ -455,6 +566,34 @@ static inline uint8_t mfp_timer_advance_fast(uint8_t cur, uint8_t reload,
    return (uint8_t)((uint32_t)reload - rem);
 }
 
+static inline __attribute__((always_inline)) void
+mfp_r140mfp1_advance_timerb_disabled(uint32_t clocks)
+{
+   if (!clocks)
+      return;
+   const uint32_t accum = (uint32_t)Timer_Tick[1] + clocks;
+   const uint32_t decs = accum / 10u;
+   Timer_Tick[1] = (int32_t)(accum - decs * 10u);
+   if (decs) {
+      int ignored_fired = 0;
+      MFP[MFP_TBDR] = mfp_timer_advance_fast(
+         MFP[MFP_TBDR], 13u, decs, &ignored_fired);
+   }
+}
+
+static void PX68K_DEVIRAM mfp_r140mfp1_materialize_timerb(void)
+{
+   const uint32_t lazy = s_mfp_r140mfp1_timerb_lazy_clocks;
+   if (!lazy)
+      return;
+
+   /* Every clock represented here elapsed while IRQ7 was disabled.  Exact
+    * counter/Tick state must advance, but no historical underflow may create
+    * IPRA/IRQ state when the enable bit was clear. */
+   s_mfp_r140mfp1_timerb_lazy_clocks = 0u;
+   mfp_r140mfp1_advance_timerb_disabled(lazy);
+}
+
 /* R57E71 fixed IRQ paths for the measured MDX timer tuple.  These are exact
  * specializations of MFP_Int(7) and MFP_Int(10): no priority/enable semantics
  * are changed, only the runtime irq-number decode and shifts are removed. */
@@ -481,24 +620,44 @@ static inline __attribute__((always_inline)) void mfp_r71_timerc_irq(void)
 void PX68K_DEVIRAM __attribute__((hot,optimize("O3"))) FASTCALL MFP_TimerR71ExactBC(int32_t clock)
 {
 #ifdef ESP_PLATFORM
+#if PX68K_TAB5_R57E63_AUDIO_AUDIT || !PX68K_TAB5_R43_QUIET_RUNTIME
    ++s_mfp_exact_bc_calls;
+#endif
    if (__builtin_expect(!s_mfp_exact_bc_logged, 0)) {
       s_mfp_exact_bc_logged = 1u;
       printf("PX68K_MFP_R57E71: cached exact B/C hot path ACTIVE B=/10 reload=13 C=/500 reload=200; fixed IRQ decode\n");
    }
 
-   int32_t accum = Timer_Tick[1] + clock;
-   if (accum >= 10) {
-      const uint32_t decs = (uint32_t)accum / 10u;
-      Timer_Tick[1] = accum - (int32_t)(decs * 10u);
-      int fired = 0;
-      MFP[MFP_TBDR] = mfp_timer_advance_fast(MFP[MFP_TBDR], 13u, decs, &fired);
-      if (fired) mfp_r71_timerb_irq();
+   /* MFP1 common path: IRQ7 disabled means Timer B underflows cannot latch
+    * IPRA or invoke IRQH.  One scalar add replaces per-slice /10, reload-13
+    * wrap/modulo and IRQ checks.  The accumulated clocks are materialized
+    * before every boundary that can expose or depend on the B timer state. */
+   if (__builtin_expect((MFP[MFP_IERA] & 0x01u) == 0u, 1)) {
+      const uint32_t c = (clock > 0) ? (uint32_t)clock : 0u;
+      const uint32_t limit = 0x10000000u;
+      if (__builtin_expect(c >= limit, 0)) {
+         mfp_r140mfp1_materialize_timerb();
+         mfp_r140mfp1_advance_timerb_disabled(c);
+      } else {
+         if (__builtin_expect(s_mfp_r140mfp1_timerb_lazy_clocks > limit - c, 0))
+            mfp_r140mfp1_materialize_timerb();
+         s_mfp_r140mfp1_timerb_lazy_clocks += c;
+      }
    } else {
-      Timer_Tick[1] = accum;
+      mfp_r140mfp1_materialize_timerb();
+      int32_t accum_b = Timer_Tick[1] + clock;
+      if (accum_b >= 10) {
+         const uint32_t decs = (uint32_t)accum_b / 10u;
+         Timer_Tick[1] = accum_b - (int32_t)(decs * 10u);
+         int fired = 0;
+         MFP[MFP_TBDR] = mfp_timer_advance_fast(MFP[MFP_TBDR], 13u, decs, &fired);
+         if (fired) mfp_r71_timerb_irq();
+      } else {
+         Timer_Tick[1] = accum_b;
+      }
    }
 
-   accum = Timer_Tick[2] + clock;
+   int32_t accum = Timer_Tick[2] + clock;
    if (accum >= 500) {
       const uint32_t decs = (uint32_t)accum / 500u;
       Timer_Tick[2] = accum - (int32_t)(decs * 500u);
@@ -508,6 +667,7 @@ void PX68K_DEVIRAM __attribute__((hot,optimize("O3"))) FASTCALL MFP_TimerR71Exac
    } else {
       Timer_Tick[2] = accum;
    }
+   mfp_r140mk1_advance_irq_deadline(clock);
 #else
    MFP_TimerSlow(clock);
 #endif
@@ -550,6 +710,23 @@ void PX68K_DEVIRAM FASTCALL MFP_TimerSlow(int32_t clock)
       if (fired)
          MFP_Int(TimerInt[chan]);
    }
+   mfp_r140mk1_advance_irq_deadline(clock);
+}
+
+/* R140J2: exact next asynchronous ordinary-timer IRQ deadline.
+ *
+ * The timer state is authoritative at every Machine-Kernel service boundary.
+ * We therefore need only the first underflow that can assert an unmasked MFP
+ * IRQ before the next scanline edge.  Masked/disabled timers are advanced in
+ * bulk when another deadline (or the line edge) is reached; their counter
+ * arithmetic is already O(1) in MFP_TimerSlow/R71ExactBC.
+ *
+ * This deliberately does not include Timer-A event-count mode (TACR bit3),
+ * whose exact vline semantics remain owned by MFP_TimerA() at the scanline
+ * edge. */
+int PX68K_DEVIRAM FASTCALL MFP_R140J2NextIRQDeadline(int max_clock)
+{
+   return MFP_R140MK1DeadlineMin(max_clock);
 }
 
 /* R26a: restore Timer-A event-count slow helper accidentally dropped while

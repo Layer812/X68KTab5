@@ -45,6 +45,52 @@
 
 /* R57E62 production: keep only the 12-byte guest-memory roots in TCM/SPM.
  * Backing RAM/ROM/font storage remains in PSRAM. */
+
+/* R57E139A6_X68P4_PRODUCTION_COHERENCY
+ * Production-clean single coherency authority.  The common data-store path
+ * performs only the 4 KiB resident-region byte gate.  Exact 128-byte, 2-way
+ * code-page invalidation remains; all diagnostic counters are removed. */
+#ifdef ESP_PLATFORM
+extern uint32_t g_x68p4_pre139_page_tag[128];
+extern uint32_t g_x68p4_pre139_page_version[128];
+extern uint8_t g_x68p4_pre139_region_count[3072];
+extern uint32_t g_x68p4_pre139_enabled;
+static inline __attribute__((always_inline)) unsigned tab5_x68p4_a6_set(uint32_t page)
+{
+    uint32_t pn=page>>7; pn^=pn>>7; pn^=pn>>14; return (unsigned)(pn&63u);
+}
+static inline __attribute__((always_inline)) void tab5_x68p4_dma139_note_page(uint32_t address)
+{
+    const uint32_t a=address&0x00ffffffu;
+    if (__builtin_expect(!g_x68p4_pre139_enabled || a>=0x00c00000u,0)) return;
+    const unsigned region=(unsigned)(a>>12);
+    if (__builtin_expect(g_x68p4_pre139_region_count[region]==0u,1)) return;
+    const uint32_t page=a&~0x7fu;
+    const unsigned first=tab5_x68p4_a6_set(page)<<1;
+    for(unsigned way=0;way<2u;++way){
+        const unsigned slot=first+way;
+        if(__builtin_expect(g_x68p4_pre139_page_tag[slot]==page,0)){
+            g_x68p4_pre139_page_tag[slot]=0xffffffffu;
+            uint32_t v=g_x68p4_pre139_page_version[slot]+1u;
+            g_x68p4_pre139_page_version[slot]=v?v:1u;
+            m68k_tab5_x68p4_bump_epoch();
+            uint8_t rc=g_x68p4_pre139_region_count[region];
+            if(rc) g_x68p4_pre139_region_count[region]=(uint8_t)(rc-1u);
+            break;
+        }
+    }
+}
+static inline __attribute__((always_inline)) void tab5_x68p4_dma139_note_write(uint32_t address,uint32_t bytes)
+{
+    if(!bytes)return;
+    const uint32_t a0=address&0x00ffffffu; tab5_x68p4_dma139_note_page(a0);
+    const uint32_t a1=(a0+bytes-1u)&0x00ffffffu;
+    if(__builtin_expect((a0^a1)&~0x7fu,0)) tab5_x68p4_dma139_note_page(a1);
+}
+#else
+static inline void tab5_x68p4_dma139_note_write(uint32_t address,uint32_t bytes){(void)address;(void)bytes;}
+#endif
+
 PX68K_MEMHOT uint8_t *IPL;
 PX68K_MEMHOT uint8_t *MEM;
 static uint8_t *OP_ROM;
@@ -162,11 +208,27 @@ static void wm_cnt(uint32_t addr, uint8_t val)
 #else
 		MEM[addr ^ 1] = val;
 #endif
+#ifdef ESP_PLATFORM
+        m68k_tab5_exec123_note_ram_write8(addr);
+#endif
 	}
 	else if (addr < 0x00e00000)
 		GVRAM_Write(addr, val);
-	else
-		MemWriteTable[(addr >> 13) & 0xff](addr, val);
+	else if (addr < 0x00e80000)
+		TVRAM_Write(addr, val);
+	else {
+        /* R140P1: only the measured production-hot device pages bypass the
+         * generic function-pointer table.  Keep uncommon devices on the
+         * original table rather than growing another generic decoder. */
+        const unsigned slot = (unsigned)((addr >> 13) & 0xffu);
+        if (__builtin_expect(slot == 0x48u, 0)) { wm_opm(addr, val); return; }
+        if (__builtin_expect(slot == 0x44u, 0)) { MFP_Write(addr, val); return; }
+        if (__builtin_expect(slot == 0x42u, 0)) { DMA_Write(addr, val); return; }
+        if (__builtin_expect(slot == 0x49u, 0)) { wm_adpcm(addr, val); return; }
+        if (__builtin_expect(slot == 0x57u, 0)) { MIDI_Write(addr, val); return; }
+        if (__builtin_expect(slot >= 0x58u && slot <= 0x5fu, 0)) { BG_Write(addr, val); return; }
+        MemWriteTable[slot](addr, val);
+    }
 }
 
 
@@ -204,7 +266,19 @@ static uint8_t rm_main(uint32_t addr)
 		return MEM[addr ^ 1];
 	else if (addr < 0x00e00000)
 		return GVRAM_Read(addr);
-	return MemReadTable[(addr >> 13) & 0xff](addr);
+    else if (addr < 0x00e80000)
+        return TVRAM_Read(addr);
+
+    /* R140P1: MDX/XVI16 hot MMIO pages go directly to the same authoritative
+     * device handlers.  Optional/uncommon pages retain the original table. */
+    const unsigned slot = (unsigned)((addr >> 13) & 0xffu);
+    if (__builtin_expect(slot == 0x44u, 0)) return MFP_Read(addr);
+    if (__builtin_expect(slot == 0x48u, 0)) return rm_opm(addr);
+    if (__builtin_expect(slot == 0x42u, 0)) return DMA_Read(addr);
+    if (__builtin_expect(slot == 0x57u, 0)) return MIDI_Read(addr);
+    if (__builtin_expect(slot == 0x49u, 0)) return ADPCM_Read(addr);
+    if (__builtin_expect(slot >= 0x58u && slot <= 0x5fu, 0)) return BG_Read(addr);
+    return MemReadTable[slot](addr);
 }
 
 static uint8_t rm_font(uint32_t addr)
@@ -279,11 +353,17 @@ static void cpu_setOPbase24(uint32_t addr)
  */
 void dma_writemem24(uint32_t addr, uint8_t val)
 {
+#ifdef ESP_PLATFORM
+    tab5_x68p4_dma139_note_write(addr, 1u);
+#endif
 	wm_main(addr, val);
 }
 
 void dma_writemem24_word(uint32_t addr, uint16_t val)
 {
+#ifdef ESP_PLATFORM
+    tab5_x68p4_dma139_note_write(addr, 2u);
+#endif
 	if (addr & 1)
    {
 		BusErrFlag |= 4;
@@ -296,6 +376,9 @@ void dma_writemem24_word(uint32_t addr, uint16_t val)
 
 void dma_writemem24_dword(uint32_t addr, uint32_t val)
 {
+#ifdef ESP_PLATFORM
+    tab5_x68p4_dma139_note_write(addr, 4u);
+#endif
 	if (addr & 1)
    {
       BusErrFlag |= 4;
@@ -310,6 +393,9 @@ void dma_writemem24_dword(uint32_t addr, uint32_t val)
 
 void cpu_writemem24(uint32_t addr, uint32_t val)
 {
+#ifdef ESP_PLATFORM
+    tab5_x68p4_dma139_note_write(addr, 1u);
+#endif
 	BusErrFlag = 0;
 
 	wm_cnt(addr, val & 0xff);
@@ -319,6 +405,9 @@ void cpu_writemem24(uint32_t addr, uint32_t val)
 
 void cpu_writemem24_word(uint32_t addr, uint32_t val)
 {
+#ifdef ESP_PLATFORM
+    tab5_x68p4_dma139_note_write(addr, 2u);
+#endif
 
 	if (addr & 1)
 		return;
@@ -334,6 +423,9 @@ void cpu_writemem24_word(uint32_t addr, uint32_t val)
 
 void cpu_writemem24_dword(uint32_t addr, uint32_t val)
 {
+#ifdef ESP_PLATFORM
+    tab5_x68p4_dma139_note_write(addr, 4u);
+#endif
 	if (addr & 1)
 		return;
 

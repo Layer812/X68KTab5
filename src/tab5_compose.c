@@ -32,6 +32,8 @@
 #include "libretro/tab5_video_cpu1.h"
 #include "esp_rom_sys.h"
 
+#define printf(...) ((void)0) /* P12R1 Production Quiet */
+
 /* R38: compare CPU0-composed candidate against the currently published ScrBuf line before committing it. */
 extern int tab5_pie_graphics_diff(const void *a, const void *b, uint32_t bytes);
 
@@ -375,6 +377,13 @@ static uint8_t *s_r57d_class_pass;
 static uint16_t *s_r57d_class_epoch;
 static uint32_t s_r57d_slot_hold[TAB5_COMPOSE_MAX_SLOTS];
 static uint32_t s_r57d_burst_hold[TAB5_GBT65K_BURST_SLOTS];
+/* R140F1: per-slot immutable snapshot lineage.  A burst slot is not reused
+ * until CPU0 returns it, so matching source generations mean its 1024-byte
+ * raw row and 512-byte palette payload are already the exact requested copy. */
+static uint8_t s_r140f1_burst_snapshot_valid[TAB5_GBT65K_BURST_SLOTS];
+static uint32_t s_r140f1_row_snapshot_reuse;
+static uint32_t s_r140f1_pal_snapshot_reuse;
+static uint32_t s_r140f1_snapshot_reported;
 static volatile uint32_t s_r57d_shadow_render_active;
 static const uint8_t *s_r57d_bg_render_src, *s_r57d_c8_render_src;
 static const uint8_t *s_r57d_c16_render_src, *s_r57d_sprite_render_src;
@@ -2883,6 +2892,10 @@ int tab5_compose_init(void)
         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     s_gbt65k_burst_ready = (s_gbt65k_burst_slots != NULL);
     if (s_gbt65k_burst_ready) {
+        memset(s_r140f1_burst_snapshot_valid, 0, sizeof(s_r140f1_burst_snapshot_valid));
+        s_r140f1_row_snapshot_reuse = 0u;
+        s_r140f1_pal_snapshot_reuse = 0u;
+        s_r140f1_snapshot_reported = 0u;
         for (uint32_t i = 0; i < TAB5_GBT65K_BURST_SLOTS; ++i)
             s_gbt65k_free_ring[i] = (uint8_t)i;
         store_release(&s_gbt65k_free_head, TAB5_GBT65K_BURST_SLOTS);
@@ -2893,6 +2906,7 @@ int tab5_compose_init(void)
                  "PX68K_GBT65K615G: PSRAM burst queue ready slots=%u bytes=%u; stale-frame discard + rotating raster admission armed",
                  (unsigned)TAB5_GBT65K_BURST_SLOTS,
                  (unsigned)(TAB5_GBT65K_BURST_SLOTS * sizeof(compose_slot_t)));
+        ESP_LOGI(TAG, "X68P4_R140F1 GFX: immutable 65K burst-slot snapshot lineage ACTIVE; equal row/palette generations skip 1024B/512B materialize copies");
     } else {
         ESP_LOGW(TAG,
                  "PX68K_GBT65K615G: burst queue allocation failed; exact 6.15e 8-slot fallback retained");
@@ -3491,7 +3505,9 @@ int tab5_compose_submit_gbt65k_line(uint32_t y, uint32_t width,
             ++s_gbt65k_window_skipped;
             if (r57d_shadow_seq)
                 tab5_guest_bus_shadow_hold_cancel(r57d_shadow_seq);
-            if (s_task) xTaskNotifyGive(s_task);
+            if (s_task) {
+                xTaskNotifyGive(s_task);
+            }
             return 2;
         }
         slot = &s_gbt65k_burst_slots[idx];
@@ -3511,7 +3527,9 @@ int tab5_compose_submit_gbt65k_line(uint32_t y, uint32_t width,
         if (!r57d_shadow_seq) {
             (void)gbt65k_free_push(idx);
             ++s_gbt65k_window_skipped;
-            if (s_task) xTaskNotifyGive(s_task);
+            if (s_task) {
+                xTaskNotifyGive(s_task);
+            }
             return 2;
         }
     }
@@ -3545,26 +3563,48 @@ int tab5_compose_submit_gbt65k_line(uint32_t y, uint32_t width,
     slot->y = y;
     slot->width = width;
     slot->dst = dst;
-    slot->u.gbt65k.gvram_row = gvram_row & 511u;
+    const uint32_t r140f1_new_row = gvram_row & 511u;
+    const uint32_t r140f1_new_row_generation =
+        __atomic_load_n(&GVRAM_RowGeneration[r140f1_new_row], __ATOMIC_ACQUIRE);
+    const uint8_t r140f1_new_contrast = (uint8_t)(contrast & 15u);
+    const int r140f1_reuse_ok = burst65k && s_r140f1_burst_snapshot_valid[idx];
+    const int r140f1_same_row = r140f1_reuse_ok &&
+        slot->u.gbt65k.gvram_row == r140f1_new_row &&
+        slot->u.gbt65k.row_generation == r140f1_new_row_generation;
+    const int r140f1_same_pal = r140f1_reuse_ok &&
+        slot->u.gbt65k.pal_generation == pal_generation &&
+        slot->u.gbt65k.contrast == r140f1_new_contrast;
+
+    slot->u.gbt65k.gvram_row = r140f1_new_row;
     slot->u.gbt65k.gvram_x = gvram_x & 511u;
-    /* R56: capture the complete 65K source row at the guest-time latch.
-     * CPU1 is the sole guest writer, so no guest write can interleave this
-     * call.  The generation is retained as cache identity/diagnostics only. */
-    slot->u.gbt65k.row_generation =
-        __atomic_load_n(&GVRAM_RowGeneration[slot->u.gbt65k.gvram_row],
-                        __ATOMIC_ACQUIRE);
-    tab5_raster590_copy_run(
-        (uint8_t *)slot->u.gbt65k.raw_row,
-        gvram + (slot->u.gbt65k.gvram_row << 10),
-        (uint32_t)sizeof(slot->u.gbt65k.raw_row));
+    slot->u.gbt65k.row_generation = r140f1_new_row_generation;
+    if (!r140f1_same_row) {
+        tab5_raster590_copy_run((uint8_t *)slot->u.gbt65k.raw_row,
+                                gvram + (r140f1_new_row << 10),
+                                (uint32_t)sizeof(slot->u.gbt65k.raw_row));
+    } else {
+        ++s_r140f1_row_snapshot_reuse;
+    }
     slot->u.gbt65k.pal_generation = pal_generation;
     slot->u.gbt65k.frame_epoch = load_acquire(&s_gbt65k_frame_epoch);
-    slot->u.gbt65k.contrast = (uint8_t)(contrast & 15u);
+    slot->u.gbt65k.contrast = r140f1_new_contrast;
     slot->u.gbt65k.text_x=(uint16_t)(text_x&1023u);
     slot->u.gbt65k.text_y=(uint16_t)(text_y&1023u);
 
-    tab5_raster590_copy_run(slot->u.gbt65k.pal_regs, pal_regs,
-                            (uint32_t)sizeof(slot->u.gbt65k.pal_regs));
+    if (!r140f1_same_pal) {
+        tab5_raster590_copy_run(slot->u.gbt65k.pal_regs, pal_regs,
+                                (uint32_t)sizeof(slot->u.gbt65k.pal_regs));
+    } else {
+        ++s_r140f1_pal_snapshot_reuse;
+    }
+    if (burst65k) s_r140f1_burst_snapshot_valid[idx] = 1u;
+    if (!s_r140f1_snapshot_reported &&
+        (s_r140f1_row_snapshot_reuse + s_r140f1_pal_snapshot_reuse) >= 4096u) {
+        s_r140f1_snapshot_reported = 1u;
+        ESP_LOGI(TAG, "X68P4_R140F1 GFX row_reuse=%u pal_reuse=%u",
+                 (unsigned)s_r140f1_row_snapshot_reuse,
+                 (unsigned)s_r140f1_pal_snapshot_reuse);
+    }
     tab5_raster590_copy_run((uint8_t *)slot->u.gbt65k.text_pal,
                             (const uint8_t *)text_palette,
                             (uint32_t)sizeof(slot->u.gbt65k.text_pal));
@@ -3600,8 +3640,7 @@ int tab5_compose_submit_gbt65k_line(uint32_t y, uint32_t width,
     else s_r57d_slot_hold[idx]=r57d_shadow_seq;
 
     if (burst65k) {
-        const uint32_t pending_now =
-            __atomic_add_fetch(&s_gbt65k_burst_pending, 1u, __ATOMIC_ACQ_REL);
+            const uint32_t pending_now = __atomic_add_fetch(&s_gbt65k_burst_pending, 1u, __ATOMIC_ACQ_REL);
         uint32_t old_max = load_relaxed(&s_gbt65k_burst_max_pending);
         while (pending_now > old_max &&
                !__atomic_compare_exchange_n(&s_gbt65k_burst_max_pending,
@@ -3724,21 +3763,37 @@ int tab5_compose_submit_gbt65k_exact_bt_line(uint32_t y, uint32_t width,
     slot->y = y;
     slot->width = width;
     slot->dst = dst;
-    slot->u.gbt65k.gvram_row = gvram_row & 511u;
+    const uint32_t r140f1_new_row = gvram_row & 511u;
+    const uint32_t r140f1_new_row_generation =
+        __atomic_load_n(&GVRAM_RowGeneration[r140f1_new_row], __ATOMIC_ACQUIRE);
+    const uint8_t r140f1_new_contrast = (uint8_t)(contrast & 15u);
+    const int r140f1_reuse_ok = burst65k && s_r140f1_burst_snapshot_valid[idx];
+    const int r140f1_same_row = r140f1_reuse_ok &&
+        slot->u.gbt65k.gvram_row == r140f1_new_row &&
+        slot->u.gbt65k.row_generation == r140f1_new_row_generation;
+    const int r140f1_same_pal = r140f1_reuse_ok &&
+        slot->u.gbt65k.pal_generation == pal_generation &&
+        slot->u.gbt65k.contrast == r140f1_new_contrast;
+    slot->u.gbt65k.gvram_row = r140f1_new_row;
     slot->u.gbt65k.gvram_x = gvram_x & 511u;
-    slot->u.gbt65k.row_generation =
-        __atomic_load_n(&GVRAM_RowGeneration[slot->u.gbt65k.gvram_row],
-                        __ATOMIC_ACQUIRE);
-    tab5_raster590_copy_run((uint8_t *)slot->u.gbt65k.raw_row,
-                            gvram + (slot->u.gbt65k.gvram_row << 10),
-                            (uint32_t)sizeof(slot->u.gbt65k.raw_row));
+    slot->u.gbt65k.row_generation = r140f1_new_row_generation;
+    if (!r140f1_same_row)
+        tab5_raster590_copy_run((uint8_t *)slot->u.gbt65k.raw_row,
+                                gvram + (r140f1_new_row << 10),
+                                (uint32_t)sizeof(slot->u.gbt65k.raw_row));
+    else
+        ++s_r140f1_row_snapshot_reuse;
     slot->u.gbt65k.pal_generation = pal_generation;
     slot->u.gbt65k.frame_epoch = load_acquire(&s_gbt65k_frame_epoch);
-    slot->u.gbt65k.contrast = (uint8_t)(contrast & 15u);
+    slot->u.gbt65k.contrast = r140f1_new_contrast;
     slot->u.gbt65k.text_x=(uint16_t)(text_x&1023u);
     slot->u.gbt65k.text_y=(uint16_t)(text_y&1023u);
-    tab5_raster590_copy_run(slot->u.gbt65k.pal_regs, pal_regs,
-                            (uint32_t)sizeof(slot->u.gbt65k.pal_regs));
+    if (!r140f1_same_pal)
+        tab5_raster590_copy_run(slot->u.gbt65k.pal_regs, pal_regs,
+                                (uint32_t)sizeof(slot->u.gbt65k.pal_regs));
+    else
+        ++s_r140f1_pal_snapshot_reuse;
+    if (burst65k) s_r140f1_burst_snapshot_valid[idx] = 1u;
     tab5_raster590_copy_run((uint8_t *)slot->u.gbt65k.exact_bg_text,
                             (const uint8_t *)bg_text,
                             width * (uint32_t)sizeof(uint16_t));
@@ -3767,8 +3822,7 @@ int tab5_compose_submit_gbt65k_exact_bt_line(uint32_t y, uint32_t width,
         s_r57d_slot_hold[idx] = r57d_shadow_seq;
 
     if (burst65k) {
-        const uint32_t pending_now =
-            __atomic_add_fetch(&s_gbt65k_burst_pending, 1u, __ATOMIC_ACQ_REL);
+            const uint32_t pending_now = __atomic_add_fetch(&s_gbt65k_burst_pending, 1u, __ATOMIC_ACQ_REL);
         uint32_t old_max = load_relaxed(&s_gbt65k_burst_max_pending);
         while (pending_now > old_max &&
                !__atomic_compare_exchange_n(&s_gbt65k_burst_max_pending,
@@ -3909,35 +3963,18 @@ void tab5_compose_guest_bg_barrier(void)
 
 void tab5_compose_wait_idle(void)
 {
-    if (!s_ready || load_acquire(&s_pending) == 0u)
-        return;
-
-    ++s_frame_waits;
-    /* Build 6.15f: normal frames keep the asynchronous 65K burst queue out of
-     * this common frame-tail wait so CPU1 is not recoupled to CPU0.  R51 keeps
-     * that production behavior unchanged; source transitions use the explicit
-     * tab5_compose_wait_source_frame_idle() barrier below. */
-    while (load_acquire(&s_pending) != 0u)
-        taskYIELD();
+    /* HF3 CPU1 NO-WAIT: legacy ABI only.  Current R56/BAT177 production owns
+     * host completion downstream through immutable snapshots.  Never rejoin
+     * guest time to CPU0 compositor progress here. */
 }
 
 
-/* Legacy R51 ABI helper retained for older callers outside the R56 managed
- * lifecycle.  R56 Screen Manager never invokes it: guest time is not stopped
- * for host rendering, and correctness comes from immutable request snapshots
- * plus opaque-ticket validation instead of a source-frame drain barrier. */
+/* Legacy R51 ABI retained as a non-blocking observation only. */
 uint32_t tab5_compose_wait_source_frame_idle(void)
 {
     if (!s_ready)
         return 0u;
-
-    const uint32_t burst_on_entry = load_acquire(&s_gbt65k_burst_pending);
-
-    while ((load_acquire(&s_pending) |
-            load_acquire(&s_gbt65k_burst_pending)) != 0u)
-        taskYIELD();
-
-    return burst_on_entry;
+    return load_acquire(&s_gbt65k_burst_pending);
 }
 
 

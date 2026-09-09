@@ -51,10 +51,28 @@ extern uint8_t MFP_TimerFastMode;
 void FASTCALL MFP_TimerR71ExactBC(int32_t clock);
 void FASTCALL MFP_TimerSlow(int32_t clock);
 void MFP_Tab5TimerFastStats(uint32_t *exact_bc, uint32_t *fallback);
+/* R140P4MK1: exact shadow of the next ordinary-timer IRQ deadline.
+ * The shadow is refreshed on guest-visible timer/IRQ state changes and after
+ * an actual deadline crossing, then decremented by the same peripheral clocks
+ * consumed by MFP_Timer().  This turns the overwhelmingly common J2 choose
+ * path into one internal-DRAM load/compare without changing timer semantics. */
+extern int32_t MFP_R140MK1CachedIRQDeadline;
+extern uint8_t MFP_R140MK1IRQ15Open;
+static inline __attribute__((always_inline)) int MFP_R140MK1DeadlineMin(int max_clock)
+{
+    const int d = (int)MFP_R140MK1CachedIRQDeadline;
+    return (d < max_clock) ? d : max_clock;
+}
+/* Retained ABI helper for non-MK callers/tests. */
+int MFP_R140J2NextIRQDeadline(int max_clock);
+/* Timer/interrupt-register polling temporarily restores the proven 200@10MHz
+ * observation cadence.  This is host-only scheduler state, not guest state. */
+extern uint8_t MFP_R140J2PollGuard;
 static inline __attribute__((always_inline)) void MFP_Timer(int32_t clock)
 {
 #ifdef ESP_PLATFORM
-    if (__builtin_expect(MFP_TimerFastMode == 1u, 0)) {
+    /* R140P4MFP1: the measured MDX steady state is the exact B/C tuple. */
+    if (__builtin_expect(MFP_TimerFastMode == 1u, 1)) {
         MFP_TimerR71ExactBC(clock);
         return;
     }

@@ -1,12 +1,7 @@
 #include "tab5_screen_manager.h"
-#include "tab5_screen_r57e89.h"
 
-extern int tab5_video_turbo_enabled(void);
 #include "tab5_video_flow.h"
 
-#ifndef PX68K_TAB5_RELEASE_DIAGNOSTICS
-#define PX68K_TAB5_RELEASE_DIAGNOSTICS 0
-#endif
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -19,9 +14,9 @@ extern int tab5_video_turbo_enabled(void);
 #include "freertos/idf_additions.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 
 #include "tab5_video.h"
-#include "tab5_lp_broker.h"
 #include "esp_rom_sys.h"
 
 extern void *tab5_ppa_alloc_framebuffer(size_t bytes);
@@ -142,9 +137,6 @@ static uint32_t s_nw_present_seen;
 static uint16_t *s_flow_scratch;
 static uint64_t *s_flow_last_seq;
 static uint64_t s_flow_epoch_observation_seq;
-static uint64_t s_flow_ingest_commits;
-static uint64_t s_flow_ingest_stale;
-static uint64_t s_flow_ingest_race;
 
 /* Guest time axis.  Only VIDEO_* fact APIs advance these counters. */
 static uint64_t s_guest_seq;
@@ -256,25 +248,8 @@ static uint32_t s_dirty_mailbox_bank_has_data[2];   /* INTERNAL atomic edge flag
  * one dirty bank into thousands of repeated rescue-policy checks. */
 static uint32_t s_dirty_mailbox_rescue_edge_pending; /* INTERNAL atomic bool */
 static uint32_t s_dirty_mailbox_pending_mask;  /* INTERNAL atomic claim bits */
-static uint64_t s_dirty_mailbox_pending_token[2];
-static uint64_t s_mailbox_posts;
-static uint64_t s_mailbox_duplicate_posts;
-static uint64_t s_mailbox_offer_suppressed;
-static uint64_t s_mailbox_refresh_claims;
-static uint64_t s_mailbox_refresh_lines;
-static uint64_t s_mailbox_refresh_tiles;
-static uint64_t s_mailbox_last_claim_max_seq;
-static uint64_t s_mailbox_last_claim_present_token;
-static uint32_t s_mailbox_buffer_swaps;
-static uint32_t s_mailbox_swap_deferred;
-static uint32_t s_mailbox_writer_retries;
 static uint32_t s_mailbox_offer_epoch = 1u;
 static uint32_t s_mailbox_rescues_since_refresh;
-static uint64_t s_mailbox_rescue_attempts;
-static uint64_t s_mailbox_rescue_swaps;
-static uint64_t s_mailbox_rescue_skip_busy;
-static uint64_t s_mailbox_rescue_skip_budget;
-static uint32_t s_mailbox_edge_wakes;
 /* R57E11: CPU1 publishes audio reserve as facts only; Screen Manager turns it
  * into a dynamic optional-rescue ceiling.  No wall-clock or refresh timing is
  * exposed to CPU1 and no caller waits on CPU0. */
@@ -292,42 +267,12 @@ static uint32_t s_mailbox_rescue_limit = 3u;
 static uint32_t s_fair_cursor;
 static uint64_t s_fair_frame_seen = UINT64_MAX;
 static bool s_fair_capacity_hit;
-static uint64_t s_admission_deferred_fair;
-static uint64_t s_fair_wraps;
 
 static screen_record_t s_records[SCREEN_VERSION_RECORDS];
 
 /* Diagnostics. */
-static uint64_t s_ready_count;
-static uint64_t s_retired_count;
-static uint64_t s_dropped_count;
-static uint64_t s_line_latches;
-static uint64_t s_line_results;
-static uint64_t s_line_noops;
-static uint64_t s_line_drops;
-static uint64_t s_retry_requests;
-static uint64_t s_retry_delivered;
-static uint64_t s_seal_deferred_retry;
-static uint64_t s_seal_aborts_retry;
-static uint64_t s_stale_results;
-static uint64_t s_present_submits;
-static uint64_t s_present_completions;
-static uint64_t s_present_backpressure;
-static uint64_t s_admission_deferred_capacity;
-static uint64_t s_admission_deferred_same_line;
-static uint64_t s_geometry_duplicate_suppressed;
 /* R56k6: task-context diagnostic events are counters only.  The Screen
  * Manager worker never enters ESP_LOG/newlib stdio; CPU1 samples these fields. */
-static uint64_t s_tasklog_record_collisions;
-static uint64_t s_tasklog_present_unknown;
-static uint64_t s_tasklog_present_rejected;
-static uint64_t s_tasklog_present_out_of_order;
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-/* R57E89 counter-only screen liveness attribution; measurement builds only. */
-static uint64_t s_r89_frame_requests,s_r89_frame_consumed,s_r89_present_opportunities,s_r89_present_consumed;
-static uint64_t s_r89_seal_armed,s_r89_seal_arm_rejected,s_r89_seal_tries,s_r89_seal_block_pending,s_r89_seal_block_retry,s_r89_seal_block_reset,s_r89_seal_nochange,s_r89_seal_epoch_drop;
-static uint64_t s_r89_presenter_calls,s_r89_presenter_rejects,s_r89_display_ok,s_r89_display_fail;
-#endif
 
 static inline uint32_t next_generation(uint32_t g)
 {
@@ -378,10 +323,6 @@ static inline uint32_t screen_full_tile_mask(uint32_t width)
     return tiles ? ((1u << tiles) - 1u) : 0u;
 }
 
-static inline uint32_t popcount32(uint32_t v)
-{
-    return (uint32_t)__builtin_popcount(v);
-}
 
 static void queue_wake(void);
 
@@ -405,7 +346,6 @@ static bool post_dirty_mailbox_latest(uint32_t y, uint32_t mask, uint64_t seq)
         if ((__atomic_load_n(&s_dirty_mailbox_active_idx, __ATOMIC_ACQUIRE) & 1u) != idx) {
             __atomic_sub_fetch(&s_dirty_mailbox_writer_inflight[idx], 1u,
                                __ATOMIC_RELEASE);
-            (void)__atomic_add_fetch(&s_mailbox_writer_retries, 1u, __ATOMIC_RELAXED);
             continue;
         }
 
@@ -427,7 +367,6 @@ static bool post_dirty_mailbox_latest(uint32_t y, uint32_t mask, uint64_t seq)
         __atomic_sub_fetch(&s_dirty_mailbox_writer_inflight[idx], 1u,
                            __ATOMIC_RELEASE);
         if (first_in_bank) {
-            (void)__atomic_add_fetch(&s_mailbox_edge_wakes, 1u, __ATOMIC_RELAXED);
             /* R57E10: edge-latch before wake.  Screen Manager consumes this
              * exactly once; busy/budget rejection does not self-rearm. */
             __atomic_store_n(&s_dirty_mailbox_rescue_edge_pending, 1u,
@@ -453,40 +392,20 @@ static bool harvest_dirty_mailbox_bank(uint32_t idx)
         return false;
 
     __atomic_thread_fence(__ATOMIC_ACQUIRE);
-    uint64_t max_seq = 0u;
-    uint64_t lines = 0u;
-    uint64_t tiles = 0u;
     uint32_t *const masks = s_dirty_tile_mailbox[idx];
     uint64_t *const seqs = s_dirty_tile_latest_seq[idx];
     if (!masks || !seqs)
         return false;
 
-    for (uint32_t y = 0u; y < SCREEN_MAX_HEIGHT; ++y) {
-        const uint32_t mask = masks[y];
-        if (!mask)
-            continue;
-        ++lines;
-        tiles += popcount32(mask);
-        if (seqs[y] > max_seq)
-            max_seq = seqs[y];
-    }
-
-    const uint64_t present_token = s_dirty_mailbox_pending_token[idx];
+    /* R139A6A3: the historical O(height) max-seq/line/tile census was
+     * observation only.  An inactive bank can be retired with two bounded
+     * clears; ordering is carried by active_idx/inflight/pending_mask. */
     memset(masks, 0, SCREEN_MAX_HEIGHT * sizeof(*masks));
     memset(seqs, 0, SCREEN_MAX_HEIGHT * sizeof(*seqs));
     __atomic_store_n(&s_dirty_mailbox_bank_has_data[idx], 0u, __ATOMIC_RELEASE);
     __atomic_thread_fence(__ATOMIC_RELEASE);
 
-    s_dirty_mailbox_pending_token[idx] = 0u;
     (void)__atomic_fetch_and(&s_dirty_mailbox_pending_mask, ~(1u << idx), __ATOMIC_ACQ_REL);
-
-    portENTER_CRITICAL(&s_mux);
-    ++s_mailbox_refresh_claims;
-    s_mailbox_refresh_lines += lines;
-    s_mailbox_refresh_tiles += tiles;
-    s_mailbox_last_claim_max_seq = max_seq;
-    s_mailbox_last_claim_present_token = present_token;
-    portEXIT_CRITICAL(&s_mux);
     return true;
 }
 
@@ -499,7 +418,7 @@ static void harvest_pending_dirty_mailboxes(void)
 /* CPU0 lock-free ownership cut.  Both physical refresh and an opportunistic
  * rescue use the same one-word active_idx release-store.  CPU0 never waits for
  * a producer; if the destination bank is still pending, the cut is deferred. */
-static bool rotate_dirty_mailbox(uint64_t present_token, bool rescue)
+static bool rotate_dirty_mailbox(bool rescue)
 {
     harvest_pending_dirty_mailboxes();
 
@@ -512,13 +431,10 @@ static bool rotate_dirty_mailbox(uint64_t present_token, bool rescue)
         return false;
 
     if (__atomic_load_n(&s_dirty_mailbox_pending_mask, __ATOMIC_ACQUIRE) & (1u << new_idx)) {
-        (void)__atomic_add_fetch(&s_mailbox_swap_deferred, 1u, __ATOMIC_RELAXED);
         return false;
     }
 
     __atomic_store_n(&s_dirty_mailbox_active_idx, new_idx, __ATOMIC_RELEASE);
-    (void)__atomic_add_fetch(&s_mailbox_buffer_swaps, 1u, __ATOMIC_RELAXED);
-    s_dirty_mailbox_pending_token[old_idx] = present_token;
     (void)__atomic_fetch_or(&s_dirty_mailbox_pending_mask, (1u << old_idx), __ATOMIC_RELEASE);
 
     /* A successful ownership cut is also a render-admission sub-epoch.  This
@@ -527,7 +443,6 @@ static bool rotate_dirty_mailbox(uint64_t present_token, bool rescue)
     portENTER_CRITICAL(&s_mux);
     advance_mailbox_offer_epoch_locked();
     if (rescue) {
-        ++s_mailbox_rescue_swaps;
         ++s_mailbox_rescues_since_refresh;
     }
     portEXIT_CRITICAL(&s_mux);
@@ -539,9 +454,9 @@ static bool rotate_dirty_mailbox(uint64_t present_token, bool rescue)
 /* Physical refresh is the base ownership cut.  R57E11 permits up to fifteen
  * additional ownership cuts only when the current audio-reserve hint and CPU0
  * Screen load allow them; with the refresh cut this is at most sixteen cuts. */
-static void rotate_dirty_mailbox_after_refresh(uint64_t present_token)
+static void rotate_dirty_mailbox_after_refresh(void)
 {
-    (void)rotate_dirty_mailbox(present_token, false);
+    (void)rotate_dirty_mailbox(false);
     portENTER_CRITICAL(&s_mux);
     s_mailbox_rescues_since_refresh = 0u;
     portEXIT_CRITICAL(&s_mux);
@@ -571,16 +486,11 @@ static void maybe_rescue_dirty_mailbox(uint32_t results_drained)
     const uint32_t rescue_limit =
         __atomic_load_n(&s_mailbox_rescue_limit, __ATOMIC_ACQUIRE);
     portENTER_CRITICAL(&s_mux);
-    ++s_mailbox_rescue_attempts;
     budget_full = (s_mailbox_rescues_since_refresh >= rescue_limit);
     busy = s_reset_pending || s_geometry_reset_pending || !s_admission_open ||
            s_seal_requested || s_retry_debt_count != 0u ||
            s_pending_tickets > SCREEN_MAILBOX_RESCUE_PENDING_SOFT_MAX ||
            results_drained > SCREEN_MAILBOX_RESCUE_DRAIN_SOFT_MAX;
-    if (budget_full)
-        ++s_mailbox_rescue_skip_budget;
-    else if (busy)
-        ++s_mailbox_rescue_skip_busy;
     portEXIT_CRITICAL(&s_mux);
 
     /* Do NOT immediately retry a rejected edge.  New writes remain latest-wins
@@ -588,7 +498,7 @@ static void maybe_rescue_dirty_mailbox(uint32_t results_drained)
     if (budget_full || busy)
         return;
 
-    (void)rotate_dirty_mailbox(0u, true);
+    (void)rotate_dirty_mailbox(true);
 }
 
 static void reset_dirty_mailbox_locked(void)
@@ -637,7 +547,6 @@ static screen_record_t *record_create(uint64_t id, uint64_t present_token,
 {
     screen_record_t *r = &s_records[id % SCREEN_VERSION_RECORDS];
     if (r->id && r->state != SCREEN_REC_RETIRED && r->state != SCREEN_REC_DROPPED)
-        ++s_tasklog_record_collisions;
     memset(r, 0, sizeof(*r));
     r->id = id;
     r->present_token = present_token;
@@ -750,7 +659,6 @@ static void mark_retry_debt_locked(uint32_t y, uint64_t required_seq)
     }
     if (!s_retry_line[y]) {
         s_retry_line[y] = 1u;
-        ++s_retry_requests;
     }
     /* A genuine renderer failure is the only reason a line may be offered
      * again inside the same Screen generation. */
@@ -761,7 +669,6 @@ static void mark_retry_debt_locked(uint32_t y, uint64_t required_seq)
         s_admission_open = true;
         s_candidate_cutoff_seq = 0u;
         s_candidate_cutoff_guest_frame = 0u;
-        ++s_seal_aborts_retry;
     }
 }
 
@@ -777,12 +684,8 @@ static void cancel_ticket_now(uint64_t ticket, int stale)
          * receives only a line-retry message. */
         mark_retry_debt_locked(y, r->guest_seq);
         ticket_release_locked(r);
-        ++s_line_drops;
-        if (stale)
-            ++s_stale_results;
-    } else if (stale) {
-        ++s_stale_results;
     }
+    (void)stale;
     portEXIT_CRITICAL(&s_mux);
 }
 
@@ -846,7 +749,6 @@ static void commit_result(uint8_t idx, uint64_t ticket)
         tr = ticket_lookup_locked(ticket);
         if (tr) {
             ticket_release_locked(tr);
-            ++s_line_drops;
         }
         portEXIT_CRITICAL(&s_mux);
         return;
@@ -907,22 +809,14 @@ static void commit_result(uint8_t idx, uint64_t ticket)
             if (s_retry_debt_count)
                 --s_retry_debt_count;
         }
-        ++s_line_results;
         if (tile_mask)
             ++s_candidate_commits;
-        else
-            ++s_line_noops;
-    } else {
-        ++s_stale_results;
     }
     portEXIT_CRITICAL(&s_mux);
 }
 
 static void handle_display_complete(uint64_t present_token, int success)
 {
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-    if (success) ++s_r89_display_ok; else ++s_r89_display_fail;
-#endif
     uint64_t screen_id = 0u;
     uint64_t retired_id = 0u;
     bool known = false;
@@ -933,14 +827,11 @@ static void handle_display_complete(uint64_t present_token, int success)
     if (r && r->state == SCREEN_REC_READY) {
         known = true;
         screen_id = r->id;
-        ++s_present_completions;
         if (!success) {
             r->state = SCREEN_REC_DROPPED;
-            ++s_dropped_count;
         } else if (s_visible_id && r->id <= s_visible_id) {
             /* A late completion must never move display time backwards. */
             r->state = SCREEN_REC_RETIRED;
-            ++s_retired_count;
             out_of_order = true;
         } else {
             if (s_visible_id) {
@@ -948,11 +839,9 @@ static void handle_display_complete(uint64_t present_token, int success)
                 if (old && old->state == SCREEN_REC_VISIBLE)
                     old->state = SCREEN_REC_RETIRED;
                 retired_id = s_visible_id;
-                ++s_retired_count;
             }
             r->state = SCREEN_REC_VISIBLE;
             s_visible_id = r->id;
-            tab5_video_flow_set_visible_frontier(r->cutoff_seq);
             if ((r->video_epoch_min && r->video_epoch_max &&
                  r->video_epoch_min != r->video_epoch_max) ||
                 r->epoch_mismatch_lines || r->epoch_unknown_lines) {
@@ -967,23 +856,20 @@ static void handle_display_complete(uint64_t present_token, int success)
     portEXIT_CRITICAL(&s_mux);
 
     if (!known) {
-        ++s_tasklog_present_unknown;
         return;
     }
 
     if (!success) {
-        ++s_tasklog_present_rejected;
         return;
     }
     if (out_of_order) {
-        ++s_tasklog_present_out_of_order;
         return;
     }
 
     /* R57E6: CPU0 harvests the latest-wins dirty mailbox only at successful
      * physical refresh completion.  This clears notification bits, never guest
      * VRAM/TVRAM data and never blocks CPU1. */
-    rotate_dirty_mailbox_after_refresh(present_token);
+    rotate_dirty_mailbox_after_refresh();
     (void)screen_id;
     (void)retired_id;
 }
@@ -1012,7 +898,6 @@ static void process_reset(void)
     s_candidate_cutoff_guest_frame = 0u;
     s_candidate_commits = 0u;
     reset_candidate_epoch_diag_locked();
-    ++s_dropped_count;
     portEXIT_CRITICAL(&s_mux);
 
     /* Old renderer jobs carry an invalidated generation/ticket and can finish
@@ -1069,7 +954,6 @@ static void process_geometry_reset(void)
     s_height = new_h;
     s_pitch = new_pitch;
     reset_fairness_locked();
-    ++s_dropped_count;
     portEXIT_CRITICAL(&s_mux);
 
     /* No ScreenVersion owns this memory yet.  Screen Manager is the sole writer
@@ -1100,7 +984,6 @@ static void advance_candidate_without_present(const char *reason)
     portENTER_CRITICAL(&s_mux);
     old_id = s_candidate_id;
     cutoff = s_candidate_cutoff_seq;
-    ++s_dropped_count;
     s_seal_requested = false;
     s_generation = next_generation(s_generation);
     advance_mailbox_offer_epoch_locked();
@@ -1138,25 +1021,13 @@ static void try_seal_and_submit(void)
 
     portENTER_CRITICAL(&s_mux);
     if (!s_seal_requested) { portEXIT_CRITICAL(&s_mux); return; }
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-    ++s_r89_seal_tries;
-#endif
     if (s_geometry_reset_pending || s_reset_pending) {
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-        ++s_r89_seal_block_reset;
-#endif
         portEXIT_CRITICAL(&s_mux); return;
     }
     if (s_pending_tickets != 0u) {
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-        ++s_r89_seal_block_pending;
-#endif
         portEXIT_CRITICAL(&s_mux); return;
     }
     if (s_retry_debt_count != 0u) {
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-        ++s_r89_seal_block_retry;
-#endif
         portEXIT_CRITICAL(&s_mux); return;
     }
 
@@ -1206,9 +1077,6 @@ static void try_seal_and_submit(void)
     }
 
     if (seal_epoch_bad) {
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-        ++s_r89_seal_epoch_drop;
-#endif
         portEXIT_CRITICAL(&s_mux);
         /* Do not submit stale/mixed pixels.  This is NOT a wait/fence on CPU1:
          * advance_candidate_without_present() rotates the logical offer epoch
@@ -1224,9 +1092,6 @@ static void try_seal_and_submit(void)
      * transition semantically without forcing a redundant LCD transaction. */
     const bool no_change = (commits == 0u && s_visible_id != 0u);
     if (no_change) {
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-        ++s_r89_seal_nochange;
-#endif
         if (seal_transition_observed && s_epoch_transition_pending &&
             s_epoch_transition_target == seal_transition_target)
             s_epoch_transition_pending = 0u;
@@ -1241,18 +1106,11 @@ static void try_seal_and_submit(void)
 
     /* admission is closed and pending==0, so s_work is immutable for the
      * duration of this presenter snapshot copy. */
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-    ++s_r89_presenter_calls;
-#endif
     if (!tab5_video_present_px68k_managed(s_work, w, h,
                                           SCREEN_BACKING_PITCH,
                                           s_candidate_dirty_tiles,
                                           present_token)) {
         portENTER_CRITICAL(&s_mux);
-        ++s_present_backpressure;
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-        ++s_r89_presenter_rejects;
-#endif
         portEXIT_CRITICAL(&s_mux);
         return;
     }
@@ -1268,9 +1126,6 @@ static void try_seal_and_submit(void)
         s_epoch_transition_target == seal_transition_target) {
         s_epoch_transition_pending = 0u;
     }
-    ++s_ready_count;
-    ++s_present_submits;
-
     /* The immutable pixels and exact dirty map now live in the presenter slot.
      * Start a new delta map relative to that queued snapshot. */
     if (s_candidate_dirty_tiles)
@@ -1327,7 +1182,6 @@ static int commit_flow_line(const tab5_video_flow_line_t *m, const uint16_t *pix
         return 0;
     }
     if (m->render_seq <= already) {
-        ++s_flow_ingest_stale;
         return 1;
     }
 
@@ -1391,15 +1245,10 @@ static int commit_flow_line(const tab5_video_flow_line_t *m, const uint16_t *pix
         if (m->visual_seq > s_candidate_visual_seq_max)
             s_candidate_visual_seq_max = m->visual_seq;
     }
-    ++s_line_results;
     if (tile_mask)
         ++s_candidate_commits;
-    else
-        ++s_line_noops;
-    ++s_flow_ingest_commits;
     portEXIT_CRITICAL(&s_mux);
 
-    tab5_video_flow_set_screen_commit_frontier(m->render_seq);
     return 1;
 }
 
@@ -1423,14 +1272,12 @@ static void commit_cpu0_flow_slot(uint8_t idx)
 
     if (!m.render_seq || m.y >= SCREEN_MAX_HEIGHT || !m.width ||
         m.width > SCREEN_MAX_WIDTH) {
-        ++s_flow_ingest_stale;
         return;
     }
 
     /* If CPU1 has already published an equal/newer exact line, this async CPU0
      * completion is obsolete even if CPU0 Screen ingress has not copied it yet. */
     if (m.render_seq <= tab5_video_flow_cpu1_line_seq(m.y)) {
-        ++s_flow_ingest_stale;
         return;
     }
 
@@ -1447,7 +1294,6 @@ static void commit_cpu0_flow_slot(uint8_t idx)
     portEXIT_CRITICAL(&s_mux);
 
     if (geom_busy) {
-        ++s_flow_ingest_stale;
         return;
     }
     (void)commit_flow_line(&m, slot->pixels, 0);
@@ -1482,7 +1328,6 @@ static uint32_t ingest_video_flow(uint32_t budget)
             const int rc = tab5_video_flow_snapshot_latest(
                 y, s_flow_scratch, SCREEN_MAX_WIDTH, &meta);
             if (rc == 0) {
-                ++s_flow_ingest_race;
                 tab5_video_flow_requeue_line(y);
             } else if (rc > 0) {
                 (void)commit_flow_line(&meta, s_flow_scratch, 1);
@@ -1526,9 +1371,6 @@ static void consume_nowait_frame_request(void)
         return;
     const uint32_t delta = serial - s_nw_frame_seen;
     s_nw_frame_seen = serial;
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-    s_r89_frame_consumed += delta ? delta : 1u;
-#endif
     const uint32_t width = __atomic_load_n(&s_nw_frame_width, __ATOMIC_RELAXED);
     const uint32_t height = __atomic_load_n(&s_nw_frame_height, __ATOMIC_RELAXED);
     const uint32_t pitch = __atomic_load_n(&s_nw_frame_pitch, __ATOMIC_RELAXED);
@@ -1572,7 +1414,6 @@ static void consume_nowait_frame_request(void)
             clear_deferred_locked();
             changed = true;
         } else {
-            ++s_geometry_duplicate_suppressed;
         }
     }
     portEXIT_CRITICAL(&s_mux);
@@ -1592,9 +1433,6 @@ static void consume_nowait_present_request(void)
     if (serial == s_nw_present_seen)
         return;
     s_nw_present_seen = serial;
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-    ++s_r89_present_consumed;
-#endif
     uint64_t cutoff = __atomic_load_n(&s_nw_present_cutoff, __ATOMIC_ACQUIRE);
     bool armed = false;
 
@@ -1607,28 +1445,23 @@ static void consume_nowait_present_request(void)
         s_candidate_cutoff_seq = cutoff;
         s_candidate_cutoff_guest_frame = s_guest_frame;
         armed = true;
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-        ++s_r89_seal_armed;
-#endif
     }
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-    if (!armed) ++s_r89_seal_arm_rejected;
-#endif
     portEXIT_CRITICAL(&s_mux);
     (void)armed;
 }
 
+/* PX68K_FLOW_R57E113P
+ * Production Turbo latest-wins Screen ingress cadence.
+ * N/A: existing continuous 64-line behavior unchanged.
+ * Turbo: one latest-wins ingress/seal opportunity per 22222us (~45Hz).
+ */
+/* PX68K_FLOW_R57E118: upstream host visual source is now hard-capped at
+ * N/A15/Turbo30. Screen consumes it immediately; a second timer would only
+ * add phase latency. */
+#define PX68K_FLOW_R57E118 1
+
 static void screen_task(void *arg)
 {
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-    {
-        const uintptr_t r56k5_base = (uintptr_t)pxTaskGetStackStart(NULL);
-        esp_rom_printf("R56K5_TASKSELF name=px68k_screen core=%d base=0x%08x top=0x%08x bytes=4096 hwm=%u\n",
-                       (int)xPortGetCoreID(), (unsigned)r56k5_base,
-                       (unsigned)(r56k5_base + 4096u),
-                       (unsigned)uxTaskGetStackHighWaterMark(NULL));
-    }
-#endif
     (void)arg;
 
     /* R56k host scheduler contract:
@@ -1638,12 +1471,6 @@ static void screen_task(void *arg)
      * that pass may an equal-priority host worker run.  If no producer has
      * posted more work, the notification wait blocks indefinitely. */
     for (;;) {
-        /* LPFAB_R3: CPU0 consumes the LP-classified DIRTY union as transport
-         * metadata only. BAT145 deliberately does not gate rendering, mutate
-         * ScreenVersion state, or replace the proven R57 exact shadow path. */
-        tab5_lp_dirty_workset_t lp_dirty_workset;
-        (void)tab5_lp_broker_dirty_take(&lp_dirty_workset);
-
         /* BAT177NW1 P0: consume CPU1 facts from one-way atomic mailboxes.
          * These helpers run on CPU0, so all Screen ownership mutation stays
          * on this core. CPU1 never takes s_mux. */
@@ -1652,9 +1479,8 @@ static void screen_task(void *arg)
         process_reset();
         process_geometry_reset();
 
-        /* Latest-wins logical/final lines.  A bounded CPU0 copy budget keeps
-         * audio/YM peers schedulable; CPU1 never sees or waits for this lag. */
-        const uint32_t flow_drained = ingest_video_flow(64u);
+        /* R57E118: capped source -> immediate event-driven latest-wins drain. */
+        const uint32_t flow_drained = ingest_video_flow(SCREEN_MAX_HEIGHT);
 
         /* R57E8 legacy dirty metadata can remain for diagnostics/other host
          * producers, but CPU1 exact video no longer depends on it. */
@@ -1689,19 +1515,23 @@ static void screen_task(void *arg)
         /* R57E9 legacy rescue remains CPU0-only. */
         maybe_rescue_dirty_mailbox(drained + flow_drained);
 
-        /* CPU1 present is only a one-way opportunity serial. Arm/consume it on
-         * CPU0 after current line ingress, then seal without any guest reply. */
-        consume_nowait_present_request();
-        try_seal_and_submit();
+        /* R57E113P: present/seal follows the same Turbo coalescing boundary. */
+        /* PX68K_FLOW_R57E118_X1: R113P/R117 cadence is retired.
+         * R118 Screen is event/source-driven from the upstream N/A15/Turbo30
+         * host-visual gate, so present-serial consumption and seal submission
+         * run immediately after ingress.  Both helpers are already conditional
+         * on their own state and do not create extra LCD work. */
+        {
+            consume_nowait_present_request();
+            try_seal_and_submit();
+        }
 
         /* Complete management-pass boundary.  taskYIELD() rotates only among
          * READY tasks of this same priority; it injects no fixed 10-ms gap. */
         taskYIELD();
         /* BAT177NW1: if bounded latest-wins ingress left work behind, CPU0
          * immediately schedules another pass. No CPU1 retry/kick is needed. */
-        tab5_video_flow_stats_t flow_after = {0};
-        tab5_video_flow_get_stats(&flow_after);
-        if (flow_after.dirty_lines != 0u)
+        if (tab5_video_flow_dirty_lines() != 0u)
             continue;
         (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
     }
@@ -1814,8 +1644,6 @@ int tab5_screen_manager_init(void)
     __atomic_store_n(&s_audio_reserve_frames, 0u, __ATOMIC_RELEASE);
     __atomic_store_n(&s_audio_submitted_frames, 0u, __ATOMIC_RELEASE);
     __atomic_store_n(&s_mailbox_rescue_limit, 3u, __ATOMIC_RELEASE);
-    s_dirty_mailbox_pending_token[0] = 0u;
-    s_dirty_mailbox_pending_token[1] = 0u;
 
     s_result_free_q = xQueueCreate(SCREEN_RESULT_SLOTS, sizeof(uint8_t));
     s_result_q = xQueueCreate(SCREEN_RESULT_QUEUE_DEPTH, sizeof(result_msg_t));
@@ -1905,23 +1733,18 @@ int tab5_screen_video_line_latch_state(uint32_t y, uint32_t width,
     }
     const bool offer_new = (s_line_offer_epoch[y] != observed_offer_epoch);
     s_guest_seq = next_nonzero_u64(s_guest_seq);
-    ++s_line_latches;
     const uint64_t dirty_seq = s_guest_seq;
     portEXIT_CRITICAL(&s_mux);
 
     const bool mailbox_new = post_dirty_mailbox_latest(y, dirty_mask, dirty_seq);
 
     portENTER_CRITICAL(&s_mux);
-    ++s_mailbox_posts;
     if (!mailbox_new)
-        ++s_mailbox_duplicate_posts;
-
     /* Geometry/reset may have changed generation while CPU1 was publishing the
      * lock-free PSRAM notification.  The dirty stays safely recorded in the
      * latest bank, but an offer observed in the old generation is not admitted. */
     if (s_generation != observed_generation || s_reset_pending ||
         s_geometry_reset_pending) {
-        ++s_mailbox_offer_suppressed;
         portEXIT_CRITICAL(&s_mux);
         return 0;
     }
@@ -1929,7 +1752,6 @@ int tab5_screen_video_line_latch_state(uint32_t y, uint32_t width,
     if (!offer_new) {
         /* Same rescue epoch: keep only the latest mailbox state/order.  CPU0
          * may open another offer epoch later if it has spare work capacity. */
-        ++s_mailbox_offer_suppressed;
         portEXIT_CRITICAL(&s_mux);
         return 0;
     }
@@ -1942,11 +1764,9 @@ int tab5_screen_video_line_latch_state(uint32_t y, uint32_t width,
     if (s_fair_frame_seen != s_guest_frame) {
         if (!s_fair_capacity_hit && s_fair_cursor != 0u) {
             s_fair_cursor = 0u;
-            ++s_fair_wraps;
         }
         if (s_fair_cursor >= s_height) {
             s_fair_cursor = 0u;
-            ++s_fair_wraps;
         }
         s_fair_frame_seen = s_guest_frame;
         s_fair_capacity_hit = false;
@@ -1956,13 +1776,10 @@ int tab5_screen_video_line_latch_state(uint32_t y, uint32_t width,
         !s_reset_pending) {
         if (s_fair_cursor != 0u && y < s_fair_cursor) {
             mark_deferred_locked(y); /* diagnostic carry-over only */
-            ++s_admission_deferred_fair;
         } else if (s_line_ticket[y] != 0u) {
             mark_deferred_locked(y); /* normally prevented by offer_epoch */
-            ++s_admission_deferred_same_line;
         } else if (s_pending_tickets >= SCREEN_MAX_INFLIGHT) {
             mark_deferred_locked(y); /* next ScreenVersion will retry latest state */
-            ++s_admission_deferred_capacity;
             if (!s_fair_capacity_hit) {
                 s_fair_cursor = y;
                 s_fair_capacity_hit = true;
@@ -1989,7 +1806,6 @@ int tab5_screen_video_line_latch_state(uint32_t y, uint32_t width,
                 accepted = true;
             } else {
                 mark_retry_debt_locked(y, s_guest_seq);
-                ++s_line_drops;
             }
         }
     }
@@ -2149,40 +1965,20 @@ void tab5_screen_video_frame_boundary(uint32_t width, uint32_t height,
     __atomic_store_n(&s_nw_frame_width, width, __ATOMIC_RELAXED);
     __atomic_store_n(&s_nw_frame_height, height, __ATOMIC_RELAXED);
     __atomic_store_n(&s_nw_frame_pitch, pitch, __ATOMIC_RELAXED);
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-    __atomic_add_fetch(&s_r89_frame_requests, 1u, __ATOMIC_RELAXED);
-#endif
     __atomic_add_fetch(&s_nw_frame_serial, 1u, __ATOMIC_RELEASE);
     queue_wake();
 }
 
-void tab5_screen_manager_audio_reserve_hint(uint32_t queued_frames,
-                                           uint32_t speaker_queued_frames,
-                                           uint32_t submitted_frames)
+void tab5_screen_manager_production_reserve_hint(uint32_t reserve,
+                                                   uint32_t submitted_frames)
 {
-    uint32_t reserve = queued_frames;
-    if (UINT32_MAX - reserve < speaker_queued_frames)
-        reserve = UINT32_MAX;
-    else
-        reserve += speaker_queued_frames;
-
+    /* P12R1 Standard12: one conservative rescue policy.  This is a CPU0
+     * presentation hint only and never stalls or retimes guest CPU/device time. */
     uint32_t limit;
-    if (tab5_video_turbo_enabled()) {
-        /* R57E97T Turbo30: explicitly favor screen freshness.  Keep only a
-         * true near-empty safety cliff; otherwise allow the full latest-wins
-         * rescue budget.  Audio buffers are unchanged. */
-        if (submitted_frames < 4096u)
-            limit = SCREEN_MAILBOX_RESCUES_PER_REFRESH_MAX;
-        else if (reserve < 512u)
-            limit = 0u;
-        else if (reserve < 1024u)
-            limit = 3u;
-        else
-            limit = SCREEN_MAILBOX_RESCUES_PER_REFRESH_MAX;
-    } else if (submitted_frames < 4096u)
-        limit = 3u;                 /* startup: responsive, but conservative */
+    if (submitted_frames < 4096u)
+        limit = 3u;
     else if (reserve < 384u)
-        limit = 0u;                 /* R57E75: true audio cliff */
+        limit = 0u;
     else if (reserve < 1024u)
         limit = 1u;
     else if (reserve < 2304u)
@@ -2201,9 +1997,6 @@ void tab5_screen_present_opportunity(void)
 {
     if (!s_ready)
         return;
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-    __atomic_add_fetch(&s_r89_present_opportunities, 1u, __ATOMIC_RELAXED);
-#endif
     __atomic_store_n(&s_nw_present_cutoff,
                      tab5_video_flow_guest_frontier(), __ATOMIC_RELAXED);
     __atomic_add_fetch(&s_nw_present_serial, 1u, __ATOMIC_RELEASE);
@@ -2249,7 +2042,6 @@ int tab5_screen_take_emulator_retry_line(uint32_t *y)
             s_retry_line[i] = 0u;
             s_retry_cursor = (i + 1u) % SCREEN_MAX_HEIGHT;
             *y = i;
-            ++s_retry_delivered;
             found = 1;
             break;
         }
@@ -2263,177 +2055,3 @@ const uint16_t *tab5_screen_readonly_work_buffer(void)
     return s_work;
 }
 
-void tab5_screen_r57e89_get_stats(tab5_screen_r57e89_stats_t *o)
-{
-    if (!o)
-        return;
-
-    memset(o, 0, sizeof(*o));
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-    o->frame_requests = __atomic_load_n(&s_r89_frame_requests, __ATOMIC_RELAXED);
-    o->frame_consumed = s_r89_frame_consumed;
-    o->present_opportunities = __atomic_load_n(&s_r89_present_opportunities, __ATOMIC_RELAXED);
-    o->present_consumed = s_r89_present_consumed;
-    o->seal_armed = s_r89_seal_armed;
-    o->seal_arm_rejected = s_r89_seal_arm_rejected;
-    o->seal_tries = s_r89_seal_tries;
-    o->seal_block_pending = s_r89_seal_block_pending;
-    o->seal_block_retry = s_r89_seal_block_retry;
-    o->seal_block_reset = s_r89_seal_block_reset;
-    o->seal_nochange = s_r89_seal_nochange;
-    o->seal_epoch_drop = s_r89_seal_epoch_drop;
-    o->presenter_calls = s_r89_presenter_calls;
-    o->presenter_rejects = s_r89_presenter_rejects;
-    o->display_ok = s_r89_display_ok;
-    o->display_fail = s_r89_display_fail;
-    o->mailbox_posts = s_mailbox_posts;
-    o->mailbox_duplicates = s_mailbox_duplicate_posts;
-    o->mailbox_offer_suppressed = s_mailbox_offer_suppressed;
-    o->mailbox_claims = s_mailbox_refresh_claims;
-    o->mailbox_swaps = s_mailbox_buffer_swaps;
-    o->mailbox_edges = s_mailbox_edge_wakes;
-    o->rescue_try = s_mailbox_rescue_attempts;
-    o->rescue_ok = s_mailbox_rescue_swaps;
-    o->rescue_busy = s_mailbox_rescue_skip_busy;
-    o->rescue_budget = s_mailbox_rescue_skip_budget;
-    o->pending_tickets = s_pending_tickets;
-    o->retry_debt = s_retry_debt_count;
-    o->seal_requested = s_seal_requested ? 1u : 0u;
-    o->admission_open = s_admission_open ? 1u : 0u;
-#endif
-}
-
-
-void tab5_screen_manager_get_stats(tab5_screen_manager_stats_t *out)
-{
-    if (!out)
-        return;
-    memset(out, 0, sizeof(*out));
-    out->guest_seq = s_guest_seq;
-    out->guest_frame = s_guest_frame;
-    out->candidate_id = s_candidate_id;
-    out->visible_id = s_visible_id;
-    out->ready_count = s_ready_count;
-    out->retired_count = s_retired_count;
-    out->dropped_count = s_dropped_count;
-    out->line_latches = s_line_latches;
-    out->line_results = s_line_results;
-    out->line_noops = s_line_noops;
-    out->line_drops = s_line_drops;
-    out->retry_requests = s_retry_requests;
-    out->retry_delivered = s_retry_delivered;
-    out->seal_deferred_retry = s_seal_deferred_retry;
-    out->seal_aborts_retry = s_seal_aborts_retry;
-    out->stale_results = s_stale_results;
-    out->present_submits = s_present_submits;
-    out->present_completions = s_present_completions;
-    out->present_backpressure = s_present_backpressure;
-    out->admission_deferred_capacity = s_admission_deferred_capacity;
-    out->admission_deferred_same_line = s_admission_deferred_same_line;
-    out->geometry_duplicate_suppressed = s_geometry_duplicate_suppressed;
-    out->tasklog_record_collisions = s_tasklog_record_collisions;
-    out->tasklog_present_unknown = s_tasklog_present_unknown;
-    out->tasklog_present_rejected = s_tasklog_present_rejected;
-    out->tasklog_present_out_of_order = s_tasklog_present_out_of_order;
-    out->admission_deferred_fair = s_admission_deferred_fair;
-    out->fair_wraps = s_fair_wraps;
-    out->mailbox_posts = s_mailbox_posts;
-    out->mailbox_duplicate_posts = s_mailbox_duplicate_posts;
-    out->mailbox_offer_suppressed = s_mailbox_offer_suppressed;
-    out->mailbox_refresh_claims = s_mailbox_refresh_claims;
-    out->mailbox_refresh_lines = s_mailbox_refresh_lines;
-    out->mailbox_refresh_tiles = s_mailbox_refresh_tiles;
-    out->mailbox_last_claim_max_seq = s_mailbox_last_claim_max_seq;
-    out->mailbox_last_claim_present_token = s_mailbox_last_claim_present_token;
-    out->mailbox_buffer_swaps = __atomic_load_n(&s_mailbox_buffer_swaps, __ATOMIC_RELAXED);
-    out->mailbox_swap_deferred = __atomic_load_n(&s_mailbox_swap_deferred, __ATOMIC_RELAXED);
-    out->mailbox_writer_retries = __atomic_load_n(&s_mailbox_writer_retries, __ATOMIC_RELAXED);
-    out->mailbox_rescue_attempts = s_mailbox_rescue_attempts;
-    out->mailbox_rescue_swaps = s_mailbox_rescue_swaps;
-    out->mailbox_rescue_skip_busy = s_mailbox_rescue_skip_busy;
-    out->mailbox_rescue_skip_budget = s_mailbox_rescue_skip_budget;
-    out->mailbox_edge_wakes = __atomic_load_n(&s_mailbox_edge_wakes, __ATOMIC_RELAXED);
-    out->mailbox_rescue_limit = __atomic_load_n(&s_mailbox_rescue_limit, __ATOMIC_ACQUIRE);
-    out->audio_reserve_frames = __atomic_load_n(&s_audio_reserve_frames, __ATOMIC_ACQUIRE);
-    out->mailbox_offer_epoch = s_mailbox_offer_epoch;
-    out->mailbox_rescues_since_refresh = s_mailbox_rescues_since_refresh;
-    out->mailbox_active_index = __atomic_load_n(&s_dirty_mailbox_active_idx, __ATOMIC_ACQUIRE) & 1u;
-    out->mailbox_pending_mask = __atomic_load_n(&s_dirty_mailbox_pending_mask, __ATOMIC_ACQUIRE);
-    out->mailbox_inflight0 = __atomic_load_n(&s_dirty_mailbox_writer_inflight[0], __ATOMIC_ACQUIRE);
-    out->mailbox_inflight1 = __atomic_load_n(&s_dirty_mailbox_writer_inflight[1], __ATOMIC_ACQUIRE);
-    out->render_generation = s_generation;
-    out->pending_tickets = s_pending_tickets;
-    out->retry_debt = s_retry_debt_count;
-    out->deferred_lines = s_deferred_count;
-    out->max_inflight = SCREEN_MAX_INFLIGHT;
-    out->admission_open = s_admission_open ? 1u : 0u;
-    out->seal_requested = s_seal_requested ? 1u : 0u;
-    out->geometry_reset_pending = s_geometry_reset_pending ? 1u : 0u;
-    out->candidate_video_epoch_min = s_candidate_video_epoch_min;
-    out->candidate_video_epoch_max = s_candidate_video_epoch_max;
-    out->candidate_visual_seq_min = s_candidate_visual_seq_min;
-    out->candidate_visual_seq_max = s_candidate_visual_seq_max;
-
-    /* BAT173E1: all expensive line-tag inspection moved to the actual seal
-     * boundary after a hard transition.  Public stats only copy counters. */
-    out->epoch_transitions = s_epoch_transitions;
-    out->epoch_mixed_commits = s_epoch_mixed_commits;
-    out->epoch_transition_pending = s_epoch_transition_pending ? 1u : 0u;
-    out->epoch_transition_target = s_epoch_transition_target;
-    out->epoch_transition_seals = s_epoch_transition_seals;
-    out->epoch_transition_bad_seals = s_epoch_transition_bad_seals;
-    out->epoch_transition_bad_visible = s_epoch_transition_bad_visible;
-    out->epoch_quarantine_drops = s_epoch_quarantine_drops;
-    out->epoch_quarantine_coherent_seals = s_epoch_quarantine_coherent_seals;
-    out->epoch_last_transition_seal_id = s_epoch_last_transition_seal_id;
-    out->epoch_last_transition_seal_min = s_epoch_last_transition_seal_min;
-    out->epoch_last_transition_seal_max = s_epoch_last_transition_seal_max;
-    out->epoch_last_transition_seal_epoch = s_epoch_last_transition_seal_epoch;
-    out->epoch_last_transition_mismatch_lines = s_epoch_last_transition_mismatch_lines;
-    out->epoch_last_transition_unknown_lines = s_epoch_last_transition_unknown_lines;
-    out->epoch_last_bad_visible_id = s_epoch_last_bad_visible_id;
-    out->epoch_last_bad_visible_epoch = s_epoch_last_bad_visible_epoch;
-    out->epoch_last_bad_visible_mismatch_lines = s_epoch_last_bad_visible_mismatch_lines;
-    out->epoch_last_bad_visible_unknown_lines = s_epoch_last_bad_visible_unknown_lines;
-
-    /* BAT144: diagnostic only.  A full 32-ticket window should normally be
-     * transient.  Scan the PSRAM ticket table only in that exceptional state
-     * (the public stats call itself is only every 600 guest frames), so normal
-     * runtime cost remains unchanged.  This tells us whether a renderer has
-     * stopped returning tickets or the Screen Manager result queue is stuck. */
-    if (s_pending_tickets >= SCREEN_MAX_INFLIGHT && s_tickets) {
-        uint64_t oldest_ticket = 0u;
-        uint64_t oldest_seq = 0u;
-        uint32_t oldest_y = 0xffffffffu;
-        for (uint32_t i = 0u; i < SCREEN_TICKET_RECORDS; ++i) {
-            const render_ticket_record_t *tr = &s_tickets[i];
-            if (!tr->active)
-                continue;
-            if (!oldest_seq || tr->guest_seq < oldest_seq) {
-                oldest_ticket = tr->ticket;
-                oldest_seq = tr->guest_seq;
-                oldest_y = tr->y;
-            }
-        }
-        out->oldest_pending_ticket = oldest_ticket;
-        out->oldest_pending_guest_seq = oldest_seq;
-        out->oldest_pending_age_seq =
-            (oldest_seq && s_guest_seq >= oldest_seq) ? (s_guest_seq - oldest_seq) : 0u;
-        out->oldest_pending_y = oldest_y;
-    } else {
-        out->oldest_pending_y = 0xffffffffu;
-    }
-    out->width = s_width;
-    out->height = s_height;
-    out->pitch = SCREEN_BACKING_PITCH;
-
-    /* FreeRTOS queue-depth reads are diagnostic snapshots and do not alter
-     * producer/consumer ownership. */
-    out->result_q_depth = s_result_q ? (uint32_t)uxQueueMessagesWaiting(s_result_q) : 0u;
-    out->result_free_depth = s_result_free_q ? (uint32_t)uxQueueMessagesWaiting(s_result_free_q) : 0u;
-}
-
-uint32_t tab5_screen_manager_stack_highwater(void)
-{
-    return s_task ? (uint32_t)uxTaskGetStackHighWaterMark(s_task) : 0u;
-}

@@ -95,28 +95,7 @@ static DRAM_ATTR int8_t s_lfo_pm[4][256];
 static DRAM_ATTR uint8_t s_lfo_am[4][256];
 static DRAM_ATTR int s_tables_ready = 0;
 
-#ifndef PX68K_TAB5_RELEASE_DIAGNOSTICS
-#define PX68K_TAB5_RELEASE_DIAGNOSTICS 0
-#endif
-
-/* R57E13E/BAT156: cold operator-semantic sampler on the LP-safe BAT154
- * synthesis graph.  BAT155's zero-mod specialization is deliberately absent.
- * No cycle counter and no hot-path duplication: one state snapshot per 64
- * render calls, outside the output-frame loop.  The sampler itself stays in
- * flash so diagnostic code does not consume scarce Internal/IRAM space. */
-typedef struct {
-    uint32_t render_calls;
-    uint32_t samples;
-    uint32_t active_ch_sum;
-    uint32_t active_op_sum;
-    uint32_t audible_op_sum;
-    uint32_t phase_only_op_sum;
-    uint32_t fb_zero_ch_sum;
-    uint32_t noise_samples;
-    uint32_t zero_mod_samples;
-    uint32_t algo_ch_sum[8];
-} ym_semantic_stats_t;
-static DRAM_ATTR volatile ym_semantic_stats_t s_semantic = {};
+/* Production clean: historical YM semantic profiler storage removed. */
 
 /*
  * Build 5.42: these are touched for every active channel of every 44.1 kHz
@@ -452,7 +431,8 @@ static IRAM_ATTR __attribute__((noinline,optimize("O3"))) void synth(VgmM5YM2151
 
 static IRAM_ATTR __attribute__((always_inline,optimize("O3"))) inline void tick(VgmM5YM2151 *e,int32_t *ol,int32_t *orr)
 {
-    if((e->output_tick_counter++&3u)==0u)update_envelopes(e);
+    const uint32_t r120a_env_mask=(e->sample_rate <= 11025u) ? 0u : ((e->sample_rate <= 22050u) ? 1u : 3u);
+    if((e->output_tick_counter++&r120a_env_mask)==0u)update_envelopes(e);
     if(e->noise_enable) {
         e->noise_phase+=e->noise_step;
         if(!e->noise_step)e->noise_step=0x00400000u;
@@ -532,7 +512,7 @@ extern "C" VgmM5YM2151 *vgmm5_ym2151_create(uint32_t clock,uint32_t sr)
 #else
     VgmM5YM2151 *e=(VgmM5YM2151*)calloc(1,sizeof(VgmM5YM2151));
 #endif
-    if(e){ memset((void*)&s_semantic,0,sizeof(s_semantic)); init_state(e,clock,sr,16384); }
+    if(e) init_state(e,clock,sr,16384);
     return e;
 }
 extern "C" void vgmm5_ym2151_destroy(VgmM5YM2151 *e){if(!e)return;
@@ -542,7 +522,22 @@ extern "C" void vgmm5_ym2151_destroy(VgmM5YM2151 *e){if(!e)return;
     free(e);
 #endif
 }
-extern "C" void vgmm5_ym2151_reset(VgmM5YM2151 *e){if(!e)return;uint32_t c=e->clock,s=e->sample_rate;int32_t v=e->volume_q14;memset((void*)&s_semantic,0,sizeof(s_semantic));init_state(e,c,s,v);}
+extern "C" void vgmm5_ym2151_set_sample_rate(VgmM5YM2151 *e,uint32_t sr)
+{
+    if(!e)return;
+    sr=(sr <= 11025u) ? 11025u : ((sr <= 22050u) ? 22050u : 44100u);
+    const uint32_t old=e->sample_rate?e->sample_rate:44100u;
+    if(old==sr)return;
+#define R120A_SCALE_U32(x) ((uint32_t)((((uint64_t)(x))*old + (sr/2u))/sr))
+    e->phase_step_factor *= (float)old/(float)sr;
+    for(int n=0;n<=12;n++)for(int k=0;k<64;k++)e->freq_tab[n][k]=R120A_SCALE_U32(e->freq_tab[n][k]);
+    for(int i=0;i<YM_OPS;i++)e->ops[i].phase_step=R120A_SCALE_U32(e->ops[i].phase_step);
+    e->lfo_step=R120A_SCALE_U32(e->lfo_step);
+    e->noise_step=R120A_SCALE_U32(e->noise_step);
+    e->sample_rate=sr;
+#undef R120A_SCALE_U32
+}
+extern "C" void vgmm5_ym2151_reset(VgmM5YM2151 *e){if(!e)return;uint32_t c=e->clock,s=e->sample_rate;int32_t v=e->volume_q14;init_state(e,c,s,v);}
 extern "C" void vgmm5_ym2151_set_px_volume(VgmM5YM2151 *e,uint8_t vol){if(!e)return;int v=vol?((16-(int)vol)*4):192;if(v>=192)e->volume_q14=0;else e->volume_q14=(int32_t)(16384.0f*powf(10.0f,-(float)v/40.0f));}
 
 extern "C" void vgmm5_ym2151_write(VgmM5YM2151 *e,uint8_t a,uint8_t d)
@@ -579,44 +574,9 @@ extern "C" void vgmm5_ym2151_csm_pulse(VgmM5YM2151 *e)
     }
 }
 
-static __attribute__((noinline,optimize("Os"))) void semantic_sample(VgmM5YM2151 *e)
-{
-    const uint8_t active=e->active_ch_mask;
-    uint32_t chn=0, ops=0, audible=0, phase_only=0, fb0=0;
-    const int32_t gam=e->cached_am;
-    for(int ch=0;ch<YM_CH;ch++) {
-        const uint8_t bit=(uint8_t)(1u<<ch);
-        if((active&bit)==0) continue;
-        chn++;
-        s_semantic.algo_ch_sum[e->algo[ch]&7u]++;
-        fb0 += (e->fb_rshift[ch]==0);
-        const int32_t am=(gam * e->am_scale[ch]) >> 2;
-        const YMOp *p=&e->ops[ch*4];
-        for(int o=0;o<4;o++) {
-            if(p[o].env_state==EG_OFF) continue;
-            ops++;
-            int32_t atten=(p[o].env_level>>EG_FRACTION_BITS)+p[o].tl_atten;
-            if(p[o].am_enable && am) atten+=am;
-            if(atten>=3840) phase_only++; else audible++;
-        }
-    }
-    s_semantic.samples++;
-    s_semantic.active_ch_sum+=chn;
-    s_semantic.active_op_sum+=ops;
-    s_semantic.audible_op_sum+=audible;
-    s_semantic.phase_only_op_sum+=phase_only;
-    s_semantic.fb_zero_ch_sum+=fb0;
-    s_semantic.noise_samples+=(e->noise_enable!=0);
-    s_semantic.zero_mod_samples+=((e->cached_pm|e->cached_am)==0);
-}
-
 extern "C" IRAM_ATTR __attribute__((noinline,optimize("O3"))) void vgmm5_ym2151_render(VgmM5YM2151 *e,int16_t *dst,uint32_t frames)
 {
     if(!e||!dst)return;
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-    const uint32_t sem_call=++s_semantic.render_calls;
-    if((sem_call&63u)==0u) semantic_sample(e);
-#endif
     int32_t vol=e->volume_q14;
     if(__builtin_expect((e->pmd|e->amd)==0u,1)){
         for(uint32_t i=0;i<frames;i++){
@@ -658,32 +618,17 @@ extern "C" int vgmm5_ym2151_memory_internal(const VgmM5YM2151 *ym)
 #endif
 }
 
-/* R57E12B4/BAT136 baseline compatibility:
- * Keep the R57E12 public profile API so main/fmg_wrap remain byte-for-byte
- * on the BAT134 lineage, but do not duplicate a profiled YM synthesis graph
- * into IRAM.  The purpose of this build is a one-variable A/B against BAT134.
- * FMHOT_R57E12 will therefore report zeros; after the memory/speed baseline is
- * recovered, a cold/non-duplicating profiler can be reintroduced separately. */
+/* Production clean: retain historical profiling ABI as zero-return stubs. */
 extern "C" void vgmm5_ym2151_profile_get(const VgmM5YM2151 *ym, vgmm5_ym2151_profile_t *out)
 {
     (void)ym;
     if (!out) return;
-    /* R57E13E/BAT156 semantic mapping over retained profile ABI:
-     * sampled=samples, total=activeCh, envelope=activeOp, lfo_noise=audibleOp,
-     * channel_prep=phaseOnlyOp, operator=fbZeroCh, routing_pan=noiseSamples. */
-    out->sampled_frames=s_semantic.samples;
-    out->total_cycles=s_semantic.active_ch_sum;
-    out->envelope_cycles=s_semantic.active_op_sum;
-    out->lfo_noise_cycles=s_semantic.audible_op_sum;
-    out->channel_prep_cycles=s_semantic.phase_only_op_sum;
-    out->operator_cycles=s_semantic.fb_zero_ch_sum;
-    out->routing_pan_cycles=s_semantic.noise_samples;
-    out->post_cycles=s_semantic.zero_mod_samples;
+    memset(out, 0, sizeof(*out));
 }
 
 extern "C" void vgmm5_ym2151_semantic_algo_get(const VgmM5YM2151 *ym,uint32_t out[8])
 {
     (void)ym;
     if(!out)return;
-    for(int i=0;i<8;i++)out[i]=s_semantic.algo_ch_sum[i];
+    for(int i=0;i<8;i++)out[i]=0u;
 }

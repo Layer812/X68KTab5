@@ -4,6 +4,11 @@
 #include <stdint.h>
 
 void FASTCALL ADPCM_PreUpdate(uint32_t clock);
+#ifdef ESP_PLATFORM
+extern int ADPCM_R127_PreCounter;
+extern uint16_t ADPCM_R127_PreStepCurrent;
+void FASTCALL ADPCM_PreUpdateR127Due(void);
+#endif
 void ADPCM_Update(int16_t *buffer, size_t length, uint8_t *pbsp, uint8_t *pbep);
 
 void FASTCALL ADPCM_Write(uint32_t adr, uint8_t data);

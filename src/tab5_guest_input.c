@@ -46,22 +46,18 @@ static uint32_t s_sent_chars = 0;
 static QueueHandle_t s_realtime_queue = NULL;
 static QueueHandle_t s_softkbd_queue = NULL;
 static uint32_t s_softkbd_next_frame = 0;
-static uint32_t s_realtime_events = 0;
-static uint32_t s_realtime_dropped = 0;
 
 /* USB mouse reports are accumulated from the HID task and consumed only
  * by the emulation task.  This keeps PX68K mouse/SCC state single-threaded. */
 static int32_t s_mouse_dx = 0;
 static int32_t s_mouse_dy = 0;
 static uint32_t s_mouse_buttons = 0;
-static uint32_t s_mouse_events = 0;
 static uint8_t s_mouse_applied_buttons = 0;
 
 /* USB joypad reports arrive on HID tasks; only the emulation task touches
  * PX68K Joystick state. Bits use JOY_* active-high semantics. */
 static uint32_t s_joy_bits = 0;
 static uint32_t s_touch_joy_bits = 0;
-static uint32_t s_joy_events = 0;
 static uint16_t s_joy_applied_bits = 0;
 
 static uint32_t text_queue_next(uint32_t p)
@@ -125,17 +121,12 @@ void tab5_guest_input_init(void)
     s_next_frame = 0;
     s_interval_frames = 12;
     s_sent_chars = 0;
-
-    __atomic_store_n(&s_realtime_events, 0u, __ATOMIC_RELAXED);
-    __atomic_store_n(&s_realtime_dropped, 0u, __ATOMIC_RELAXED);
     __atomic_store_n(&s_mouse_dx, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&s_mouse_dy, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&s_mouse_buttons, 0u, __ATOMIC_RELAXED);
-    __atomic_store_n(&s_mouse_events, 0u, __ATOMIC_RELAXED);
     s_mouse_applied_buttons = 0;
     __atomic_store_n(&s_joy_bits, 0u, __ATOMIC_RELAXED);
     __atomic_store_n(&s_touch_joy_bits, 0u, __ATOMIC_RELAXED);
-    __atomic_store_n(&s_joy_events, 0u, __ATOMIC_RELAXED);
     s_joy_applied_bits = 0;
 
     if (!s_realtime_queue)
@@ -203,11 +194,8 @@ int tab5_guest_input_queue_key(uint32_t retro_key, int pressed)
 
     if (xQueueSend(s_realtime_queue, &event, 0) != pdTRUE)
     {
-        __atomic_add_fetch(&s_realtime_dropped, 1u, __ATOMIC_RELAXED);
         return 0;
     }
-
-    __atomic_add_fetch(&s_realtime_events, 1u, __ATOMIC_RELAXED);
     return 1;
 }
 
@@ -224,11 +212,8 @@ int tab5_guest_input_queue_x68k_scancode(uint8_t scancode, int pressed)
 
     if (xQueueSend(s_realtime_queue, &event, 0) != pdTRUE)
     {
-        __atomic_add_fetch(&s_realtime_dropped, 1u, __ATOMIC_RELAXED);
         return 0;
     }
-
-    __atomic_add_fetch(&s_realtime_events, 1u, __ATOMIC_RELAXED);
     return 1;
 }
 
@@ -251,7 +236,6 @@ int tab5_guest_input_queue_mouse(int dx, int dy, uint8_t buttons)
     __atomic_add_fetch(&s_mouse_dx, (int32_t)dx, __ATOMIC_RELAXED);
     __atomic_add_fetch(&s_mouse_dy, (int32_t)dy, __ATOMIC_RELAXED);
     __atomic_store_n(&s_mouse_buttons, (uint32_t)(buttons & 0x03u), __ATOMIC_RELEASE);
-    __atomic_add_fetch(&s_mouse_events, 1u, __ATOMIC_RELAXED);
     return 1;
 }
 
@@ -263,7 +247,6 @@ int tab5_guest_input_queue_joypad(uint16_t joy_bits)
                                      JOY_HOST_BTN5 | JOY_HOST_BTN6 |
                                      JOY_HOST_L | JOY_HOST_R | JOY_HOST_START | JOY_HOST_MODE);
     __atomic_store_n(&s_joy_bits, (uint32_t)(joy_bits & mask), __ATOMIC_RELEASE);
-    __atomic_add_fetch(&s_joy_events, 1u, __ATOMIC_RELAXED);
     return 1;
 }
 
@@ -395,31 +378,6 @@ size_t tab5_guest_input_pending(void)
 uint32_t tab5_guest_input_sent_chars(void)
 {
     return s_sent_chars;
-}
-
-size_t tab5_guest_input_realtime_pending(void)
-{
-    return s_realtime_queue ? (size_t)uxQueueMessagesWaiting(s_realtime_queue) : 0u;
-}
-
-uint32_t tab5_guest_input_realtime_events(void)
-{
-    return __atomic_load_n(&s_realtime_events, __ATOMIC_RELAXED);
-}
-
-uint32_t tab5_guest_input_realtime_dropped(void)
-{
-    return __atomic_load_n(&s_realtime_dropped, __ATOMIC_RELAXED);
-}
-
-uint32_t tab5_guest_input_mouse_events(void)
-{
-    return __atomic_load_n(&s_mouse_events, __ATOMIC_RELAXED);
-}
-
-uint32_t tab5_guest_input_joypad_events(void)
-{
-    return __atomic_load_n(&s_joy_events, __ATOMIC_RELAXED);
 }
 
 uint16_t tab5_guest_input_joypad_state(void)

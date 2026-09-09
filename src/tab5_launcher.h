@@ -43,10 +43,9 @@ typedef struct {
  *   - FLOPPY 0: XDF/DIM
  *   - FLOPPY 1: XDF/DIM
  *   - HDD 0:    HDS as SCSI target 0 (read/write)
- *   - BOOT:     FLOPPY0 or HDD0 selected directly in Media Setup
+ *   - BOOT:     FLOPPY0, FLOPPY1 or HDD0 selected directly in Media Setup
  *
- * FLOPPY2/3 and explicit FLOPPY1 boot are deliberately shown disabled in
- * the UI until their underlying core/boot semantics are proven.
+ * FLOPPY2/3 are absent because the PX68K backend exposes two drives.
  */
 int tab5_launcher_run(const char *human_path, tab5_launcher_config_t *out_config);
 

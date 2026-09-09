@@ -61,1977 +61,74 @@ extern void m68ki_build_opcode_table(void);
 #include <stdio.h>
 #include <string.h>
 #include "esp_attr.h"
-#include "esp_cpu.h"
 #include <stddef.h>
 #include <stdlib.h>
 #include "../../x68k/x68kmemory.h"
 #include "../../x68k/tvram.h"
+#include "../../x68k/mfp.h"
+#include "../../x68k/rtc.h"
+#include "../../x68k/dmac.h"
+#include "../../x68k/crtc.h"
+#include "../../x68k/fdd.h"
+#include "../../x68k/scc.h"
+#include "../../x68k/adpcm.h"
+#include "../../x68k/midi.h"
+#include "../../fmgen/fmg_wrap.h"
+#include "../../libretro/keyboard.h"
 
-#ifndef PX68K_TAB5_PERF_PROFILE
-#define PX68K_TAB5_PERF_PROFILE 0
+/* R57E138A: X68P4 processor cutover.  Runtime RV32 generation, generic JIT
+ * discovery and the small/sparse Trace134-137 entry paths are retired.  The
+ * hot executor consumes predecoded X68P4Op pages from fixed Internal SRAM. */
+#ifdef PX68K_TAB5_DYNAREC
+#undef PX68K_TAB5_DYNAREC
 #endif
-#ifndef PX68K_TAB5_DYNAREC
-#define PX68K_TAB5_DYNAREC 1
-#endif
-#ifndef PX68K_TAB5_DYNAREC_COST_PROFILE
-#define PX68K_TAB5_DYNAREC_COST_PROFILE PX68K_TAB5_PERF_PROFILE
-#endif
-#if PX68K_TAB5_PERF_PROFILE
-#define TAB5_PROF(...) do { __VA_ARGS__; } while (0)
-#else
-#define TAB5_PROF(...) do { } while (0)
-#endif
+#define PX68K_TAB5_DYNAREC 0
+#define PX68K_TAB5_DYNAREC_GENERIC 0
+#define PX68K_TAB5_TRACE134 0
+#define PX68K_TAB5_X68P4_PREDECODE 1
 
-/* Build 5.64: PX68K's current Musashi integration has no call site for
- * m68k_pulse_bus_error(); its own BusErrFlag/BusErrHandling bookkeeping is
- * not bridged to Musashi's longjmp bus-error mechanism.  Therefore the
- * per-instruction 64-byte D/A rollback snapshot and per-slice bus-error
- * setjmp were pure preparation for an unreachable exception path.
- *
- * Keep this as an explicit compile-time switch so a future port that wires
- * m68k_pulse_bus_error() back in can restore the upstream behavior simply by
- * setting the value to 0.  Address-error emulation remains untouched. */
-/* Intent: The original rollback preparation is unnecessary for the Tab5 bus-error path; skip only dead preparation work while retaining address-error behavior.  Layer8 Aug/17/2026 */
-#ifndef PX68K_TAB5_SKIP_DEAD_BERR_ROLLBACK
-#define PX68K_TAB5_SKIP_DEAD_BERR_ROLLBACK 1
-#endif
+/* R140N2R6 SAFELEAN: unreachable Musashi host bus-error rollback is physically removed.
+ * PX68K BusErrFlag/BusErrHandling is not wired to this upstream setjmp/longjmp path.
+ * Address Error handling is unchanged. */
 
 /* Build 6.15h17R27 A/B: disable only the R22 ZERO-RUN outer batching call.
  * Keep the implementation and its IRAM/data footprint linked so R26a vs R27
  * compares execution behavior rather than changing the memory layout. */
 #ifndef PX68K_TAB5_MDX622_ZERO_RUN_AB
-#define PX68K_TAB5_MDX622_ZERO_RUN_AB 0
+#define PX68K_TAB5_MDX622_ZERO_RUN_AB 1
 #endif
 
-/* Build 5.56a: P4 XespV copies the 64-byte D0-D7/A0-A7 bus-error snapshot
- * with three 128-bit loads + three 128-bit stores.  The arrays are explicitly
- * from the native Musashi layout.  The global CPU object is 16-byte aligned;
- * dar/dar_save are both +4 mod 16, so the helper uses a 12-byte scalar head,
- * three aligned 128-bit moves, and one 4-byte scalar tail. */
-extern void tab5_xespv_copy64(void *dst, const void *src);
-_Static_assert((offsetof(m68ki_cpu_core, dar) & 15u) == 4u, "unexpected Musashi dar layout");
-_Static_assert((offsetof(m68ki_cpu_core, dar_save) & 15u) == 4u, "unexpected Musashi dar_save layout");
+/* R139A6A2 production-clean: dead ESP bus-error rollback snapshot/XespV self-check physically removed. */
 
-/* Runtime guard for the experimental P4 PIE/XespV copy.  Build 5.56 aborted on
- * a mismatch before Musashi started.  5.56a keeps the self-check but falls back
- * to the proven scalar snapshot so one experimental instruction sequence can
- * never prevent Human68k from booting. */
-static DRAM_ATTR int s_tab5_xespv_snapshot_enabled = 0;
-static DRAM_ATTR __attribute__((aligned(16))) uint8_t s_tab5_xespv_probe_src[80];
-static DRAM_ATTR __attribute__((aligned(16))) uint8_t s_tab5_xespv_probe_dst[80];
+/* R139A6 production-clean: historical opcode/hot-PC/backedge profiler
+ * storage and observation machinery physically removed. */
+uint32_t m68k_tab5_profile_storage_bytes(void) { return 0u; }
 
-static inline __attribute__((always_inline)) void tab5_scalar_copy64(uint *dst, const uint *src)
-{
-    dst[0]=src[0]; dst[1]=src[1]; dst[2]=src[2]; dst[3]=src[3];
-    dst[4]=src[4]; dst[5]=src[5]; dst[6]=src[6]; dst[7]=src[7];
-    dst[8]=src[8]; dst[9]=src[9]; dst[10]=src[10]; dst[11]=src[11];
-    dst[12]=src[12]; dst[13]=src[13]; dst[14]=src[14]; dst[15]=src[15];
-}
-
-static void tab5_xespv_snapshot_selfcheck(void)
-{
-    uint32_t saved_dar[16], saved_copy[16], ref[16];
-    unsigned i;
-    int dram_ok = 0, tcm_ok = 0;
-    s_tab5_xespv_snapshot_enabled = 0;
-
-    /* RC: one deterministic exactness check replaces development-time A/B timing. */
-    for (i = 0; i < 64; ++i) s_tab5_xespv_probe_src[4+i] = (uint8_t)(0x31u + i * 7u);
-    memset(s_tab5_xespv_probe_dst, 0, sizeof(s_tab5_xespv_probe_dst));
-    tab5_xespv_copy64(s_tab5_xespv_probe_dst + 4, s_tab5_xespv_probe_src + 4);
-    dram_ok = (memcmp(s_tab5_xespv_probe_src + 4, s_tab5_xespv_probe_dst + 4, 64) == 0);
-
-    if ((((uintptr_t)&m68ki_cpu) & 15u) != 0u) {
-        printf("PX68K_XESPV599RC1: exact self-check DRAM=%s TCM=SKIP backend=SCALAR\n",
-               dram_ok ? "PASS" : "FAIL");
-        return;
-    }
-
-    memcpy(saved_dar, m68ki_cpu.dar, sizeof(saved_dar));
-    memcpy(saved_copy, m68ki_cpu.dar_save, sizeof(saved_copy));
-    for (i = 0; i < 16; ++i) m68ki_cpu.dar[i] = 0x13579bdfu ^ (0x01020304u * i);
-    memcpy(ref, m68ki_cpu.dar, sizeof(ref));
-    memset(m68ki_cpu.dar_save, 0, sizeof(m68ki_cpu.dar_save));
-    tab5_xespv_copy64(m68ki_cpu.dar_save, m68ki_cpu.dar);
-    tcm_ok = (memcmp(ref, m68ki_cpu.dar_save, sizeof(ref)) == 0);
-    if (dram_ok && tcm_ok) s_tab5_xespv_snapshot_enabled = 1;
-
-    memcpy(m68ki_cpu.dar, saved_dar, sizeof(saved_dar));
-    memcpy(m68ki_cpu.dar_save, saved_copy, sizeof(saved_copy));
-    printf("PX68K_XESPV599RC1: exact self-check DRAM=%s TCM=%s backend=%s\n",
-           dram_ok ? "PASS" : "FAIL", tcm_ok ? "PASS" : "FAIL",
-           s_tab5_xespv_snapshot_enabled ? "XespV" : "SCALAR");
-}
-
-/*
- * Build 5.20: sample-only 68000 opcode profiler.
- *
- * The full 64K counter array intentionally lives with the PX68K component BSS
- * (PSRAM in the Tab5 linker layout).  It is touched only during the existing
- * one-frame-per-600 performance sample, so normal emulation has just one
- * highly-predictable branch per instruction and no counter traffic.
- *
- * This is diagnostic scaffolding for a later selective IRAM fast path: rather
- * than moving Musashi's entire 256KB jump table into scarce internal SRAM, we
- * first identify the actual hot 68000 opcodes used by real X68000 software.
- */
-static uint32_t s_tab5_opcode_counts[0x10000];
-static uint32_t s_tab5_opcode_total = 0;
-static DRAM_ATTR int s_tab5_opcode_profile_enabled = 0;
-
-#ifndef PX68K_TAB5_DYNAREC_LOG
-#define PX68K_TAB5_DYNAREC_LOG 1
-#endif
-
-/* Build 6.13b: sparse hot-PC + short back-edge profiler for the Dynarec decision.  This table
- * lives beside the large diagnostic opcode histogram (external component BSS
- * in the Tab5 linker layout), and is touched only during the one diagnostic
- * frame every 1200 guest frames.  Eight probes keep the update path bounded;
- * misses are counted so the log tells us when the table should be enlarged. */
-#define TAB5_HOTPC613_SLOTS 8192u
-#define TAB5_HOTPC613_MASK  (TAB5_HOTPC613_SLOTS - 1u)
-typedef struct {
-    uint32_t pc;
-    uint32_t count;
-    uint16_t op;
-    uint16_t reserved;
-} tab5_hotpc613_entry_t;
-static tab5_hotpc613_entry_t s_tab5_hotpc613[TAB5_HOTPC613_SLOTS];
-static uint32_t s_tab5_hotpc613_total = 0;
-static uint32_t s_tab5_hotpc613_dropped = 0;
-
-static inline __attribute__((always_inline))
-void tab5_hotpc613_observe(uint32_t pc, uint16_t op)
-{
-    pc &= 0x00ffffffu;
-    unsigned base = (unsigned)(((pc >> 1) ^ (pc >> 9) ^ (pc >> 17)) & TAB5_HOTPC613_MASK);
-    ++s_tab5_hotpc613_total;
-    for (unsigned probe = 0; probe < 8u; ++probe) {
-        tab5_hotpc613_entry_t * const e = &s_tab5_hotpc613[(base + probe) & TAB5_HOTPC613_MASK];
-        if (e->count == 0u) {
-            e->pc = pc;
-            e->op = op;
-            e->count = 1u;
-            return;
-        }
-        if (e->pc == pc) {
-            ++e->count;
-            e->op = op;
-            return;
-        }
-    }
-    ++s_tab5_hotpc613_dropped;
-}
-
-static void tab5_hotpc613_reset(void)
-{
-    memset(s_tab5_hotpc613, 0, sizeof(s_tab5_hotpc613));
-    s_tab5_hotpc613_total = 0;
-    s_tab5_hotpc613_dropped = 0;
-}
-
-/* Build 6.13b: count taken short backward control-flow edges.  A hot back-edge
- * is a direct signal that a tiny basic block/loop is worth translating.  The
- * profiler is diagnostic-only and active for one sparse sample frame. */
-#define TAB5_BACKEDGE613_SLOTS 2048u
-#define TAB5_BACKEDGE613_MASK  (TAB5_BACKEDGE613_SLOTS - 1u)
-typedef struct {
-    uint32_t from_pc;
-    uint32_t to_pc;
-    uint32_t count;
-    uint16_t span;
-    uint16_t reserved;
-} tab5_backedge613_entry_t;
-static tab5_backedge613_entry_t s_tab5_backedge613[TAB5_BACKEDGE613_SLOTS];
-static uint32_t s_tab5_backedge613_total = 0;
-static uint32_t s_tab5_backedge613_dropped = 0;
-static uint32_t s_tab5_prev_pc613 = 0;
-static uint8_t s_tab5_prev_pc613_valid = 0;
-
-static inline __attribute__((always_inline))
-void tab5_backedge613_observe(uint32_t pc)
-{
-    pc &= 0x00ffffffu;
-    if (s_tab5_prev_pc613_valid) {
-        const uint32_t from = s_tab5_prev_pc613;
-        if (pc <= from) {
-            const uint32_t span32 = from - pc;
-            if (span32 <= 64u) {
-                unsigned base = (unsigned)(((from >> 1) ^ (pc >> 3) ^ (from >> 11)) & TAB5_BACKEDGE613_MASK);
-                ++s_tab5_backedge613_total;
-                for (unsigned probe = 0; probe < 8u; ++probe) {
-                    tab5_backedge613_entry_t * const e = &s_tab5_backedge613[(base + probe) & TAB5_BACKEDGE613_MASK];
-                    if (e->count == 0u) {
-                        e->from_pc = from;
-                        e->to_pc = pc;
-                        e->span = (uint16_t)span32;
-                        e->count = 1u;
-                        goto done;
-                    }
-                    if (e->from_pc == from && e->to_pc == pc) {
-                        ++e->count;
-                        goto done;
-                    }
-                }
-                ++s_tab5_backedge613_dropped;
-            }
-        }
-    }
-done:
-    s_tab5_prev_pc613 = pc;
-    s_tab5_prev_pc613_valid = 1;
-}
-
-static void tab5_backedge613_reset(void)
-{
-    memset(s_tab5_backedge613, 0, sizeof(s_tab5_backedge613));
-    s_tab5_backedge613_total = 0;
-    s_tab5_backedge613_dropped = 0;
-    s_tab5_prev_pc613 = 0;
-    s_tab5_prev_pc613_valid = 0;
-}
-
-static inline uint16_t tab5_dyn613c_fetch16(uint32_t pc);
-
-static void tab5_backedge613_dump(void)
-{
-    enum { TOPN = 16 };
-    uint32_t top_count[TOPN] = {0};
-    uint32_t top_from[TOPN] = {0};
-    uint32_t top_to[TOPN] = {0};
-    uint16_t top_span[TOPN] = {0};
-    const uint32_t accepted = s_tab5_backedge613_total - s_tab5_backedge613_dropped;
-
-    for (unsigned n = 0; n < TAB5_BACKEDGE613_SLOTS; ++n) {
-        const tab5_backedge613_entry_t * const e = &s_tab5_backedge613[n];
-        if (!e->count || e->count <= top_count[TOPN - 1]) continue;
-        for (unsigned i = 0; i < TOPN; ++i) {
-            if (e->count > top_count[i]) {
-                for (unsigned j = TOPN - 1; j > i; --j) {
-                    top_count[j] = top_count[j - 1];
-                    top_from[j] = top_from[j - 1];
-                    top_to[j] = top_to[j - 1];
-                    top_span[j] = top_span[j - 1];
-                }
-                top_count[i] = e->count;
-                top_from[i] = e->from_pc;
-                top_to[i] = e->to_pc;
-                top_span[i] = e->span;
-                break;
-            }
-        }
-    }
-
-    printf("PX68K_DYN613B: BACKEDGE total=%lu accepted=%lu dropped=%lu table=%u storage=%uB maxspan=64B\n",
-           (unsigned long)s_tab5_backedge613_total,
-           (unsigned long)accepted,
-           (unsigned long)s_tab5_backedge613_dropped,
-           (unsigned)TAB5_BACKEDGE613_SLOTS,
-           (unsigned)sizeof(s_tab5_backedge613));
-    for (unsigned i = 0; i < TOPN && top_count[i]; ++i) {
-        const uint32_t pct_x100 = accepted
-            ? (uint32_t)(((uint64_t)top_count[i] * 10000ULL) / accepted) : 0u;
-        printf("PX68K_DYN613B: BE%02u $%06lX->$%06lX span=%u count=%lu pct=%lu.%02lu\n",
-               i + 1u, (unsigned long)top_from[i], (unsigned long)top_to[i],
-               (unsigned)top_span[i], (unsigned long)top_count[i],
-               (unsigned long)(pct_x100 / 100u),
-               (unsigned long)(pct_x100 % 100u));
-        if (i < 4u) {
-            const uint32_t start = top_to[i];
-            const uint32_t end = top_from[i] + 2u;
-            printf("PX68K_DYN613D: LOOP%02u words", i + 1u);
-            unsigned col = 0u;
-            for (uint32_t pc = start; pc < end && pc - start <= 64u; pc += 2u) {
-                if ((col & 7u) == 0u) printf("\nPX68K_DYN613D:   $%06lX:", (unsigned long)pc);
-                printf(" %04X", (unsigned)tab5_dyn613c_fetch16(pc));
-                ++col;
-            }
-            printf("\n");
-        }
-    }
-}
-
-static void tab5_hotpc613_dump(void)
-{
-    enum { TOPN = 20 };
-    uint32_t top_count[TOPN] = {0};
-    uint32_t top_pc[TOPN] = {0};
-    uint16_t top_op[TOPN] = {0};
-    uint32_t accepted = s_tab5_hotpc613_total - s_tab5_hotpc613_dropped;
-
-    for (unsigned n = 0; n < TAB5_HOTPC613_SLOTS; ++n) {
-        const tab5_hotpc613_entry_t * const e = &s_tab5_hotpc613[n];
-        if (!e->count || e->count <= top_count[TOPN - 1]) continue;
-        for (unsigned i = 0; i < TOPN; ++i) {
-            if (e->count > top_count[i]) {
-                for (unsigned j = TOPN - 1; j > i; --j) {
-                    top_count[j] = top_count[j - 1];
-                    top_pc[j] = top_pc[j - 1];
-                    top_op[j] = top_op[j - 1];
-                }
-                top_count[i] = e->count;
-                top_pc[i] = e->pc;
-                top_op[i] = e->op;
-                break;
-            }
-        }
-    }
-
-    printf("PX68K_DYN613B: HOTPC total=%lu accepted=%lu dropped=%lu table=%u slots storage=%uB\n",
-           (unsigned long)s_tab5_hotpc613_total,
-           (unsigned long)accepted,
-           (unsigned long)s_tab5_hotpc613_dropped,
-           (unsigned)TAB5_HOTPC613_SLOTS,
-           (unsigned)sizeof(s_tab5_hotpc613));
-    for (unsigned i = 0; i < TOPN && top_count[i]; ++i) {
-        const uint32_t pct_x100 = accepted ?
-            (uint32_t)(((uint64_t)top_count[i] * 10000ULL) / accepted) : 0u;
-        printf("PX68K_DYN613B: PC%02u $%06lX op=$%04X count=%lu pct=%lu.%02lu\n",
-               i + 1u, (unsigned long)top_pc[i], (unsigned)top_op[i],
-               (unsigned long)top_count[i],
-               (unsigned long)(pct_x100 / 100u),
-               (unsigned long)(pct_x100 % 100u));
-    }
-}
-
-uint32_t m68k_tab5_profile_storage_bytes(void)
-{
-    return (uint32_t)(sizeof(s_tab5_opcode_counts) + sizeof(s_tab5_hotpc613) + sizeof(s_tab5_backedge613));
-}
-
-/* Build 6.13c11: production-benchmark MC68000 -> ESP32-P4 RV32 runtime translator.
- * c6 proved the valuable SFXVI $368760 arithmetic prefix executes natively.
- * c7 moved the exact guest-code signature into generated RV32 and cut the
- * measured guarded entry from about 1287 to about 708 P4 cycles.  c8 then
- * moved the exact RAM preflight into generated RV32 as well; the same hot
- * block measured about 513 cycles total (front + native call) while retaining
- * ~21.5k native executions and zero memory failures.
- *
- * The dominant remaining loss is now scheduler fit, not guard cost.  In c8 the
- * 94-cycle $368760 primary fragment entered 54,587 times, but 33,078 entries
- * had fewer than 94 guest cycles left in the current Musashi slice and fell
- * back to the interpreter.  c9 therefore emits an additional short prefix
- * variant (<=48 guest cycles) from the SAME guest PC when a long fragment has
- * enough useful instructions.  Runtime selection is purely by the remaining
- * scheduler budget: prefer the 96-cycle-class primary, otherwise use the short
- * variant, otherwise fall back.  Both variants keep independent exact native
- * signature and RAM guards and return precise PC/PPC/IR/cycle state.
- *
- * This remains a conservative loop JIT rather than a replacement CPU core.
- * A taken short backward Bcc is observed in the normal Musashi path.  After
- * the edge becomes hot, a straight-line body is decoded once and emitted into
- * the 32 KiB executable arena proven by 6.13b2.
- *
- * Safety rules for this native build:
- *   - guest code and all direct data operands must be ordinary 12 MiB RAM;
- *   - no internal branches/calls/exceptions; only the final Bcc is translated;
- *   - memory operands are only (An), (An)+, or compile-time absolute .L RAM;
- *   - each generated variant compares every guest code byte/word it will
- *     execute before any guest side effect; self-modifying code invalidates
- *     the complete block before execution;
- *   - each generated variant performs exact An alignment/range/write-overlap
- *     guards before any guest side effect; transient RAM misses fall back;
- *   - short loops may execute one complete iteration per native call; long
- *     loops compile a <=96-cycle primary prefix and, where profitable,
- *     <=48-cycle short plus <=32-cycle tiny prefixes from the same start PC.
- *     The scheduler remains
- *     authoritative and existing poll/DBF/bulk-clear accelerators remain so.
- *
- * c10 proved the third <=32-cycle tier is worthwhile, and c11 proved the
- * production configuration runs the real JIT with the heavyweight research
- * profiler/cost probe disabled.  The c11 wall benchmark also exposed the next
- * dominant tax: once any block is active, the main Musashi loop performed a
- * 4-probe translated-PC lookup before every ordinary guest instruction.
- *
- * c12 removed the global per-instruction lookup.  c13 finishes that dispatch
- * cleanup: discovery itself is deferred until the existing poll/DBF/clear/stream
- * accelerators have had first refusal, compiled start PCs use a tiny direct L0,
- * and rejected/saturated discovery edges are memoized for the current candidate
- * epoch.  This keeps the proven 96/48/32 fragments and exact native guards while
- * avoiding repeated 4-probe block lookup and 16-probe candidate walks on hot
- * backward branches that cannot produce useful generic JIT work.
- *
- * v1 still keeps guest D/A registers in the Musashi context.  Register caching
- * remains the optional next CPU pass after the low-overhead dispatch A/B. */
-
-#define TAB5_DYN613C_ARENA_HEAD       64u
-#if PX68K_TAB5_DYNAREC
-#define TAB5_DYN613C_BLOCK_SLOTS      64u
-#define TAB5_DYN613C_CAND_SLOTS       256u
-#define TAB5_DYN613C_BLOCK_L0_SLOTS     64u
-#define TAB5_DYN613C_EDGE_MEMO_SLOTS   128u
-#else
-/* R23: production JIT is hard-disabled. Keep one compile-only sentinel slot so
- * the archived diagnostic code still type-checks, instead of allocating the
- * old 16,128-byte dead tables. These sentinels live in external BSS and are
- * never touched by the production execution path. */
-#define TAB5_DYN613C_BLOCK_SLOTS       1u
-#define TAB5_DYN613C_CAND_SLOTS        1u
-#define TAB5_DYN613C_BLOCK_L0_SLOTS    1u
-#define TAB5_DYN613C_EDGE_MEMO_SLOTS   1u
-#endif
-#define TAB5_DYN613C_CAND_PROBES      16u
-#define TAB5_DYN613C_CAND_EPOCH_MISSES 65536u
-#define TAB5_DYN613C_HOT_THRESHOLD    16u
-#define TAB5_DYN613C_MAX_GUEST_BYTES  192u
-#define TAB5_DYN613C_MAX_INSNS        72u
-#define TAB5_DYN613C_MAX_NATIVE_WORDS 1024u
-#define TAB5_DYN613C_MIN_INSNS        6u
-#define TAB5_DYN613C_FRAG_CYCLE_CAP   96u
-#define TAB5_DYN613C_FRAG_MIN_INSNS   6u
-#define TAB5_DYN613C_SHORT_CYCLE_CAP  48u
-#define TAB5_DYN613C_SHORT_MIN_INSNS   4u
-#define TAB5_DYN613C_TINY_CYCLE_CAP    32u
-#define TAB5_DYN613C_TINY_MIN_INSNS     3u
-
-typedef int (*tab5_dyn613c_native_fn_t)(m68ki_cpu_core *cpu, uint8_t *mem);
-typedef int (*tab5_dyn613c_sync_fn_t)(void *addr, unsigned int bytes);
-
-#define TAB5_DYN613C_SIG_MISMATCH (-1)
-#define TAB5_DYN613C_MEM_MISMATCH (-2)
-
-typedef enum {
-    D613_NONE = 0,
-    D613_MOVE_W_RR,
-    D613_MOVE_L_RR,
-    D613_MOVEA_W_RR,
-    D613_MOVEA_L_RR,
-    D613_MOVEQ,
-    D613_ADD_W_RR,
-    D613_ADD_L_RR,
-    D613_ADDA_W_RR,
-    D613_ADDA_L_RR,
-    D613_AND_W_RR,
-    D613_OR_W_RR,
-    D613_CMP_W_RR,
-    D613_CMP_L_RR,
-    D613_CMPA_L_AA,
-    D613_AND_W_IMM,
-    D613_AND_L_IMM,
-    D613_ANDI_W,
-    D613_ANDI_L,
-    D613_ADDQ_W,
-    D613_SUBQ_W,
-    D613_ADDQ_A,
-    D613_ASR_W,
-    D613_ASR_L,
-    D613_EXT_L,
-    D613_SWAP,
-    D613_TST_W_D,
-    D613_TST_W_A,
-    D613_TST_W_ABSL,
-    D613_MOVE_W_PI_D,
-    D613_MOVE_L_PI_D,
-    D613_MOVE_W_D_PI,
-    D613_MOVE_L_D_PI,
-    D613_MOVE_L_PI_PI,
-    D613_CLR_W_PI,
-    D613_CLR_L_PI,
-    D613_BCC_FINAL
-} tab5_dyn613c_kind_t;
-
-typedef struct {
-    uint32_t pc;
-    uint32_t imm;
-    uint16_t op;
-    uint8_t kind;
-    uint8_t len;
-} tab5_dyn613c_dec_t;
-
-typedef struct {
-    uint32_t start_pc;
-    uint32_t branch_pc;
-    uint32_t fall_pc;
-    uint32_t code_hash;
-    uint16_t branch_op;
-    uint16_t guest_bytes;
-    uint16_t guest_insns;
-    uint16_t native_bytes;
-    uint16_t cycles_taken;
-    uint16_t cycles_not;
-    uint8_t mem_span[8];
-    uint8_t mem_write_mask;
-    uint8_t valid;
-    uint8_t fragment;
-    uint8_t sig_words;
-    uint8_t ram_guard_words;
-    uint8_t short_valid;
-    uint16_t short_guest_bytes;
-    uint16_t short_guest_insns;
-    uint16_t short_native_bytes;
-    uint16_t short_cycles;
-    uint8_t short_sig_words;
-    uint8_t short_ram_guard_words;
-    uint8_t tiny_valid;
-    uint16_t tiny_guest_bytes;
-    uint16_t tiny_guest_insns;
-    uint16_t tiny_native_bytes;
-    uint16_t tiny_cycles;
-    uint8_t tiny_sig_words;
-    uint8_t tiny_ram_guard_words;
-    /* c4-c10 diagnostics: sampled only, never guest-visible. */
-    uint32_t enter_count;
-    uint32_t exec_count;
-    uint32_t mem_fail_count;
-    uint32_t cycle_fail_count;
-    uint32_t sample_count;
-    uint32_t sample_hash_cc;
-    uint32_t sample_preflight_cc;
-    uint32_t sample_native_cc;
-    uint32_t short_select_count;
-    uint32_t short_exec_count;
-    uint32_t short_mem_fail_count;
-    uint32_t short_sample_count;
-    uint32_t short_sample_front_cc;
-    uint32_t short_sample_native_cc;
-    uint32_t tiny_select_count;
-    uint32_t tiny_exec_count;
-    uint32_t tiny_mem_fail_count;
-    uint32_t tiny_sample_count;
-    uint32_t tiny_sample_front_cc;
-    uint32_t tiny_sample_native_cc;
-    tab5_dyn613c_native_fn_t fn;
-    tab5_dyn613c_native_fn_t short_fn;
-    tab5_dyn613c_native_fn_t tiny_fn;
-} tab5_dyn613c_block_t;
-
-typedef struct {
-    uint32_t from_pc;
-    uint32_t to_pc;
-    uint16_t op;
-    uint16_t count;
-    uint8_t attempted;
-    uint8_t epoch;
-    uint8_t reserved[2];
-} tab5_dyn613c_candidate_t;
-
-/* c13 L0/memo tables are performance hints only.  Every L0 hit revalidates the
- * authoritative block slot, and memo entries expire automatically when the
- * candidate epoch rotates.  Losing an entry to a direct-map collision can only
- * reduce acceleration; it cannot change guest-visible execution. */
-typedef struct {
-    uint32_t pc;
-    uint8_t block_plus1;
-    uint8_t reserved[3];
-} tab5_dyn613c_block_l0_t;
-
-typedef struct {
-    uint32_t from_pc;
-    uint32_t to_pc;
-    uint16_t op;
-    uint8_t epoch;
-    uint8_t state;
-} tab5_dyn613c_edge_memo_t;
-
-enum { TAB5_DYN613C_MEMO_REJECT=1u, TAB5_DYN613C_MEMO_MISS=2u };
-
-static DRAM_ATTR uint8_t *s_dyn613c_arena = NULL;
-static DRAM_ATTR uint32_t s_dyn613c_arena_bytes = 0;
-static DRAM_ATTR uint32_t s_dyn613c_arena_used = TAB5_DYN613C_ARENA_HEAD;
-static DRAM_ATTR tab5_dyn613c_sync_fn_t s_dyn613c_sync = NULL;
-/* R23: generic JIT is production-disabled.  Full tables are compiled only
- * when JIT is enabled. Production keeps four one-slot compile-only sentinels
- * in external BSS, so the old 16,128-byte allocation disappears entirely
- * from Internal SRAM and effectively from the runtime working set. */
-#if PX68K_TAB5_DYNAREC
-#define TAB5_DYN613C_META_ATTR DRAM_ATTR
-#else
-#define TAB5_DYN613C_META_ATTR EXT_RAM_BSS_ATTR
-#endif
-static TAB5_DYN613C_META_ATTR tab5_dyn613c_block_t s_dyn613c_blocks[TAB5_DYN613C_BLOCK_SLOTS];
-static TAB5_DYN613C_META_ATTR tab5_dyn613c_candidate_t s_dyn613c_cands[TAB5_DYN613C_CAND_SLOTS];
-static TAB5_DYN613C_META_ATTR tab5_dyn613c_block_l0_t s_dyn613c_block_l0[TAB5_DYN613C_BLOCK_L0_SLOTS];
-static TAB5_DYN613C_META_ATTR tab5_dyn613c_edge_memo_t s_dyn613c_edge_memo[TAB5_DYN613C_EDGE_MEMO_SLOTS];
-static DRAM_ATTR uint32_t s_dyn613c_active = 0;
-static DRAM_ATTR uint32_t s_dyn613c_compile_ok = 0;
-static DRAM_ATTR uint32_t s_dyn613c_compile_reject = 0;
-static DRAM_ATTR uint32_t s_dyn613c_reject_decode = 0;
-static DRAM_ATTR uint32_t s_dyn613c_reject_poll = 0;
-static DRAM_ATTR uint32_t s_dyn613c_reject_mem = 0;
-static DRAM_ATTR uint32_t s_dyn613c_reject_cache = 0;
-static DRAM_ATTR uint32_t s_dyn613c_exec = 0;
-static DRAM_ATTR uint32_t s_dyn613c_fallback = 0;
-static DRAM_ATTR uint32_t s_dyn613c_hash_fail = 0;
-static DRAM_ATTR uint32_t s_dyn613c_mem_fail = 0;
-static DRAM_ATTR uint32_t s_dyn613c_cycle_fail = 0;
-static DRAM_ATTR uint32_t s_dyn613c_fragment_ok = 0;
-static DRAM_ATTR uint32_t s_dyn613c_short_ok = 0;
-static DRAM_ATTR uint32_t s_dyn613c_short_select = 0;
-static DRAM_ATTR uint32_t s_dyn613c_short_exec = 0;
-static DRAM_ATTR uint32_t s_dyn613c_tiny_ok = 0;
-static DRAM_ATTR uint32_t s_dyn613c_tiny_select = 0;
-static DRAM_ATTR uint32_t s_dyn613c_tiny_exec = 0;
-static DRAM_ATTR uint32_t s_dyn613c_perf_reject = 0;
-static DRAM_ATTR uint32_t s_dyn613c_flush = 0;
-static DRAM_ATTR uint64_t s_dyn613c_guest_instr = 0;
-static DRAM_ATTR uint64_t s_dyn613c_cycles = 0;
-static DRAM_ATTR uint64_t s_dyn613c_native_bytes_total = 0;
-static DRAM_ATTR uint32_t s_dyn613c_last_bad_pc = 0xffffffffu;
-static DRAM_ATTR uint16_t s_dyn613c_last_bad_op = 0xffffu;
-static DRAM_ATTR uint32_t s_dyn613c_reject_diag_printed = 0;
-static DRAM_ATTR uint32_t s_dyn613c_cand_insert_miss = 0;
-static DRAM_ATTR uint32_t s_dyn613c_cand_miss_run = 0;
-static DRAM_ATTR uint32_t s_dyn613c_cand_rotations = 0;
-static DRAM_ATTR uint8_t s_dyn613c_cand_epoch = 1u;
-static DRAM_ATTR uint32_t s_dyn613c_l0_hits = 0;
-static DRAM_ATTR uint32_t s_dyn613c_l0_misses = 0;
-static DRAM_ATTR uint32_t s_dyn613c_memo_reject_hits = 0;
-static DRAM_ATTR uint32_t s_dyn613c_memo_miss_hits = 0;
-
-unsigned int m68k_tab5_dynarec_metadata_bytes(void)
-{
-#if PX68K_TAB5_DYNAREC
-    /* Persistent JIT tables only.  The 4 KiB emitter and decode array are
-     * transient CPU1 stack objects used only when a hot block is compiled. */
-    return (uint32_t)(sizeof(s_dyn613c_blocks) + sizeof(s_dyn613c_cands) +
-                      sizeof(s_dyn613c_block_l0) + sizeof(s_dyn613c_edge_memo));
-#else
-    return 0u;
-#endif
-}
-
-/* RV32 register numbers.  Keep a0/a1 as the C ABI cpu/MEM arguments and use
- * only caller-saved registers so generated functions need no stack frame. */
-enum {
-    R_ZERO=0, R_RA=1,
-    R_T0=5, R_T1=6, R_T2=7,
-    R_A0=10, R_A1=11, R_A2=12, R_A3=13, R_A4=14, R_A5=15,
-    R_A6=16, R_A7=17
-};
-
-typedef struct {
-    uint32_t w[TAB5_DYN613C_MAX_NATIVE_WORDS];
-    unsigned n;
-    int failed;
-} tab5_rv613c_emit_t;
-
-static inline uint32_t rv613_i(unsigned opcode, unsigned rd, unsigned f3,
-                               unsigned rs1, int imm)
-{
-    return ((uint32_t)imm & 0xfffu) << 20 |
-           (rs1 & 31u) << 15 | (f3 & 7u) << 12 |
-           (rd & 31u) << 7 | (opcode & 0x7fu);
-}
-static inline uint32_t rv613_r(unsigned rd, unsigned f3, unsigned rs1,
-                               unsigned rs2, unsigned f7)
-{
-    return (f7 & 0x7fu) << 25 | (rs2 & 31u) << 20 | (rs1 & 31u) << 15 |
-           (f3 & 7u) << 12 | (rd & 31u) << 7 | 0x33u;
-}
-static inline uint32_t rv613_s(unsigned f3, unsigned rs1, unsigned rs2, int imm)
-{
-    const uint32_t u = (uint32_t)imm & 0xfffu;
-    return ((u >> 5) & 0x7fu) << 25 | (rs2 & 31u) << 20 |
-           (rs1 & 31u) << 15 | (f3 & 7u) << 12 |
-           (u & 0x1fu) << 7 | 0x23u;
-}
-static inline uint32_t rv613_b(unsigned f3, unsigned rs1, unsigned rs2, int off)
-{
-    const uint32_t u = (uint32_t)off & 0x1fffu;
-    return ((u >> 12) & 1u) << 31 | ((u >> 5) & 0x3fu) << 25 |
-           (rs2 & 31u) << 20 | (rs1 & 31u) << 15 | (f3 & 7u) << 12 |
-           ((u >> 1) & 0x0fu) << 8 | ((u >> 11) & 1u) << 7 | 0x63u;
-}
-static inline void rv613_emit(tab5_rv613c_emit_t *e, uint32_t w)
-{
-    if (e->n >= TAB5_DYN613C_MAX_NATIVE_WORDS) { e->failed = 1; return; }
-    e->w[e->n++] = w;
-}
-static inline void rv613_add(tab5_rv613c_emit_t *e, unsigned rd, unsigned a, unsigned b)
-{ rv613_emit(e, rv613_r(rd,0,a,b,0)); }
-static inline void rv613_sub(tab5_rv613c_emit_t *e, unsigned rd, unsigned a, unsigned b)
-{ rv613_emit(e, rv613_r(rd,0,a,b,0x20)); }
-static inline void rv613_and(tab5_rv613c_emit_t *e, unsigned rd, unsigned a, unsigned b)
-{ rv613_emit(e, rv613_r(rd,7,a,b,0)); }
-static inline void rv613_or(tab5_rv613c_emit_t *e, unsigned rd, unsigned a, unsigned b)
-{ rv613_emit(e, rv613_r(rd,6,a,b,0)); }
-static inline void rv613_xor(tab5_rv613c_emit_t *e, unsigned rd, unsigned a, unsigned b)
-{ rv613_emit(e, rv613_r(rd,4,a,b,0)); }
-static inline void rv613_sltu(tab5_rv613c_emit_t *e, unsigned rd, unsigned a, unsigned b)
-{ rv613_emit(e, rv613_r(rd,3,a,b,0)); }
-static inline void rv613_addi(tab5_rv613c_emit_t *e, unsigned rd, unsigned rs, int imm)
-{ rv613_emit(e, rv613_i(0x13,rd,0,rs,imm)); }
-static inline void rv613_andi(tab5_rv613c_emit_t *e, unsigned rd, unsigned rs, int imm)
-{ rv613_emit(e, rv613_i(0x13,rd,7,rs,imm)); }
-static inline void rv613_slli(tab5_rv613c_emit_t *e, unsigned rd, unsigned rs, unsigned sh)
-{ rv613_emit(e, rv613_i(0x13,rd,1,rs,(int)(sh & 31u))); }
-static inline void rv613_srli(tab5_rv613c_emit_t *e, unsigned rd, unsigned rs, unsigned sh)
-{ rv613_emit(e, rv613_i(0x13,rd,5,rs,(int)(sh & 31u))); }
-static inline void rv613_srai(tab5_rv613c_emit_t *e, unsigned rd, unsigned rs, unsigned sh)
-{ rv613_emit(e, rv613_i(0x13,rd,5,rs,(int)(0x400u | (sh & 31u)))); }
-static inline void rv613_lw(tab5_rv613c_emit_t *e, unsigned rd, unsigned rs, int off)
-{ rv613_emit(e, rv613_i(0x03,rd,2,rs,off)); }
-static inline void rv613_lhu(tab5_rv613c_emit_t *e, unsigned rd, unsigned rs, int off)
-{ rv613_emit(e, rv613_i(0x03,rd,5,rs,off)); }
-static inline void rv613_sw(tab5_rv613c_emit_t *e, unsigned rs2, unsigned rs1, int off)
-{ rv613_emit(e, rv613_s(2,rs1,rs2,off)); }
-static inline void rv613_sh(tab5_rv613c_emit_t *e, unsigned rs2, unsigned rs1, int off)
-{ rv613_emit(e, rv613_s(1,rs1,rs2,off)); }
-static inline void rv613_lui(tab5_rv613c_emit_t *e, unsigned rd, uint32_t imm20)
-{ rv613_emit(e, (imm20 & 0xfffffu) << 12 | (rd & 31u) << 7 | 0x37u); }
-static inline void rv613_li(tab5_rv613c_emit_t *e, unsigned rd, uint32_t value)
-{
-    const int32_t sv = (int32_t)value;
-    if (sv >= -2048 && sv <= 2047) {
-        rv613_addi(e, rd, R_ZERO, sv);
-    } else {
-        const int32_t hi = (int32_t)(((int64_t)sv + 0x800) >> 12);
-        const int32_t lo = (int32_t)((int64_t)sv - ((int64_t)hi * 4096));
-        rv613_lui(e, rd, (uint32_t)hi);
-        rv613_addi(e, rd, rd, lo);
-    }
-}
-static inline unsigned rv613_branch_placeholder(tab5_rv613c_emit_t *e,
-                                                  unsigned f3, unsigned rs1, unsigned rs2)
-{
-    const unsigned at = e->n;
-    rv613_emit(e, rv613_b(f3,rs1,rs2,0));
-    return at;
-}
-static inline void rv613_patch_branch(tab5_rv613c_emit_t *e, unsigned at,
-                                      unsigned f3, unsigned rs1, unsigned rs2,
-                                      unsigned target_word)
-{
-    const int off = ((int)target_word - (int)at) * 4;
-    if (at >= e->n || off < -4096 || off > 4094 || (off & 1)) {
-        e->failed = 1; return;
-    }
-    e->w[at] = rv613_b(f3,rs1,rs2,off);
-}
-static inline void rv613_ret(tab5_rv613c_emit_t *e)
-{ rv613_emit(e, 0x00008067u); }
-
-#define D613_OFF_DA(n) ((int)(offsetof(m68ki_cpu_core, dar) + 4u*(n)))
-#define D613_OFF_PPC   ((int)offsetof(m68ki_cpu_core, ppc))
-#define D613_OFF_PC    ((int)offsetof(m68ki_cpu_core, pc))
-#define D613_OFF_IR    ((int)offsetof(m68ki_cpu_core, ir))
-#define D613_OFF_X     ((int)offsetof(m68ki_cpu_core, x_flag))
-#define D613_OFF_N     ((int)offsetof(m68ki_cpu_core, n_flag))
-#define D613_OFF_Z     ((int)offsetof(m68ki_cpu_core, not_z_flag))
-#define D613_OFF_V     ((int)offsetof(m68ki_cpu_core, v_flag))
-#define D613_OFF_C     ((int)offsetof(m68ki_cpu_core, c_flag))
-
-static inline void rv613_load_da(tab5_rv613c_emit_t *e, unsigned rd, unsigned idx)
-{ rv613_lw(e,rd,R_A0,D613_OFF_DA(idx)); }
-static inline void rv613_store_da(tab5_rv613c_emit_t *e, unsigned rs, unsigned idx)
-{ rv613_sw(e,rs,R_A0,D613_OFF_DA(idx)); }
-static inline void rv613_mask16(tab5_rv613c_emit_t *e, unsigned rd, unsigned rs)
-{ rv613_slli(e,rd,rs,16); rv613_srli(e,rd,rd,16); }
-static inline void rv613_upper16(tab5_rv613c_emit_t *e, unsigned rd, unsigned rs)
-{ rv613_srli(e,rd,rs,16); rv613_slli(e,rd,rd,16); }
-static inline void rv613_store_nzvc16_move(tab5_rv613c_emit_t *e, unsigned value)
-{
-    rv613_srli(e,R_A2,value,8);
-    rv613_sw(e,R_A2,R_A0,D613_OFF_N);
-    rv613_sw(e,value,R_A0,D613_OFF_Z);
-    rv613_sw(e,R_ZERO,R_A0,D613_OFF_V);
-    rv613_sw(e,R_ZERO,R_A0,D613_OFF_C);
-}
-static inline void rv613_store_nzvc32_move(tab5_rv613c_emit_t *e, unsigned value)
-{
-    rv613_srli(e,R_A2,value,24);
-    rv613_sw(e,R_A2,R_A0,D613_OFF_N);
-    rv613_sw(e,value,R_A0,D613_OFF_Z);
-    rv613_sw(e,R_ZERO,R_A0,D613_OFF_V);
-    rv613_sw(e,R_ZERO,R_A0,D613_OFF_C);
-}
-
-static inline uint16_t tab5_dyn613c_fetch16(uint32_t pc)
-{
-    uint16_t v = 0;
-    if ((pc & 1u) || pc > 0x00bffffeu) return 0xffffu;
-    __builtin_memcpy(&v, MEM + pc, sizeof(v));
-    return v;
-}
-static inline uint32_t tab5_dyn613c_fetch32(uint32_t pc)
-{
-    return ((uint32_t)tab5_dyn613c_fetch16(pc) << 16) |
-           (uint32_t)tab5_dyn613c_fetch16(pc + 2u);
-}
-static uint32_t tab5_dyn613c_hash(uint32_t pc, uint32_t bytes)
-{
-    uint32_t h = 2166136261u;
-    for (uint32_t off = 0; off < bytes; off += 2u) {
-        const uint16_t w = tab5_dyn613c_fetch16(pc + off);
-        h ^= (uint8_t)(w >> 8); h *= 16777619u;
-        h ^= (uint8_t)w;      h *= 16777619u;
-    }
-    return h;
-}
-
-static void tab5_dyn613c_cache_reset(int count_flush)
-{
-    memset(s_dyn613c_blocks, 0, sizeof(s_dyn613c_blocks));
-    memset(s_dyn613c_cands, 0, sizeof(s_dyn613c_cands));
-    memset(s_dyn613c_block_l0, 0, sizeof(s_dyn613c_block_l0));
-    memset(s_dyn613c_edge_memo, 0, sizeof(s_dyn613c_edge_memo));
-    s_dyn613c_cand_epoch = 1u;
-    s_dyn613c_cand_miss_run = 0u;
-    s_dyn613c_active = 0;
-    s_dyn613c_arena_used = TAB5_DYN613C_ARENA_HEAD;
-    if (count_flush) ++s_dyn613c_flush;
-}
-
+/* R139A6 production-clean: retired generic runtime dynarec physically removed.
+ * X68P4 predecode is the only ESP execution-cache architecture. */
+unsigned int m68k_tab5_dynarec_metadata_bytes(void) { return 0u; }
 void m68k_tab5_dynarec_bind(void *arena, unsigned int bytes,
                             int (*sync_fn)(void *addr, unsigned int bytes))
-{
-    s_dyn613c_arena = (uint8_t *)arena;
-    s_dyn613c_arena_bytes = bytes;
-    s_dyn613c_sync = (tab5_dyn613c_sync_fn_t)sync_fn;
-    tab5_dyn613c_cache_reset(0);
-    printf("PX68K_DYN613C: native-loop JIT bound arena=%p bytes=%u head=%u sync=%s\n",
-           arena, bytes, (unsigned)TAB5_DYN613C_ARENA_HEAD,
-           sync_fn ? "READY" : "NONE");
-}
+{ (void)arena; (void)bytes; (void)sync_fn; }
 
-static int tab5_dyn613c_decode(uint32_t pc, tab5_dyn613c_dec_t *d)
-{
-    const uint16_t op = tab5_dyn613c_fetch16(pc);
-    memset(d,0,sizeof(*d)); d->pc=pc; d->op=op; d->len=2;
-
-    if ((op & 0xf1f8u) == 0x3000u) d->kind=D613_MOVE_W_RR;
-    else if ((op & 0xf1f8u) == 0x2000u) d->kind=D613_MOVE_L_RR;
-    else if ((op & 0xf1f8u) == 0x3040u) d->kind=D613_MOVEA_W_RR;
-    else if ((op & 0xf1f8u) == 0x2040u) d->kind=D613_MOVEA_L_RR;
-    else if ((op & 0xf100u) == 0x7000u) d->kind=D613_MOVEQ;
-    else if ((op & 0xf1f8u) == 0xd040u) d->kind=D613_ADD_W_RR;
-    else if ((op & 0xf1f8u) == 0xd080u) d->kind=D613_ADD_L_RR;
-    else if ((op & 0xf1f8u) == 0xd0c0u) d->kind=D613_ADDA_W_RR;
-    else if ((op & 0xf1f8u) == 0xd1c0u) d->kind=D613_ADDA_L_RR;
-    else if ((op & 0xf1f8u) == 0xc040u) d->kind=D613_AND_W_RR;
-    else if ((op & 0xf1f8u) == 0x8040u) d->kind=D613_OR_W_RR;
-    else if ((op & 0xf1f8u) == 0xb040u) d->kind=D613_CMP_W_RR;
-    else if ((op & 0xf1f8u) == 0xb080u) d->kind=D613_CMP_L_RR;
-    else if ((op & 0xf1f8u) == 0xb1c8u) d->kind=D613_CMPA_L_AA;
-    else if ((op & 0xf1ffu) == 0xc07cu) { d->kind=D613_AND_W_IMM; d->len=4; d->imm=tab5_dyn613c_fetch16(pc+2); }
-    else if ((op & 0xf1ffu) == 0xc0bcu) { d->kind=D613_AND_L_IMM; d->len=6; d->imm=tab5_dyn613c_fetch32(pc+2); }
-    else if ((op & 0xfff8u) == 0x0240u) { d->kind=D613_ANDI_W; d->len=4; d->imm=tab5_dyn613c_fetch16(pc+2); }
-    else if ((op & 0xfff8u) == 0x0280u) { d->kind=D613_ANDI_L; d->len=6; d->imm=tab5_dyn613c_fetch32(pc+2); }
-    else if ((op & 0xf1f8u) == 0x5040u) d->kind=D613_ADDQ_W;
-    else if ((op & 0xf1f8u) == 0x5140u) d->kind=D613_SUBQ_W;
-    else if ((op & 0xf1f8u) == 0x5048u || (op & 0xf1f8u) == 0x5088u) d->kind=D613_ADDQ_A;
-    else if ((op & 0xf1f8u) == 0xe040u) d->kind=D613_ASR_W;
-    else if ((op & 0xf1f8u) == 0xe080u) d->kind=D613_ASR_L;
-    else if ((op & 0xfff8u) == 0x48c0u) d->kind=D613_EXT_L;
-    else if ((op & 0xfff8u) == 0x4840u) d->kind=D613_SWAP;
-    else if ((op & 0xfff8u) == 0x4a40u) d->kind=D613_TST_W_D;
-    else if ((op & 0xfff8u) == 0x4a50u) d->kind=D613_TST_W_A;
-    else if (op == 0x4a79u) { d->kind=D613_TST_W_ABSL; d->len=6; d->imm=tab5_dyn613c_fetch32(pc+2)&0x00ffffffu; }
-    else if ((op & 0xf1f8u) == 0x3018u) d->kind=D613_MOVE_W_PI_D;
-    else if ((op & 0xf1f8u) == 0x2018u) d->kind=D613_MOVE_L_PI_D;
-    else if ((op & 0xf1f8u) == 0x30c0u) d->kind=D613_MOVE_W_D_PI;
-    else if ((op & 0xf1f8u) == 0x20c0u) d->kind=D613_MOVE_L_D_PI;
-    else if ((op & 0xf1f8u) == 0x20d8u) d->kind=D613_MOVE_L_PI_PI;
-    else if ((op & 0xfff8u) == 0x4258u) d->kind=D613_CLR_W_PI;
-    else if ((op & 0xfff8u) == 0x4298u) d->kind=D613_CLR_L_PI;
-    else if ((op & 0xf000u) == 0x6000u) {
-        const unsigned cc=(op>>8)&15u; const uint8_t lo=(uint8_t)op;
-        if (!(cc==6u || cc==7u || cc==10u || cc==11u)) {
-            s_dyn613c_last_bad_pc=pc; s_dyn613c_last_bad_op=op; return 0;
-        }
-        d->kind=D613_BCC_FINAL;
-        if (lo==0u) { d->len=4; d->imm=(uint32_t)(int32_t)(int16_t)tab5_dyn613c_fetch16(pc+2); }
-        else if (lo==0xffu) { s_dyn613c_last_bad_pc=pc; s_dyn613c_last_bad_op=op; return 0; }
-        else d->imm=(uint32_t)(int32_t)(int8_t)lo;
-    } else { s_dyn613c_last_bad_pc=pc; s_dyn613c_last_bad_op=op; return 0; }
-    return d->kind != D613_NONE;
-}
-
-static inline unsigned d613_src_d(uint16_t op) { return op & 7u; }
-static inline unsigned d613_dst_d(uint16_t op) { return (op >> 9) & 7u; }
-static inline unsigned d613_src_a(uint16_t op) { return op & 7u; }
-static inline unsigned d613_dst_a(uint16_t op) { return (op >> 9) & 7u; }
-static inline unsigned d613_quick(uint16_t op) { return (((op>>9)-1u)&7u)+1u; }
-
-static inline uint32_t tab5_dyn613c_dec_cycles(const tab5_dyn613c_dec_t *d)
-{
-    uint32_t c=CYC_INSTRUCTION[d->op];
-    if (d->kind==D613_ASR_W || d->kind==D613_ASR_L)
-        c += (d613_quick(d->op) << CYC_SHIFT);
-    return c;
-}
+/* R57E138A link-compatible tombstones: runtime trace/JIT code is not built. */
+void m68k_tab5_trace134_bind(void *arena, unsigned int bytes,
+                             int (*sync_fn)(void *addr, unsigned int bytes))
+{ (void)arena; (void)bytes; (void)sync_fn; }
+void m68k_tab5_trace134_invalidate_all(void) { }
+void m68k_tab5_trace134_invalidate_range(uint32_t address, uint32_t bytes)
+{ (void)address; (void)bytes; }
 
 
-/* c7/c8 exact native code signature.  Guest RAM stores each 68000 word in the
- * host halfword layout already used by the generated data paths.  Keep all
- * loads naturally aligned: if start is +2 mod 4, compare one halfword first,
- * then use 32-bit pairs, then a final halfword if needed.  XOR/OR accumulates
- * all differences so the hot path has only one branch. */
-static void rv613_emit_signature_guard(tab5_rv613c_emit_t *e,
-                                       uint32_t start, uint32_t bytes)
-{
-    uint32_t off=0u;
-    rv613_li(e,R_A6,start);
-    rv613_add(e,R_A6,R_A1,R_A6);
-    rv613_addi(e,R_A7,R_ZERO,0);
-
-    if ((start & 2u) && bytes >= 2u) {
-        const uint32_t expect=(uint32_t)tab5_dyn613c_fetch16(start);
-        rv613_lhu(e,R_T0,R_A6,0);
-        rv613_li(e,R_T1,expect);
-        rv613_xor(e,R_T0,R_T0,R_T1);
-        rv613_or(e,R_A7,R_A7,R_T0);
-        off=2u;
-    }
-    while (off+4u <= bytes) {
-        const uint32_t expect=(uint32_t)tab5_dyn613c_fetch16(start+off) |
-                              ((uint32_t)tab5_dyn613c_fetch16(start+off+2u) << 16);
-        rv613_lw(e,R_T0,R_A6,(int)off);
-        rv613_li(e,R_T1,expect);
-        rv613_xor(e,R_T0,R_T0,R_T1);
-        rv613_or(e,R_A7,R_A7,R_T0);
-        off+=4u;
-    }
-    if (off+2u <= bytes) {
-        const uint32_t expect=(uint32_t)tab5_dyn613c_fetch16(start+off);
-        rv613_lhu(e,R_T0,R_A6,(int)off);
-        rv613_li(e,R_T1,expect);
-        rv613_xor(e,R_T0,R_T0,R_T1);
-        rv613_or(e,R_A7,R_A7,R_T0);
-    }
-
-    /* Equal -> skip the private mismatch return and enter the translated body. */
-    const unsigned ok=rv613_branch_placeholder(e,0,R_A7,R_ZERO); /* BEQ */
-    rv613_li(e,R_A0,0xffffffffu); /* TAB5_DYN613C_SIG_MISMATCH */
-    rv613_ret(e);
-    rv613_patch_branch(e,ok,0,R_A7,R_ZERO,e->n);
-}
-
-/* c8 native RAM preflight: emit the exact c6/c7 C predicate before any guest
- * side effect.  Used An values must be even, 24-bit, and keep the complete
- * access span inside 12 MiB guest RAM.  Write spans must not overlap this
- * block's guest-code bytes.  All failures return private sentinel -2. */
-static void rv613_emit_ram_guard(tab5_rv613c_emit_t *e,
-                                 const uint8_t mem_span[8], uint8_t write_mask,
-                                 uint32_t code_start, uint32_t code_end)
-{
-    unsigned fail[24];
-    unsigned nf=0u;
-    for (unsigned a=0;a<8u;++a) {
-        const unsigned span=mem_span[a];
-        if (!span) continue;
-        rv613_load_da(e,R_T0,a+8u);
-        rv613_li(e,R_T1,0xff000001u);
-        rv613_and(e,R_T2,R_T0,R_T1);
-        if (nf >= sizeof(fail)/sizeof(fail[0])) { e->failed=1; return; }
-        fail[nf++]=rv613_branch_placeholder(e,1,R_T2,R_ZERO); /* BNE */
-        rv613_li(e,R_T1,0x00c00000u-span);
-        rv613_sltu(e,R_T2,R_T1,R_T0); /* limit < v */
-        if (nf >= sizeof(fail)/sizeof(fail[0])) { e->failed=1; return; }
-        fail[nf++]=rv613_branch_placeholder(e,1,R_T2,R_ZERO); /* BNE */
-        if (write_mask&(1u<<a)) {
-            rv613_li(e,R_T1,code_end);
-            rv613_sltu(e,R_T2,R_T0,R_T1); /* v < code_end */
-            const unsigned safe_hi=rv613_branch_placeholder(e,0,R_T2,R_ZERO); /* BEQ */
-            rv613_addi(e,R_A2,R_T0,(int)span);
-            rv613_li(e,R_T1,code_start);
-            rv613_sltu(e,R_T2,R_T1,R_A2); /* code_start < end */
-            if (nf >= sizeof(fail)/sizeof(fail[0])) { e->failed=1; return; }
-            fail[nf++]=rv613_branch_placeholder(e,1,R_T2,R_ZERO); /* BNE */
-            rv613_patch_branch(e,safe_hi,0,R_T2,R_ZERO,e->n);
-        }
-    }
-    const unsigned pass=rv613_branch_placeholder(e,0,R_ZERO,R_ZERO); /* always */
-    const unsigned fail_at=e->n;
-    rv613_li(e,R_A0,0xfffffffeu);
-    rv613_ret(e);
-    const unsigned body_at=e->n;
-    rv613_patch_branch(e,pass,0,R_ZERO,R_ZERO,body_at);
-    for (unsigned i=0;i<nf;++i)
-        rv613_patch_branch(e,fail[i],1,R_T2,R_ZERO,fail_at);
-}
-
-static void rv613_write_pc_exit(tab5_rv613c_emit_t *e, uint32_t ppc, uint16_t ir,
-                                uint32_t pc, uint32_t cycles)
-{
-    rv613_li(e,R_T0,ppc); rv613_sw(e,R_T0,R_A0,D613_OFF_PPC);
-    rv613_li(e,R_T0,(uint32_t)ir); rv613_sw(e,R_T0,R_A0,D613_OFF_IR);
-    rv613_li(e,R_T0,pc); rv613_sw(e,R_T0,R_A0,D613_OFF_PC);
-    rv613_li(e,R_A0,cycles); rv613_ret(e);
-}
-
-static void rv613_emit_nzvc_sub32(tab5_rv613c_emit_t *e, unsigned src, unsigned dst, unsigned res)
-{
-    /* N = R>>24; Z = R; V=((S^D)&(R^D))>>24; C=((S&R)|(~D&(S|R)))>>23 */
-    rv613_srli(e,R_A2,res,24); rv613_sw(e,R_A2,R_A0,D613_OFF_N);
-    rv613_sw(e,res,R_A0,D613_OFF_Z);
-    rv613_xor(e,R_A2,src,dst); rv613_xor(e,R_A3,res,dst);
-    rv613_and(e,R_A2,R_A2,R_A3); rv613_srli(e,R_A2,R_A2,24); rv613_sw(e,R_A2,R_A0,D613_OFF_V);
-    rv613_and(e,R_A2,src,res); rv613_or(e,R_A3,src,res);
-    rv613_emit(e, rv613_i(0x13,R_A4,4,R_ZERO,-1)); /* xori a4,zero,-1 -> all ones */
-    rv613_xor(e,R_A4,dst,R_A4); rv613_and(e,R_A3,R_A4,R_A3);
-    rv613_or(e,R_A2,R_A2,R_A3); rv613_srli(e,R_A2,R_A2,23); rv613_sw(e,R_A2,R_A0,D613_OFF_C);
-}
-
-static int tab5_dyn613c_emit_insn(tab5_rv613c_emit_t *e, const tab5_dyn613c_dec_t *d)
-{
-    const uint16_t op=d->op; unsigned s,t,q,sh;
-    switch ((tab5_dyn613c_kind_t)d->kind) {
-    case D613_MOVE_W_RR:
-        s=d613_src_d(op); t=d613_dst_d(op);
-        rv613_load_da(e,R_T0,s); rv613_mask16(e,R_T1,R_T0);
-        rv613_load_da(e,R_T0,t); rv613_upper16(e,R_T0,R_T0); rv613_or(e,R_T0,R_T0,R_T1); rv613_store_da(e,R_T0,t);
-        rv613_store_nzvc16_move(e,R_T1); return 1;
-    case D613_MOVE_L_RR:
-        s=d613_src_d(op); t=d613_dst_d(op); rv613_load_da(e,R_T0,s); rv613_store_da(e,R_T0,t); rv613_store_nzvc32_move(e,R_T0); return 1;
-    case D613_MOVEA_W_RR:
-        s=d613_src_d(op); t=d613_dst_a(op)+8u; rv613_load_da(e,R_T0,s); rv613_slli(e,R_T0,R_T0,16); rv613_srai(e,R_T0,R_T0,16); rv613_store_da(e,R_T0,t); return 1;
-    case D613_MOVEA_L_RR:
-        s=d613_src_d(op); t=d613_dst_a(op)+8u; rv613_load_da(e,R_T0,s); rv613_store_da(e,R_T0,t); return 1;
-    case D613_MOVEQ:
-        t=d613_dst_d(op); rv613_li(e,R_T0,(uint32_t)(int32_t)(int8_t)op); rv613_store_da(e,R_T0,t); rv613_store_nzvc32_move(e,R_T0); return 1;
-    case D613_ADD_W_RR:
-    case D613_ADD_L_RR:
-        s=d613_src_d(op); t=d613_dst_d(op); rv613_load_da(e,R_T0,s); rv613_load_da(e,R_T1,t);
-        if (d->kind==D613_ADD_L_RR) {
-            rv613_add(e,R_T2,R_T0,R_T1); rv613_store_da(e,R_T2,t);
-            rv613_srli(e,R_A2,R_T2,24); rv613_sw(e,R_A2,R_A0,D613_OFF_N); rv613_sw(e,R_T2,R_A0,D613_OFF_Z);
-            rv613_xor(e,R_A2,R_T0,R_T2); rv613_xor(e,R_A3,R_T1,R_T2); rv613_and(e,R_A2,R_A2,R_A3); rv613_srli(e,R_A2,R_A2,24); rv613_sw(e,R_A2,R_A0,D613_OFF_V);
-            /* Exact Musashi CFLAG_ADD_32: ((S&D)|(~R&(S|D)))>>23. */
-            rv613_and(e,R_A2,R_T0,R_T1); rv613_or(e,R_A3,R_T0,R_T1);
-            rv613_li(e,R_A4,0xffffffffu); rv613_xor(e,R_A4,R_T2,R_A4);
-            rv613_and(e,R_A3,R_A3,R_A4); rv613_or(e,R_A2,R_A2,R_A3);
-            rv613_srli(e,R_A2,R_A2,23);
-            rv613_sw(e,R_A2,R_A0,D613_OFF_C); rv613_sw(e,R_A2,R_A0,D613_OFF_X); return 1;
-        }
-        rv613_mask16(e,R_T0,R_T0); rv613_mask16(e,R_A4,R_T1); rv613_add(e,R_T2,R_T0,R_A4);
-        rv613_mask16(e,R_A2,R_T2); rv613_upper16(e,R_T1,R_T1); rv613_or(e,R_T1,R_T1,R_A2); rv613_store_da(e,R_T1,t);
-        rv613_srli(e,R_A3,R_T2,8); rv613_sw(e,R_A3,R_A0,D613_OFF_N); rv613_sw(e,R_A2,R_A0,D613_OFF_Z);
-        rv613_xor(e,R_A3,R_T0,R_T2); rv613_xor(e,R_A4,R_A4,R_T2); rv613_and(e,R_A3,R_A3,R_A4); rv613_srli(e,R_A3,R_A3,8); rv613_sw(e,R_A3,R_A0,D613_OFF_V);
-        rv613_srli(e,R_A3,R_T2,8); rv613_sw(e,R_A3,R_A0,D613_OFF_C); rv613_sw(e,R_A3,R_A0,D613_OFF_X); return 1;
-    case D613_ADDA_W_RR:
-    case D613_ADDA_L_RR:
-        s=d613_src_d(op); t=d613_dst_a(op)+8u; rv613_load_da(e,R_T0,s); rv613_load_da(e,R_T1,t);
-        if (d->kind==D613_ADDA_W_RR) { rv613_slli(e,R_T0,R_T0,16); rv613_srai(e,R_T0,R_T0,16); }
-        rv613_add(e,R_T1,R_T1,R_T0); rv613_store_da(e,R_T1,t); return 1;
-    case D613_AND_W_RR:
-    case D613_OR_W_RR:
-        s=d613_src_d(op); t=d613_dst_d(op); rv613_load_da(e,R_T0,s); rv613_load_da(e,R_T1,t); rv613_mask16(e,R_T0,R_T0); rv613_mask16(e,R_T2,R_T1);
-        if (d->kind==D613_AND_W_RR) rv613_and(e,R_T2,R_T2,R_T0); else rv613_or(e,R_T2,R_T2,R_T0);
-        rv613_upper16(e,R_T1,R_T1); rv613_or(e,R_T1,R_T1,R_T2); rv613_store_da(e,R_T1,t); rv613_store_nzvc16_move(e,R_T2); return 1;
-    case D613_CMP_W_RR:
-    case D613_CMP_L_RR:
-        s=d613_src_d(op); t=d613_dst_d(op); rv613_load_da(e,R_T0,s); rv613_load_da(e,R_T1,t);
-        if (d->kind==D613_CMP_W_RR) {
-            rv613_mask16(e,R_T0,R_T0); rv613_mask16(e,R_T1,R_T1); rv613_sub(e,R_T2,R_T1,R_T0); rv613_mask16(e,R_A2,R_T2);
-            rv613_srli(e,R_A3,R_T2,8); rv613_sw(e,R_A3,R_A0,D613_OFF_N); rv613_sw(e,R_A2,R_A0,D613_OFF_Z);
-            rv613_xor(e,R_A3,R_T0,R_T1); rv613_xor(e,R_A4,R_T2,R_T1); rv613_and(e,R_A3,R_A3,R_A4); rv613_srli(e,R_A3,R_A3,8); rv613_sw(e,R_A3,R_A0,D613_OFF_V);
-            rv613_srli(e,R_A3,R_T2,8); /* exact CFLAG_16(res) */ rv613_sw(e,R_A3,R_A0,D613_OFF_C); return 1;
-        }
-        rv613_sub(e,R_T2,R_T1,R_T0); rv613_emit_nzvc_sub32(e,R_T0,R_T1,R_T2); return 1;
-    case D613_CMPA_L_AA:
-        s=d613_src_a(op)+8u; t=d613_dst_a(op)+8u; rv613_load_da(e,R_T0,s); rv613_load_da(e,R_T1,t); rv613_sub(e,R_T2,R_T1,R_T0); rv613_emit_nzvc_sub32(e,R_T0,R_T1,R_T2); return 1;
-    case D613_AND_W_IMM:
-    case D613_ANDI_W:
-        t=(d->kind==D613_AND_W_IMM)?d613_dst_d(op):d613_src_d(op); rv613_load_da(e,R_T0,t); rv613_mask16(e,R_T1,R_T0); rv613_li(e,R_T2,d->imm&0xffffu); rv613_and(e,R_T1,R_T1,R_T2); rv613_upper16(e,R_T0,R_T0); rv613_or(e,R_T0,R_T0,R_T1); rv613_store_da(e,R_T0,t); rv613_store_nzvc16_move(e,R_T1); return 1;
-    case D613_AND_L_IMM:
-    case D613_ANDI_L:
-        t=(d->kind==D613_AND_L_IMM)?d613_dst_d(op):d613_src_d(op); rv613_load_da(e,R_T0,t); rv613_li(e,R_T1,d->imm); rv613_and(e,R_T0,R_T0,R_T1); rv613_store_da(e,R_T0,t); rv613_store_nzvc32_move(e,R_T0); return 1;
-    case D613_ADDQ_W:
-    case D613_SUBQ_W:
-        t=d613_src_d(op); q=d613_quick(op); rv613_load_da(e,R_T0,t); rv613_mask16(e,R_T1,R_T0); rv613_li(e,R_T2,q);
-        if (d->kind==D613_ADDQ_W) rv613_add(e,R_A2,R_T1,R_T2); else rv613_sub(e,R_A2,R_T1,R_T2);
-        rv613_mask16(e,R_A3,R_A2); rv613_upper16(e,R_T0,R_T0); rv613_or(e,R_T0,R_T0,R_A3); rv613_store_da(e,R_T0,t);
-        rv613_srli(e,R_A4,R_A2,8); rv613_sw(e,R_A4,R_A0,D613_OFF_N); rv613_sw(e,R_A3,R_A0,D613_OFF_Z);
-        if (d->kind==D613_ADDQ_W) {
-            rv613_xor(e,R_A4,R_T2,R_A2); rv613_xor(e,R_A5,R_T1,R_A2); rv613_and(e,R_A4,R_A4,R_A5); rv613_srli(e,R_A4,R_A4,8); rv613_sw(e,R_A4,R_A0,D613_OFF_V);
-            rv613_srli(e,R_A4,R_A2,8); rv613_sw(e,R_A4,R_A0,D613_OFF_C); rv613_sw(e,R_A4,R_A0,D613_OFF_X);
-        } else {
-            rv613_xor(e,R_A4,R_T2,R_T1); rv613_xor(e,R_A5,R_A2,R_T1); rv613_and(e,R_A4,R_A4,R_A5); rv613_srli(e,R_A4,R_A4,8); rv613_sw(e,R_A4,R_A0,D613_OFF_V);
-            rv613_srli(e,R_A4,R_A2,8); /* exact CFLAG_16(res) */ rv613_sw(e,R_A4,R_A0,D613_OFF_C); rv613_sw(e,R_A4,R_A0,D613_OFF_X);
-        } return 1;
-    case D613_ADDQ_A:
-        t=d613_src_a(op)+8u; q=d613_quick(op); rv613_load_da(e,R_T0,t); rv613_addi(e,R_T0,R_T0,(int)q); rv613_store_da(e,R_T0,t); return 1;
-    case D613_ASR_W:
-    case D613_ASR_L:
-        t=d613_src_d(op); sh=d613_quick(op); rv613_load_da(e,R_T0,t);
-        if (d->kind==D613_ASR_L) {
-            rv613_srai(e,R_T1,R_T0,sh); rv613_store_da(e,R_T1,t); rv613_store_nzvc32_move(e,R_T1);
-            rv613_slli(e,R_T2,R_T0,9u-sh); rv613_sw(e,R_T2,R_A0,D613_OFF_C); rv613_sw(e,R_T2,R_A0,D613_OFF_X); return 1;
-        }
-        rv613_mask16(e,R_T1,R_T0); rv613_slli(e,R_T2,R_T1,16); rv613_srai(e,R_T2,R_T2,16); rv613_srai(e,R_T2,R_T2,sh); rv613_mask16(e,R_A2,R_T2);
-        rv613_upper16(e,R_T0,R_T0); rv613_or(e,R_T0,R_T0,R_A2); rv613_store_da(e,R_T0,t); rv613_store_nzvc16_move(e,R_A2);
-        rv613_slli(e,R_T1,R_T1,9u-sh); rv613_sw(e,R_T1,R_A0,D613_OFF_C); rv613_sw(e,R_T1,R_A0,D613_OFF_X); return 1;
-    case D613_EXT_L:
-        t=d613_src_d(op); rv613_load_da(e,R_T0,t); rv613_slli(e,R_T0,R_T0,16); rv613_srai(e,R_T0,R_T0,16); rv613_store_da(e,R_T0,t); rv613_store_nzvc32_move(e,R_T0); return 1;
-    case D613_SWAP:
-        t=d613_src_d(op); rv613_load_da(e,R_T0,t); rv613_slli(e,R_T1,R_T0,16); rv613_srli(e,R_T0,R_T0,16); rv613_or(e,R_T0,R_T0,R_T1); rv613_store_da(e,R_T0,t); rv613_store_nzvc32_move(e,R_T0); return 1;
-    case D613_TST_W_D:
-        t=d613_src_d(op); rv613_load_da(e,R_T0,t); rv613_mask16(e,R_T0,R_T0); rv613_store_nzvc16_move(e,R_T0); return 1;
-    case D613_TST_W_A:
-        t=d613_src_a(op)+8u; rv613_load_da(e,R_T0,t); rv613_add(e,R_T1,R_A1,R_T0); rv613_lhu(e,R_T0,R_T1,0); rv613_store_nzvc16_move(e,R_T0); return 1;
-    case D613_TST_W_ABSL:
-        rv613_li(e,R_T0,d->imm); rv613_add(e,R_T1,R_A1,R_T0); rv613_lhu(e,R_T0,R_T1,0); rv613_store_nzvc16_move(e,R_T0); return 1;
-    case D613_MOVE_W_PI_D:
-    case D613_MOVE_L_PI_D: {
-        const unsigned ar=d613_src_a(op)+8u, dr=d613_dst_d(op); rv613_load_da(e,R_T0,ar); rv613_add(e,R_T1,R_A1,R_T0);
-        if (d->kind==D613_MOVE_W_PI_D) {
-            rv613_lhu(e,R_T2,R_T1,0); rv613_addi(e,R_T0,R_T0,2); rv613_store_da(e,R_T0,ar); rv613_load_da(e,R_A2,dr); rv613_upper16(e,R_A2,R_A2); rv613_or(e,R_A2,R_A2,R_T2); rv613_store_da(e,R_A2,dr); rv613_store_nzvc16_move(e,R_T2);
-        } else {
-            rv613_lhu(e,R_T2,R_T1,0); rv613_lhu(e,R_A2,R_T1,2); rv613_slli(e,R_T2,R_T2,16); rv613_or(e,R_T2,R_T2,R_A2); rv613_addi(e,R_T0,R_T0,4); rv613_store_da(e,R_T0,ar); rv613_store_da(e,R_T2,dr); rv613_store_nzvc32_move(e,R_T2);
-        } return 1; }
-    case D613_MOVE_W_D_PI:
-    case D613_MOVE_L_D_PI: {
-        const unsigned dr=d613_src_d(op), ar=d613_dst_a(op)+8u; rv613_load_da(e,R_T0,ar); rv613_add(e,R_T1,R_A1,R_T0); rv613_load_da(e,R_T2,dr);
-        if (d->kind==D613_MOVE_W_D_PI) { rv613_sh(e,R_T2,R_T1,0); rv613_addi(e,R_T0,R_T0,2); rv613_store_da(e,R_T0,ar); rv613_mask16(e,R_T2,R_T2); rv613_store_nzvc16_move(e,R_T2); }
-        else { rv613_srli(e,R_A2,R_T2,16); rv613_sh(e,R_A2,R_T1,0); rv613_sh(e,R_T2,R_T1,2); rv613_addi(e,R_T0,R_T0,4); rv613_store_da(e,R_T0,ar); rv613_store_nzvc32_move(e,R_T2); }
-        return 1; }
-    case D613_MOVE_L_PI_PI: {
-        const unsigned sa=d613_src_a(op)+8u, da=d613_dst_a(op)+8u; if (sa==da) return 0;
-        rv613_load_da(e,R_T0,sa); rv613_add(e,R_T1,R_A1,R_T0); rv613_lhu(e,R_T2,R_T1,0); rv613_lhu(e,R_A2,R_T1,2); rv613_slli(e,R_T2,R_T2,16); rv613_or(e,R_T2,R_T2,R_A2); rv613_addi(e,R_T0,R_T0,4); rv613_store_da(e,R_T0,sa);
-        rv613_load_da(e,R_T0,da); rv613_add(e,R_T1,R_A1,R_T0); rv613_srli(e,R_A2,R_T2,16); rv613_sh(e,R_A2,R_T1,0); rv613_sh(e,R_T2,R_T1,2); rv613_addi(e,R_T0,R_T0,4); rv613_store_da(e,R_T0,da); rv613_store_nzvc32_move(e,R_T2); return 1; }
-    case D613_CLR_W_PI:
-    case D613_CLR_L_PI: {
-        const unsigned ar=d613_src_a(op)+8u; rv613_load_da(e,R_T0,ar); rv613_add(e,R_T1,R_A1,R_T0); rv613_sh(e,R_ZERO,R_T1,0);
-        if (d->kind==D613_CLR_L_PI) rv613_sh(e,R_ZERO,R_T1,2);
-        rv613_addi(e,R_T0,R_T0,d->kind==D613_CLR_L_PI?4:2); rv613_store_da(e,R_T0,ar); rv613_sw(e,R_ZERO,R_A0,D613_OFF_N); rv613_sw(e,R_ZERO,R_A0,D613_OFF_V); rv613_sw(e,R_ZERO,R_A0,D613_OFF_C); rv613_li(e,R_T0,0); rv613_sw(e,R_T0,R_A0,D613_OFF_Z); return 1; }
-    default: return 0;
-    }
-}
-
-static int tab5_dyn613c_scan(uint32_t start, uint32_t branch_pc, uint16_t branch_op,
-                             tab5_dyn613c_dec_t *out, unsigned *out_n,
-                             uint8_t mem_span[8], uint8_t *write_mask,
-                             uint32_t *cycles_taken, uint32_t *cycles_not)
-{
-    uint32_t pc=start, cyc=0; unsigned n=0; uint8_t mem_used=0, a_other_mod=0;
-    memset(mem_span,0,8); *write_mask=0;
-    if ((start|branch_pc)&1u || start>=0x00c00000u || branch_pc>=0x00c00000u || branch_pc<start || branch_pc-start>TAB5_DYN613C_MAX_GUEST_BYTES) return 0;
-    while (pc <= branch_pc && n<TAB5_DYN613C_MAX_INSNS) {
-        tab5_dyn613c_dec_t d; if (!tab5_dyn613c_decode(pc,&d)) return 0;
-        if (pc==branch_pc) {
-            if (d.kind!=D613_BCC_FINAL || d.op!=branch_op) return 0;
-            const uint32_t target=((pc+2u)+(int32_t)d.imm)&0x00ffffffu;
-            if (target!=start) return 0;
-            out[n++]=d; cyc += CYC_INSTRUCTION[d.op];
-            *cycles_taken=cyc; *cycles_not=cyc + ((d.len==2)?CYC_BCC_NOTAKE_B:CYC_BCC_NOTAKE_W); *out_n=n;
-            /* Tiny TST/poll loops already have scheduler fast-forward that is much
-             * stronger than one-iteration JIT; never steal those hot paths. */
-            if (n==2u && (out[0].kind==D613_TST_W_A || out[0].kind==D613_TST_W_ABSL)) return -2;
-            if (n==3u && out[0].kind==D613_CLR_L_PI && out[1].kind==D613_CMPA_L_AA && ((d.op>>8)&15u)==6u) return -2;
-            if (n==5u && out[0].kind==D613_CLR_W_PI && out[1].kind==D613_CLR_W_PI && out[2].kind==D613_SUBQ_W && out[3].kind==D613_ADDQ_A && ((d.op>>8)&15u)==10u) return -2;
-            return n>=TAB5_DYN613C_MIN_INSNS ? 1 : 0;
-        }
-        if (d.kind==D613_BCC_FINAL) return 0; /* internal branch */
-        out[n++]=d; cyc += tab5_dyn613c_dec_cycles(&d);
-        unsigned ar=99, bytes=0; int wr=0, othermod=0;
-        switch ((tab5_dyn613c_kind_t)d.kind) {
-        case D613_TST_W_A: ar=d613_src_a(d.op); bytes=2; break;
-        case D613_TST_W_ABSL: if ((d.imm&1u)||d.imm>0x00bffffeu) return -3; break;
-        case D613_MOVE_W_PI_D: ar=d613_src_a(d.op); bytes=2; break;
-        case D613_MOVE_L_PI_D: ar=d613_src_a(d.op); bytes=4; break;
-        case D613_MOVE_W_D_PI: ar=d613_dst_a(d.op); bytes=2; wr=1; break;
-        case D613_MOVE_L_D_PI: ar=d613_dst_a(d.op); bytes=4; wr=1; break;
-        case D613_CLR_W_PI: ar=d613_src_a(d.op); bytes=2; wr=1; break;
-        case D613_CLR_L_PI: ar=d613_src_a(d.op); bytes=4; wr=1; break;
-        case D613_MOVE_L_PI_PI: {
-            unsigned sa=d613_src_a(d.op), da=d613_dst_a(d.op); if (sa==da) return -3;
-            if ((a_other_mod&(1u<<sa))||(a_other_mod&(1u<<da))) return -3;
-            if ((unsigned)mem_span[sa]+4u>255u || (unsigned)mem_span[da]+4u>255u) return -3;
-            mem_span[sa]+=4; mem_span[da]+=4; mem_used|=(1u<<sa)|(1u<<da); *write_mask|=1u<<da; break; }
-        case D613_MOVEA_W_RR: case D613_MOVEA_L_RR: case D613_ADDA_W_RR: case D613_ADDA_L_RR: ar=d613_dst_a(d.op); othermod=1; break;
-        case D613_ADDQ_A: ar=d613_src_a(d.op); othermod=1; break;
-        default: break;
-        }
-        if (ar<8u) {
-            if (othermod) { if (mem_used&(1u<<ar)) return -3; a_other_mod|=1u<<ar; }
-            else if (bytes) { if (a_other_mod&(1u<<ar)) return -3; if ((unsigned)mem_span[ar]+bytes>255u) return -3; mem_span[ar]+=(uint8_t)bytes; mem_used|=1u<<ar; if(wr)*write_mask|=1u<<ar; }
-        }
-        pc += d.len; if (pc>branch_pc && pc!=branch_pc) return 0;
-    }
-    return 0;
-}
-
-/* c6: rebuild RAM guard metadata from exactly the instructions that will
- * execute natively. c5 fragments inherited the full source-loop spans. */
-static int tab5_dyn613c_mem_meta_exact(const tab5_dyn613c_dec_t *d, unsigned n,
-                                       uint8_t mem_span[8], uint8_t *write_mask)
-{
-    uint8_t mem_used=0, a_other_mod=0;
-    memset(mem_span,0,8); *write_mask=0;
-    for (unsigned i=0; i<n; ++i) {
-        unsigned ar=99, bytes=0; int wr=0, othermod=0;
-        switch ((tab5_dyn613c_kind_t)d[i].kind) {
-        case D613_TST_W_A: ar=d613_src_a(d[i].op); bytes=2; break;
-        case D613_TST_W_ABSL:
-            if ((d[i].imm&1u) || d[i].imm>0x00bffffeu) return 0;
-            break;
-        case D613_MOVE_W_PI_D: ar=d613_src_a(d[i].op); bytes=2; break;
-        case D613_MOVE_L_PI_D: ar=d613_src_a(d[i].op); bytes=4; break;
-        case D613_MOVE_W_D_PI: ar=d613_dst_a(d[i].op); bytes=2; wr=1; break;
-        case D613_MOVE_L_D_PI: ar=d613_dst_a(d[i].op); bytes=4; wr=1; break;
-        case D613_CLR_W_PI: ar=d613_src_a(d[i].op); bytes=2; wr=1; break;
-        case D613_CLR_L_PI: ar=d613_src_a(d[i].op); bytes=4; wr=1; break;
-        case D613_MOVE_L_PI_PI: {
-            const unsigned sa=d613_src_a(d[i].op), da=d613_dst_a(d[i].op);
-            if (sa==da) return 0;
-            if ((a_other_mod&(1u<<sa)) || (a_other_mod&(1u<<da))) return 0;
-            if ((unsigned)mem_span[sa]+4u>255u || (unsigned)mem_span[da]+4u>255u) return 0;
-            mem_span[sa]+=4; mem_span[da]+=4;
-            mem_used|=(1u<<sa)|(1u<<da); *write_mask|=1u<<da;
-            break;
-        }
-        case D613_MOVEA_W_RR: case D613_MOVEA_L_RR:
-        case D613_ADDA_W_RR: case D613_ADDA_L_RR:
-            ar=d613_dst_a(d[i].op); othermod=1; break;
-        case D613_ADDQ_A:
-            ar=d613_src_a(d[i].op); othermod=1; break;
-        default: break;
-        }
-        if (ar<8u) {
-            if (othermod) {
-                if (mem_used&(1u<<ar)) return 0;
-                a_other_mod|=1u<<ar;
-            } else if (bytes) {
-                if (a_other_mod&(1u<<ar)) return 0;
-                if ((unsigned)mem_span[ar]+bytes>255u) return 0;
-                mem_span[ar]+=(uint8_t)bytes; mem_used|=1u<<ar;
-                if (wr) *write_mask|=1u<<ar;
-            }
-        }
-    }
-    return 1;
-}
-
-static int tab5_dyn613c_preflight(const tab5_dyn613c_block_t *b)
-{
-    for (unsigned a=0;a<8u;++a) if (b->mem_span[a]) {
-        const uint32_t v=REG_A[a]; const uint32_t span=b->mem_span[a];
-        if ((v&0xff000001u) || v>0x00c00000u-span) return 0;
-        if (b->mem_write_mask&(1u<<a)) {
-            const uint32_t e=v+span, cs=b->start_pc, ce=b->fall_pc;
-            if (!(e<=cs || v>=ce)) return 0;
-        }
-    }
-    return 1;
-}
-
-static inline unsigned tab5_dyn613c_block_l0_index(uint32_t pc)
-{
-    return ((pc >> 1) ^ (pc >> 7) ^ (pc >> 13)) & (TAB5_DYN613C_BLOCK_L0_SLOTS - 1u);
-}
-
-static inline void tab5_dyn613c_block_l0_fill(tab5_dyn613c_block_t *b)
-{
-    if (!b) return;
-    const unsigned bi=(unsigned)(b-s_dyn613c_blocks);
-    if (bi>=TAB5_DYN613C_BLOCK_SLOTS) return;
-    tab5_dyn613c_block_l0_t * const e=&s_dyn613c_block_l0[tab5_dyn613c_block_l0_index(b->start_pc)];
-    e->pc=b->start_pc;
-    e->block_plus1=(uint8_t)(bi+1u);
-}
-
-static tab5_dyn613c_block_t *tab5_dyn613c_find(uint32_t pc)
-{
-    if (!s_dyn613c_active) return NULL;
-    tab5_dyn613c_block_l0_t * const l0=&s_dyn613c_block_l0[tab5_dyn613c_block_l0_index(pc)];
-    if (l0->block_plus1 && l0->pc==pc) {
-        const unsigned bi=(unsigned)l0->block_plus1-1u;
-        if (bi<TAB5_DYN613C_BLOCK_SLOTS) {
-            tab5_dyn613c_block_t * const b=&s_dyn613c_blocks[bi];
-            if (b->valid && b->start_pc==pc) { ++s_dyn613c_l0_hits; return b; }
-        }
-        l0->block_plus1=0u;
-    }
-    ++s_dyn613c_l0_misses;
-    const unsigned base=((pc>>1)^(pc>>7))&(TAB5_DYN613C_BLOCK_SLOTS-1u);
-    for (unsigned p=0;p<4u;++p) {
-        tab5_dyn613c_block_t *b=&s_dyn613c_blocks[(base+p)&(TAB5_DYN613C_BLOCK_SLOTS-1u)];
-        if (b->valid && b->start_pc==pc) { tab5_dyn613c_block_l0_fill(b); return b; }
-    }
-    return NULL;
-}
-
-static inline void tab5_dyn613c_candidate_epoch_advance(void);
-
-static inline unsigned tab5_dyn613c_edge_memo_index(uint32_t from, uint32_t to, uint16_t op)
-{
-    return ((from>>1) ^ (from>>9) ^ (to>>3) ^ (to>>11) ^ (uint32_t)op) &
-           (TAB5_DYN613C_EDGE_MEMO_SLOTS-1u);
-}
-
-static inline void tab5_dyn613c_edge_memo_store(uint32_t from, uint32_t to, uint16_t op, uint8_t state)
-{
-    tab5_dyn613c_edge_memo_t * const m=&s_dyn613c_edge_memo[tab5_dyn613c_edge_memo_index(from,to,op)];
-    m->from_pc=from; m->to_pc=to; m->op=op; m->epoch=s_dyn613c_cand_epoch; m->state=state;
-}
-
-/* Return non-zero when the current epoch already knows this edge is not worth
- * walking the heavyweight candidate table.  Saturation misses still advance
- * the original miss-run counter, so candidate turnover timing is preserved
- * without repeating sixteen DRAM probes on every occurrence. */
-static inline int tab5_dyn613c_edge_memo_skip(uint32_t from, uint32_t to, uint16_t op)
-{
-    tab5_dyn613c_edge_memo_t * const m=&s_dyn613c_edge_memo[tab5_dyn613c_edge_memo_index(from,to,op)];
-    if (m->epoch!=s_dyn613c_cand_epoch || m->state==0u ||
-        m->from_pc!=from || m->to_pc!=to || m->op!=op) return 0;
-    if (m->state==TAB5_DYN613C_MEMO_REJECT) { ++s_dyn613c_memo_reject_hits; return 1; }
-    if (m->state==TAB5_DYN613C_MEMO_MISS) {
-        ++s_dyn613c_memo_miss_hits;
-        ++s_dyn613c_cand_insert_miss;
-        if (++s_dyn613c_cand_miss_run < TAB5_DYN613C_CAND_EPOCH_MISSES) return 1;
-        tab5_dyn613c_candidate_epoch_advance();
-        return 0;
-    }
-    return 0;
-}
-
-static int tab5_dyn613c_try_execute_block(tab5_dyn613c_block_t *b)
-{
-    if (!b || !b->valid) return 0;
-    ++b->enter_count;
-#if PX68K_TAB5_DYNAREC_COST_PROFILE
-    const uint32_t ent=b->enter_count;
-    const int sample=(ent<=4u || (ent&63u)==0u);
-    uint32_t cc0=0,cc1=0,cc3=0;
-    if (sample) cc0=(uint32_t)esp_cpu_get_cycle_count();
+#ifdef ESP_PLATFORM
+const unsigned int x68p4_r140n2r6_safelean_cpu_marker = 0x14020601u;
 #endif
-    if (FLAG_T1||FLAG_T0 || CPU_TYPE!=CPU_TYPE_000) { ++s_dyn613c_fallback; return 0; }
-
-    const int primary_need=(b->cycles_taken>b->cycles_not)?b->cycles_taken:b->cycles_not;
-    const int remain=GET_CYCLES();
-    int variant=0; /* 0=primary, 1=short, 2=tiny */
-    int need=primary_need;
-    tab5_dyn613c_native_fn_t fn=b->fn;
-    if (remain < primary_need) {
-        if (b->short_valid && remain >= (int)b->short_cycles) {
-            variant=1;
-            need=(int)b->short_cycles;
-            fn=b->short_fn;
-            ++s_dyn613c_short_select;
-            ++b->short_select_count;
-        } else if (b->tiny_valid && remain >= (int)b->tiny_cycles) {
-            variant=2;
-            need=(int)b->tiny_cycles;
-            fn=b->tiny_fn;
-            ++s_dyn613c_tiny_select;
-            ++b->tiny_select_count;
-        } else {
-            ++s_dyn613c_cycle_fail; ++b->cycle_fail_count; ++s_dyn613c_fallback;
-            return 0;
-        }
-    }
-#if PX68K_TAB5_DYNAREC_COST_PROFILE
-    if (sample) cc1=(uint32_t)esp_cpu_get_cycle_count();
-#endif
-
-    /* c11: selected primary/short/tiny variant owns both exact native guards. */
-    BusErrFlag = 0;
-    const int used=fn(&m68ki_cpu,MEM);
-#if PX68K_TAB5_DYNAREC_COST_PROFILE
-    if (sample) cc3=(uint32_t)esp_cpu_get_cycle_count();
-#endif
-    if (used==TAB5_DYN613C_SIG_MISMATCH) {
-        ++s_dyn613c_hash_fail;
-#if PX68K_TAB5_DYNAREC_LOG
-        const unsigned guest_bytes=(variant==2)?b->tiny_guest_bytes:(variant==1?b->short_guest_bytes:b->guest_bytes);
-        const char *vname=(variant==2)?"TINY":(variant==1?"SHORT":"PRIMARY");
-        printf("PX68K_DYN613C14R: INVALIDATE pc=$%06lX guest=%uB variant=%s exec=%lu reason=native-signature\n",
-               (unsigned long)b->start_pc,guest_bytes,vname,(unsigned long)b->exec_count);
-#endif
-        b->valid=0; if(s_dyn613c_active)--s_dyn613c_active;
-        ++s_dyn613c_fallback;
-        return 0;
-    }
-    if (used==TAB5_DYN613C_MEM_MISMATCH) {
-        ++s_dyn613c_mem_fail; ++b->mem_fail_count;
-        if (variant==1) ++b->short_mem_fail_count;
-        else if (variant==2) ++b->tiny_mem_fail_count;
-        return 0;
-    }
-    if (used<=0 || used>need) { ++s_dyn613c_fallback; return 0; }
-    USE_CYCLES(used); ++s_dyn613c_exec; ++b->exec_count;
-    if (variant==1) {
-        ++s_dyn613c_short_exec; ++b->short_exec_count;
-        s_dyn613c_guest_instr+=b->short_guest_insns;
-    } else if (variant==2) {
-        ++s_dyn613c_tiny_exec; ++b->tiny_exec_count;
-        s_dyn613c_guest_instr+=b->tiny_guest_insns;
-    } else {
-        s_dyn613c_guest_instr+=b->guest_insns;
-    }
-    s_dyn613c_cycles+=(uint32_t)used;
-#if PX68K_TAB5_DYNAREC_COST_PROFILE
-    if (sample) {
-        if (variant==1) {
-            ++b->short_sample_count;
-            b->short_sample_front_cc += (uint32_t)(cc1-cc0);
-            b->short_sample_native_cc += (uint32_t)(cc3-cc1);
-        } else if (variant==2) {
-            ++b->tiny_sample_count;
-            b->tiny_sample_front_cc += (uint32_t)(cc1-cc0);
-            b->tiny_sample_native_cc += (uint32_t)(cc3-cc1);
-        } else {
-            ++b->sample_count;
-            b->sample_hash_cc += (uint32_t)(cc1-cc0);
-            b->sample_preflight_cc += 0u;
-            b->sample_native_cc += (uint32_t)(cc3-cc1);
-        }
-    }
-#endif
-    return 1;
-}
-
-static int tab5_dyn613c_install(uint32_t start, uint32_t branch_pc, uint16_t branch_op)
-{
-    tab5_dyn613c_dec_t d[TAB5_DYN613C_MAX_INSNS]; unsigned n=0; uint8_t spans[8],wm=0; uint32_t ct=0,cn=0;
-    if (!s_dyn613c_arena || !s_dyn613c_sync || s_dyn613c_arena_bytes<=TAB5_DYN613C_ARENA_HEAD) return 0;
-    s_dyn613c_last_bad_pc=0xffffffffu; s_dyn613c_last_bad_op=0xffffu;
-    int scan=tab5_dyn613c_scan(start,branch_pc,branch_op,d,&n,spans,&wm,&ct,&cn);
-    if (scan==-2) { ++s_dyn613c_reject_poll; ++s_dyn613c_compile_reject; return 0; }
-    if (scan==-3) { ++s_dyn613c_reject_mem; ++s_dyn613c_compile_reject; return 0; }
-    if (scan<=0) {
-        ++s_dyn613c_reject_decode; ++s_dyn613c_compile_reject;
-#if PX68K_TAB5_DYNAREC_LOG
-        if (s_dyn613c_reject_diag_printed < 32u) {
-            ++s_dyn613c_reject_diag_printed;
-            printf("PX68K_DYN613C14R: REJECT decode $%06lX-$%06lX op=$%04X badpc=$%06lX badop=$%04X span=%lu\n",
-                   (unsigned long)start,(unsigned long)branch_pc,(unsigned)branch_op,
-                   (unsigned long)(s_dyn613c_last_bad_pc&0x00ffffffu),(unsigned)s_dyn613c_last_bad_op,
-                   (unsigned long)(branch_pc-start));
-        }
-#endif
-        return 0;
-    }
-    const tab5_dyn613c_dec_t *br=&d[n-1];
-    const uint32_t full_need=(ct>cn)?ct:cn;
-    unsigned emit_n=n-1u;
-    uint32_t emit_cycles=0u;
-    int fragment=0;
-
-    /* c5: a long loop that cannot fit the scheduler slice is still valuable.
-     * Emit only a straight-line prefix whose exact guest cycle cost is small
-     * enough to enter frequently.  The final Bcc remains in Musashi. */
-    if (full_need > TAB5_DYN613C_FRAG_CYCLE_CAP) {
-        unsigned k=0;
-        for (; k+1u<n; ++k) {
-            const uint32_t ic=tab5_dyn613c_dec_cycles(&d[k]);
-            if (k>=TAB5_DYN613C_FRAG_MIN_INSNS && emit_cycles+ic>TAB5_DYN613C_FRAG_CYCLE_CAP)
-                break;
-            if (emit_cycles+ic>TAB5_DYN613C_FRAG_CYCLE_CAP)
-                break;
-            emit_cycles+=ic;
-        }
-        if (k>=TAB5_DYN613C_FRAG_MIN_INSNS && k<n-1u) {
-            emit_n=k;
-            fragment=1;
-        } else {
-            ++s_dyn613c_perf_reject;
-            ++s_dyn613c_compile_reject;
-            return 0;
-        }
-    }
-
-    uint32_t block_end_pc=branch_pc+br->len;
-    uint32_t block_ppc=branch_pc;
-    uint16_t block_ir=branch_op;
-    uint32_t block_ct=ct, block_cn=cn;
-    unsigned block_insns=n;
-    uint8_t block_spans[8], block_wm=wm;
-    memcpy(block_spans,spans,sizeof(block_spans));
-    if (fragment) {
-        const tab5_dyn613c_dec_t *last=&d[emit_n-1u];
-        block_end_pc=last->pc+last->len;
-        block_ppc=last->pc;
-        block_ir=last->op;
-        block_ct=block_cn=emit_cycles;
-        block_insns=emit_n;
-        if (!tab5_dyn613c_mem_meta_exact(d,emit_n,block_spans,&block_wm)) {
-            ++s_dyn613c_reject_mem; ++s_dyn613c_compile_reject; return 0;
-        }
-    }
-
-    tab5_rv613c_emit_t e={0};
-    const uint32_t sig_guest_bytes=block_end_pc-start;
-    rv613_emit_signature_guard(&e,start,sig_guest_bytes);
-    const unsigned sig_words=e.n;
-    if (e.failed || sig_words>255u) { ++s_dyn613c_reject_cache; ++s_dyn613c_compile_reject; return 0; }
-    const unsigned rg_at=e.n;
-    rv613_emit_ram_guard(&e,block_spans,block_wm,start,block_end_pc);
-    const unsigned ram_guard_words=e.n-rg_at;
-    if (e.failed || ram_guard_words>255u) { ++s_dyn613c_reject_cache; ++s_dyn613c_compile_reject; return 0; }
-    for (unsigned i=0;i<emit_n;++i)
-        if (!tab5_dyn613c_emit_insn(&e,&d[i])) { e.failed=1; break; }
-    if (e.failed) { ++s_dyn613c_reject_decode; ++s_dyn613c_compile_reject; return 0; }
-
-    if (fragment) {
-        rv613_write_pc_exit(&e,block_ppc,block_ir,block_end_pc,emit_cycles);
-    } else {
-        const unsigned cc=(br->op>>8)&15u; unsigned patch;
-        rv613_lw(&e,R_T0,R_A0,cc==10u||cc==11u?D613_OFF_N:D613_OFF_Z);
-        if (cc==10u||cc==11u) rv613_andi(&e,R_T0,R_T0,0x80);
-        if (cc==6u || cc==11u) patch=rv613_branch_placeholder(&e,0,R_T0,R_ZERO); /* BNE/BMI: if zero -> not */
-        else patch=rv613_branch_placeholder(&e,1,R_T0,R_ZERO); /* BEQ/BPL: if nonzero -> not */
-        rv613_write_pc_exit(&e,branch_pc,branch_op,start,ct);
-        const unsigned not_at=e.n; rv613_write_pc_exit(&e,branch_pc,branch_op,branch_pc+br->len,cn);
-        rv613_patch_branch(&e,patch,(cc==6u||cc==11u)?0u:1u,R_T0,R_ZERO,not_at);
-    }
-    if (e.failed) { ++s_dyn613c_reject_cache; ++s_dyn613c_compile_reject; return 0; }
-    const uint32_t raw=e.n*4u, alloc=(raw+63u)&~63u;
-    if (s_dyn613c_arena_used+alloc>s_dyn613c_arena_bytes) { tab5_dyn613c_cache_reset(1); }
-    if (s_dyn613c_arena_used+alloc>s_dyn613c_arena_bytes) { ++s_dyn613c_reject_cache; ++s_dyn613c_compile_reject; return 0; }
-
-    const unsigned base=((start>>1)^(start>>7))&(TAB5_DYN613C_BLOCK_SLOTS-1u); tab5_dyn613c_block_t *b=NULL;
-    for(unsigned p=0;p<4u;++p){tab5_dyn613c_block_t *q=&s_dyn613c_blocks[(base+p)&(TAB5_DYN613C_BLOCK_SLOTS-1u)];if(!q->valid){b=q;break;}}
-    if(!b){++s_dyn613c_reject_cache;++s_dyn613c_compile_reject;return 0;}
-
-    uint8_t *dst=s_dyn613c_arena+s_dyn613c_arena_used;
-    memset(dst,0,alloc); memcpy(dst,e.w,raw);
-    if(!s_dyn613c_sync(dst,alloc)){++s_dyn613c_reject_cache;++s_dyn613c_compile_reject;return 0;}
-    s_dyn613c_arena_used+=alloc;
-
-    memset(b,0,sizeof(*b));
-    b->start_pc=start; b->branch_pc=block_ppc; b->fall_pc=block_end_pc; b->branch_op=block_ir;
-    b->guest_bytes=(uint16_t)(block_end_pc-start); b->guest_insns=(uint16_t)block_insns;
-    b->native_bytes=(uint16_t)raw; b->cycles_taken=(uint16_t)block_ct; b->cycles_not=(uint16_t)block_cn;
-    memcpy(b->mem_span,block_spans,8); b->mem_write_mask=block_wm;
-    b->code_hash=tab5_dyn613c_hash(start,b->guest_bytes);
-    b->fn=(tab5_dyn613c_native_fn_t)(uintptr_t)dst; b->fragment=(uint8_t)fragment;
-    b->sig_words=(uint8_t)sig_words; b->ram_guard_words=(uint8_t)ram_guard_words;
-
-    /* c9-c11 scheduler-fit fallback: build shorter prefixes from the same
-     * start PC.  They are selected only when larger variants cannot fit the
-     * current guest-cycle budget.  Reuse the same 4 KiB emitter so CPU1 stack
-     * usage does not grow versus c8. */
-    if (fragment && emit_cycles > TAB5_DYN613C_SHORT_CYCLE_CAP) {
-        unsigned short_n=0u;
-        uint32_t short_cycles=0u;
-        for (; short_n<emit_n; ++short_n) {
-            const uint32_t ic=tab5_dyn613c_dec_cycles(&d[short_n]);
-            if (short_cycles+ic > TAB5_DYN613C_SHORT_CYCLE_CAP) break;
-            short_cycles+=ic;
-        }
-        if (short_n>=TAB5_DYN613C_SHORT_MIN_INSNS && short_n<emit_n) {
-            uint8_t short_spans[8], short_wm=0u;
-            if (tab5_dyn613c_mem_meta_exact(d,short_n,short_spans,&short_wm)) {
-                const tab5_dyn613c_dec_t *slast=&d[short_n-1u];
-                const uint32_t short_end=slast->pc+slast->len;
-                memset(&e,0,sizeof(e));
-                rv613_emit_signature_guard(&e,start,short_end-start);
-                const unsigned short_sig=e.n;
-                const unsigned short_rg_at=e.n;
-                rv613_emit_ram_guard(&e,short_spans,short_wm,start,short_end);
-                const unsigned short_rg=e.n-short_rg_at;
-                for (unsigned i=0;i<short_n && !e.failed;++i)
-                    if (!tab5_dyn613c_emit_insn(&e,&d[i])) { e.failed=1; break; }
-                if (!e.failed)
-                    rv613_write_pc_exit(&e,slast->pc,slast->op,short_end,short_cycles);
-                if (!e.failed && short_sig<=255u && short_rg<=255u) {
-                    const uint32_t sraw=e.n*4u, salloc=(sraw+63u)&~63u;
-                    if (s_dyn613c_arena_used+salloc<=s_dyn613c_arena_bytes) {
-                        uint8_t *sdst=s_dyn613c_arena+s_dyn613c_arena_used;
-                        memset(sdst,0,salloc); memcpy(sdst,e.w,sraw);
-                        if (s_dyn613c_sync(sdst,salloc)) {
-                            b->short_valid=1u;
-                            b->short_guest_bytes=(uint16_t)(short_end-start);
-                            b->short_guest_insns=(uint16_t)short_n;
-                            b->short_native_bytes=(uint16_t)sraw;
-                            b->short_cycles=(uint16_t)short_cycles;
-                            b->short_sig_words=(uint8_t)short_sig;
-                            b->short_ram_guard_words=(uint8_t)short_rg;
-                            b->short_fn=(tab5_dyn613c_native_fn_t)(uintptr_t)sdst;
-                            s_dyn613c_arena_used+=salloc;
-                            s_dyn613c_native_bytes_total+=sraw;
-                            ++s_dyn613c_short_ok;
-#if PX68K_TAB5_DYNAREC_LOG
-                            printf("PX68K_DYN613C14R: SHORT $%06lX-$%06lX guest=%uB/%u insn native=%uB sig=%uB ramg=%uB cycles=%u primary=%u arena=%lu/%lu\n",
-                                   (unsigned long)start,(unsigned long)short_end,
-                                   (unsigned)b->short_guest_bytes,(unsigned)b->short_guest_insns,
-                                   (unsigned)b->short_native_bytes,(unsigned)b->short_sig_words*4u,
-                                   (unsigned)b->short_ram_guard_words*4u,(unsigned)b->short_cycles,
-                                   (unsigned)block_ct,(unsigned long)s_dyn613c_arena_used,
-                                   (unsigned long)s_dyn613c_arena_bytes);
-#endif
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /* c10/c11 third scheduler tier: a <=32-cycle TINY prefix.  It is emitted only
-     * when at least three complete translated instructions fit and it is
-     * strictly shorter than the SHORT variant (when one exists). */
-    if (fragment && emit_cycles > TAB5_DYN613C_TINY_CYCLE_CAP) {
-        unsigned tiny_n=0u;
-        uint32_t tiny_cycles=0u;
-        for (; tiny_n<emit_n; ++tiny_n) {
-            const uint32_t ic=tab5_dyn613c_dec_cycles(&d[tiny_n]);
-            if (tiny_cycles+ic > TAB5_DYN613C_TINY_CYCLE_CAP) break;
-            tiny_cycles+=ic;
-        }
-        if (tiny_n>=TAB5_DYN613C_TINY_MIN_INSNS && tiny_n<emit_n &&
-            (!b->short_valid || tiny_n<b->short_guest_insns)) {
-            uint8_t tiny_spans[8], tiny_wm=0u;
-            if (tab5_dyn613c_mem_meta_exact(d,tiny_n,tiny_spans,&tiny_wm)) {
-                const tab5_dyn613c_dec_t *tlast=&d[tiny_n-1u];
-                const uint32_t tiny_end=tlast->pc+tlast->len;
-                memset(&e,0,sizeof(e));
-                rv613_emit_signature_guard(&e,start,tiny_end-start);
-                const unsigned tiny_sig=e.n;
-                const unsigned tiny_rg_at=e.n;
-                rv613_emit_ram_guard(&e,tiny_spans,tiny_wm,start,tiny_end);
-                const unsigned tiny_rg=e.n-tiny_rg_at;
-                for (unsigned i=0;i<tiny_n && !e.failed;++i)
-                    if (!tab5_dyn613c_emit_insn(&e,&d[i])) { e.failed=1; break; }
-                if (!e.failed)
-                    rv613_write_pc_exit(&e,tlast->pc,tlast->op,tiny_end,tiny_cycles);
-                if (!e.failed && tiny_sig<=255u && tiny_rg<=255u) {
-                    const uint32_t traw=e.n*4u, talloc=(traw+63u)&~63u;
-                    if (s_dyn613c_arena_used+talloc<=s_dyn613c_arena_bytes) {
-                        uint8_t *tdst=s_dyn613c_arena+s_dyn613c_arena_used;
-                        memset(tdst,0,talloc); memcpy(tdst,e.w,traw);
-                        if (s_dyn613c_sync(tdst,talloc)) {
-                            b->tiny_valid=1u;
-                            b->tiny_guest_bytes=(uint16_t)(tiny_end-start);
-                            b->tiny_guest_insns=(uint16_t)tiny_n;
-                            b->tiny_native_bytes=(uint16_t)traw;
-                            b->tiny_cycles=(uint16_t)tiny_cycles;
-                            b->tiny_sig_words=(uint8_t)tiny_sig;
-                            b->tiny_ram_guard_words=(uint8_t)tiny_rg;
-                            b->tiny_fn=(tab5_dyn613c_native_fn_t)(uintptr_t)tdst;
-                            s_dyn613c_arena_used+=talloc;
-                            s_dyn613c_native_bytes_total+=traw;
-                            ++s_dyn613c_tiny_ok;
-#if PX68K_TAB5_DYNAREC_LOG
-                            printf("PX68K_DYN613C14R: TINY $%06lX-$%06lX guest=%uB/%u insn native=%uB sig=%uB ramg=%uB cycles=%u short=%u primary=%u arena=%lu/%lu\n",
-                                   (unsigned long)start,(unsigned long)tiny_end,
-                                   (unsigned)b->tiny_guest_bytes,(unsigned)b->tiny_guest_insns,
-                                   (unsigned)b->tiny_native_bytes,(unsigned)b->tiny_sig_words*4u,
-                                   (unsigned)b->tiny_ram_guard_words*4u,(unsigned)b->tiny_cycles,
-                                   (unsigned)b->short_cycles,(unsigned)block_ct,
-                                   (unsigned long)s_dyn613c_arena_used,(unsigned long)s_dyn613c_arena_bytes);
-#endif
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    b->valid=1;
-    ++s_dyn613c_active; ++s_dyn613c_compile_ok; s_dyn613c_native_bytes_total+=raw;
-    if (fragment) {
-        ++s_dyn613c_fragment_ok;
-        unsigned guard_mask=0u;
-        for (unsigned a=0;a<8u;++a) if (b->mem_span[a]) guard_mask|=1u<<a;
-#if PX68K_TAB5_DYNAREC_LOG
-        printf("PX68K_DYN613C14R: FRAGMENT $%06lX-$%06lX guest=%uB/%u insn native=%uB sig=%uB ramg=%uB cycles=%u short=%u/%u tiny=%u/%u guard=R%02X/W%02X source-loop=$%06lX-$%06lX arena=%lu/%lu\n",
-               (unsigned long)start,(unsigned long)block_end_pc,(unsigned)b->guest_bytes,(unsigned)block_insns,
-               (unsigned)raw,(unsigned)(sig_words*4u),(unsigned)(ram_guard_words*4u),(unsigned)block_ct,
-               (unsigned)b->short_cycles,(unsigned)b->short_guest_insns,
-               (unsigned)b->tiny_cycles,(unsigned)b->tiny_guest_insns,guard_mask,(unsigned)b->mem_write_mask,
-               (unsigned long)start,(unsigned long)branch_pc,
-               (unsigned long)s_dyn613c_arena_used,(unsigned long)s_dyn613c_arena_bytes);
-#endif
-    } else {
-#if PX68K_TAB5_DYNAREC_LOG
-        printf("PX68K_DYN613C14R: COMPILED $%06lX-$%06lX op=$%04X guest=%uB/%u insn native=%uB sig=%uB ramg=%uB cycles=%u/%u arena=%lu/%lu\n",
-               (unsigned long)start,(unsigned long)branch_pc,(unsigned)branch_op,(unsigned)b->guest_bytes,
-               (unsigned)block_insns,(unsigned)raw,(unsigned)(sig_words*4u),(unsigned)(ram_guard_words*4u),(unsigned)block_ct,(unsigned)block_cn,
-               (unsigned long)s_dyn613c_arena_used,(unsigned long)s_dyn613c_arena_bytes);
-#endif
-    }
-    return 1;
-}
-
-static inline void tab5_dyn613c_candidate_epoch_advance(void)
-{
-    uint8_t next=(uint8_t)(s_dyn613c_cand_epoch+1u);
-    if (!next) {
-        /* 255 phase rotations is already far beyond a normal run; clear only
-         * on wrap so stale epoch tags can never alias a new generation. */
-        memset(s_dyn613c_cands,0,sizeof(s_dyn613c_cands));
-        next=1u;
-    }
-    s_dyn613c_cand_epoch=next;
-    s_dyn613c_cand_miss_run=0u;
-    ++s_dyn613c_cand_rotations;
-}
-
-static tab5_dyn613c_block_t *tab5_dyn613c_observe_taken_bcc(uint32_t from, uint32_t to, uint16_t op)
-{
-    from&=0x00ffffffu; to&=0x00ffffffu;
-    if (!s_dyn613c_arena || to>=from || from-to>TAB5_DYN613C_MAX_GUEST_BYTES || (to&1u)) return NULL;
-
-    /* c13: one authoritative lookup serves both discovery and immediate tail
-     * dispatch.  c12 performed a second block-table lookup after observe(). */
-    tab5_dyn613c_block_t *b=tab5_dyn613c_find(to);
-    if (b) return b;
-
-    /* Memoized rejected/saturated edges avoid repeated candidate-table walks
-     * for the lifetime of the current turnover epoch. */
-    if (tab5_dyn613c_edge_memo_skip(from,to,op)) return NULL;
-
-    const unsigned base=((from>>1)^(to>>3))&(TAB5_DYN613C_CAND_SLOTS-1u);
-    tab5_dyn613c_candidate_t *c=NULL;
-    for(unsigned p=0;p<TAB5_DYN613C_CAND_PROBES;++p){
-        tab5_dyn613c_candidate_t *q=&s_dyn613c_cands[(base+p)&(TAB5_DYN613C_CAND_SLOTS-1u)];
-        if(q->epoch!=s_dyn613c_cand_epoch || !q->count){
-            q->from_pc=from;q->to_pc=to;q->op=op;q->count=1;q->attempted=0;q->epoch=s_dyn613c_cand_epoch;c=q;break;
-        }
-        if(q->from_pc==from&&q->to_pc==to&&q->op==op){if(q->count<0xffffu)++q->count;c=q;break;}
-    }
-    if(!c){
-        ++s_dyn613c_cand_insert_miss;
-        if (++s_dyn613c_cand_miss_run < TAB5_DYN613C_CAND_EPOCH_MISSES) {
-            tab5_dyn613c_edge_memo_store(from,to,op,TAB5_DYN613C_MEMO_MISS);
-            return NULL;
-        }
-        tab5_dyn613c_candidate_epoch_advance();
-        /* Start the new phase with the very edge that proved the old probe
-         * neighborhood was saturated. */
-        c=&s_dyn613c_cands[base];
-        c->from_pc=from;c->to_pc=to;c->op=op;c->count=1;c->attempted=0;c->epoch=s_dyn613c_cand_epoch;
-    }
-    if(c->attempted){
-        tab5_dyn613c_edge_memo_store(from,to,op,TAB5_DYN613C_MEMO_REJECT);
-        return NULL;
-    }
-    if(c->count<TAB5_DYN613C_HOT_THRESHOLD)return NULL;
-    c->attempted=1;
-    if (!tab5_dyn613c_install(to,from,op)) {
-        tab5_dyn613c_edge_memo_store(from,to,op,TAB5_DYN613C_MEMO_REJECT);
-        return NULL;
-    }
-    b=tab5_dyn613c_find(to);
-    return b;
-}
-
-static void tab5_dyn613c_dump(void)
-{
-    unsigned cand_used=0, cand_attempted=0;
-    for (unsigned i=0; i<TAB5_DYN613C_CAND_SLOTS; ++i) {
-        if (s_dyn613c_cands[i].epoch==s_dyn613c_cand_epoch && s_dyn613c_cands[i].count) {
-            ++cand_used; if (s_dyn613c_cands[i].attempted) ++cand_attempted;
-        }
-    }
-    printf("PX68K_DYN613C: STATS blocks=%lu compile=%lu frags=%lu short=%lu shortsel=%lu shortexec=%lu tiny=%lu tinysel=%lu tinyexec=%lu reject=%lu decode=%lu poll=%lu mem=%lu perf=%lu cache=%lu exec=%lu fallback=%lu cyclefail=%lu hashfail=%lu memfail=%lu guest-insn=%llu cycles=%llu native-bytes=%llu arena=%lu/%lu flush=%lu cand=%u/%u attempted=%u insertmiss=%lu epoch=%u rotate=%lu missrun=%lu l0=%lu/%lu memo=%lu/%lu\n",
-           (unsigned long)s_dyn613c_active,(unsigned long)s_dyn613c_compile_ok,(unsigned long)s_dyn613c_fragment_ok,
-           (unsigned long)s_dyn613c_short_ok,(unsigned long)s_dyn613c_short_select,(unsigned long)s_dyn613c_short_exec,
-           (unsigned long)s_dyn613c_tiny_ok,(unsigned long)s_dyn613c_tiny_select,(unsigned long)s_dyn613c_tiny_exec,
-           (unsigned long)s_dyn613c_compile_reject,(unsigned long)s_dyn613c_reject_decode,(unsigned long)s_dyn613c_reject_poll,
-           (unsigned long)s_dyn613c_reject_mem,(unsigned long)s_dyn613c_perf_reject,(unsigned long)s_dyn613c_reject_cache,
-           (unsigned long)s_dyn613c_exec,(unsigned long)s_dyn613c_fallback,(unsigned long)s_dyn613c_cycle_fail,
-           (unsigned long)s_dyn613c_hash_fail,(unsigned long)s_dyn613c_mem_fail,(unsigned long long)s_dyn613c_guest_instr,
-           (unsigned long long)s_dyn613c_cycles,(unsigned long long)s_dyn613c_native_bytes_total,
-           (unsigned long)s_dyn613c_arena_used,(unsigned long)s_dyn613c_arena_bytes,(unsigned long)s_dyn613c_flush,
-           cand_used,(unsigned)TAB5_DYN613C_CAND_SLOTS,cand_attempted,(unsigned long)s_dyn613c_cand_insert_miss,
-           (unsigned)s_dyn613c_cand_epoch,(unsigned long)s_dyn613c_cand_rotations,(unsigned long)s_dyn613c_cand_miss_run,
-           (unsigned long)s_dyn613c_l0_hits,(unsigned long)s_dyn613c_l0_misses,
-           (unsigned long)s_dyn613c_memo_reject_hits,(unsigned long)s_dyn613c_memo_miss_hits);
-
-    /* Report the busiest native blocks.  Research builds may include sampled
-     * host-cycle costs; production mode keeps the functional counters but
-     * compiles the esp_cpu_get_cycle_count() probes out of the hot path. */
-    uint8_t used[TAB5_DYN613C_BLOCK_SLOTS]={0};
-    for (unsigned rank=0; rank<8u; ++rank) {
-        int best=-1; uint32_t score=0;
-        for (unsigned i=0;i<TAB5_DYN613C_BLOCK_SLOTS;++i) {
-            const tab5_dyn613c_block_t *b=&s_dyn613c_blocks[i];
-            if(used[i] || !b->valid) continue;
-            const uint32_t sc=b->exec_count ? b->exec_count : b->enter_count;
-            if(best<0 || sc>score){best=(int)i;score=sc;}
-        }
-        if(best<0 || !score) break;
-        used[best]=1; const tab5_dyn613c_block_t *b=&s_dyn613c_blocks[best];
-        const uint32_t pri_exec=b->exec_count-b->short_exec_count-b->tiny_exec_count;
-        const uint32_t pri_mem=b->mem_fail_count-b->short_mem_fail_count-b->tiny_mem_fail_count;
-#if PX68K_TAB5_DYNAREC_COST_PROFILE
-        const uint32_t ns=b->sample_count, ss=b->short_sample_count, ts=b->tiny_sample_count;
-        printf("PX68K_DYN613C14R: B%02u pc=$%06lX kind=%s guest=%uB/%u native=%uB need=%u short=%uB/%u/%ucy tiny=%uB/%u/%ucy enter=%lu exec=%lu pri=%lu shortsel=%lu shortexec=%lu tinysel=%lu tinyexec=%lu cyclefail=%lu memfail=%lu/%lu/%lu avgcc pri=%lu/%lu short=%lu/%lu tiny=%lu/%lu\n",
-               rank+1u,(unsigned long)b->start_pc,b->fragment?"FRAG":"LOOP",
-               (unsigned)b->guest_bytes,(unsigned)b->guest_insns,(unsigned)b->native_bytes,
-               (unsigned)((b->cycles_taken>b->cycles_not)?b->cycles_taken:b->cycles_not),
-               (unsigned)b->short_guest_bytes,(unsigned)b->short_guest_insns,(unsigned)b->short_cycles,
-               (unsigned)b->tiny_guest_bytes,(unsigned)b->tiny_guest_insns,(unsigned)b->tiny_cycles,
-               (unsigned long)b->enter_count,(unsigned long)b->exec_count,(unsigned long)pri_exec,
-               (unsigned long)b->short_select_count,(unsigned long)b->short_exec_count,
-               (unsigned long)b->tiny_select_count,(unsigned long)b->tiny_exec_count,(unsigned long)b->cycle_fail_count,
-               (unsigned long)pri_mem,(unsigned long)b->short_mem_fail_count,(unsigned long)b->tiny_mem_fail_count,
-               (unsigned long)(ns?b->sample_hash_cc/ns:0u),(unsigned long)(ns?b->sample_native_cc/ns:0u),
-               (unsigned long)(ss?b->short_sample_front_cc/ss:0u),(unsigned long)(ss?b->short_sample_native_cc/ss:0u),
-               (unsigned long)(ts?b->tiny_sample_front_cc/ts:0u),(unsigned long)(ts?b->tiny_sample_native_cc/ts:0u));
-#else
-        printf("PX68K_DYN613C14R: B%02u pc=$%06lX kind=%s guest=%uB/%u native=%uB need=%u short=%uB/%u/%ucy tiny=%uB/%u/%ucy enter=%lu exec=%lu pri=%lu shortsel=%lu shortexec=%lu tinysel=%lu tinyexec=%lu cyclefail=%lu memfail=%lu/%lu/%lu costprobe=OFF\n",
-               rank+1u,(unsigned long)b->start_pc,b->fragment?"FRAG":"LOOP",
-               (unsigned)b->guest_bytes,(unsigned)b->guest_insns,(unsigned)b->native_bytes,
-               (unsigned)((b->cycles_taken>b->cycles_not)?b->cycles_taken:b->cycles_not),
-               (unsigned)b->short_guest_bytes,(unsigned)b->short_guest_insns,(unsigned)b->short_cycles,
-               (unsigned)b->tiny_guest_bytes,(unsigned)b->tiny_guest_insns,(unsigned)b->tiny_cycles,
-               (unsigned long)b->enter_count,(unsigned long)b->exec_count,(unsigned long)pri_exec,
-               (unsigned long)b->short_select_count,(unsigned long)b->short_exec_count,
-               (unsigned long)b->tiny_select_count,(unsigned long)b->tiny_exec_count,(unsigned long)b->cycle_fail_count,
-               (unsigned long)pri_mem,(unsigned long)b->short_mem_fail_count,(unsigned long)b->tiny_mem_fail_count);
-#endif
-    }
-}
-
 
 /* profile-safe code peek */
 static inline __attribute__((always_inline)) uint16_t tab5_poll58_fetch16(uint32_t a);
 
-/* Build 5.98g6: observation-only map of 68000 instruction shapes that may
- * benefit from P4 PIE/SIMD batching.  This runs only during the existing sparse
- * opcode-profile window, so normal emulation pays zero permanent cost.  It
- * intentionally does NOT alter guest state and does not claim that every hit
- * is safe to vectorize; the counters tell us where a later exact fast path is
- * worth implementing. */
-typedef struct {
-    uint32_t movem_total;
-    uint32_t movem_w;
-    uint32_t movem_l;
-    uint32_t movem_r2m;
-    uint32_t movem_m2r;
-    uint32_t movem_regs;
-    uint32_t movem_bytes;
-    uint32_t movem_r2m_bytes;
-    uint32_t movem_m2r_bytes;
-    uint32_t movem_max_regs;
-    uint32_t movem_predec;
-    uint32_t movem_postinc;
-    uint32_t store_w_post;
-    uint32_t store_l_post;
-    uint32_t copy_w_post;
-    uint32_t copy_l_post;
-    uint32_t clr_mem;
-    uint32_t or_mem;
-    uint32_t and_mem;
-    uint32_t eor_mem;
-    uint32_t mem_shift;
-} tab5_piecpu598g4b_obs_t;
-static DRAM_ATTR tab5_piecpu598g4b_obs_t s_tab5_piecpu598g4b;
-
-static inline __attribute__((always_inline))
-void tab5_piecpu598g4b_observe(uint16_t op)
-{
-    tab5_piecpu598g4b_obs_t * const o = &s_tab5_piecpu598g4b;
-    const unsigned mode = (op >> 3) & 7u;
-
-    if ((op & 0xfb80u) == 0x4880u) {
-        const uint32_t epc = REG_PC & 0x00ffffffu;
-        ++o->movem_total;
-        if (op & 0x0040u) ++o->movem_l; else ++o->movem_w;
-        if (op & 0x0400u) ++o->movem_m2r; else ++o->movem_r2m;
-        if (mode == 4u) ++o->movem_predec;
-        if (mode == 3u) ++o->movem_postinc;
-        /* The register mask is the immediate extension word.  Peek it only
-         * from ordinary RAM/IPL so observation never touches device space. */
-        if (epc <= 0x00bffffeu || (epc >= 0x00fc0000u && epc <= 0x00fffffeu)) {
-            const uint16_t mask = tab5_poll58_fetch16(epc);
-            const uint32_t regs = (uint32_t)__builtin_popcount((unsigned)mask);
-            const uint32_t bytes = regs * ((op & 0x0040u) ? 4u : 2u);
-            o->movem_regs += regs;
-            o->movem_bytes += bytes;
-            if (op & 0x0400u) o->movem_m2r_bytes += bytes;
-            else o->movem_r2m_bytes += bytes;
-            if (regs > o->movem_max_regs) o->movem_max_regs = regs;
-        }
-        return;
-    }
-
-    if ((op & 0xf1f8u) == 0x30c0u) { ++o->store_w_post; return; }
-    if ((op & 0xf1f8u) == 0x20c0u) { ++o->store_l_post; return; }
-    if ((op & 0xf1f8u) == 0x30d8u) { ++o->copy_w_post; return; }
-    if ((op & 0xf1f8u) == 0x20d8u) { ++o->copy_l_post; return; }
-
-    if ((op & 0xff00u) == 0x4200u && mode >= 2u) { ++o->clr_mem; return; }
-    if (((op >> 6) & 7u) >= 4u && ((op >> 6) & 7u) <= 6u && mode >= 2u) {
-        switch ((op >> 12) & 15u) {
-        case 0x8u: ++o->or_mem; return;
-        case 0xbu: ++o->eor_mem; return;
-        case 0xcu: ++o->and_mem; return;
-        default: break;
-        }
-    }
-    if ((op & 0xf000u) == 0xe000u && (op & 0x00c0u) == 0x00c0u && mode >= 2u)
-        ++o->mem_shift;
-}
-
-static void tab5_piecpu598g4b_reset(void)
-{
-    memset(&s_tab5_piecpu598g4b, 0, sizeof(s_tab5_piecpu598g4b));
-}
-
-
-/* Build 5.65b: observation-only study of consecutive MOVE.W Dn,(An)+ runs.
- * Unlike 5.65/5.65a this never reads future guest instructions and never
- * changes PC/registers/cycles/memory. It runs only inside the sparse opcode
- * profiling window, using instructions Musashi has already fetched. */
-typedef struct {
-    uint32_t total_candidates;
-    uint32_t runs_ge2;
-    uint32_t cur_len;
-    uint32_t cur_start_pc;
-    uint32_t prev_pc;
-    uint16_t prev_op;
-    uint32_t max_len;
-    uint32_t max_start_pc;
-    uint32_t max_end_pc;
-    uint16_t max_op;
-} tab5_movew65b_obs_t;
-static DRAM_ATTR tab5_movew65b_obs_t s_tab5_movew65b;
-
-
-/* Build 5.70: observation remains diagnostic-only.  The runtime accelerator
- * below no longer depends on learning a block after it has already executed:
- * it validates the live RAM instruction stream at the current PC immediately
- * before any instructions are elided. */
-static inline __attribute__((always_inline))
-void tab5_movew570_finish_observed_run(tab5_movew65b_obs_t *o)
-{
-    if (o->cur_len >= 2u) o->runs_ge2++;
-}
-
-static inline __attribute__((always_inline))
-void tab5_movew65b_observe(uint16_t op, uint32_t pc)
-{
-    tab5_movew65b_obs_t * const o = &s_tab5_movew65b;
-    pc &= 0x00ffffffu;
-    if ((op & 0xf1f8u) == 0x30c0u) { /* MOVE.W Dn,(An)+ */
-        o->total_candidates++;
-        if (o->cur_len && op == o->prev_op &&
-            pc == ((o->prev_pc + 2u) & 0x00ffffffu)) {
-            o->cur_len++;
-        } else {
-            if (o->cur_len) tab5_movew570_finish_observed_run(o);
-            o->cur_len = 1u;
-            o->cur_start_pc = pc;
-        }
-        o->prev_op = op;
-        o->prev_pc = pc;
-        if (o->cur_len > o->max_len) {
-            o->max_len = o->cur_len;
-            o->max_op = op;
-            o->max_start_pc = o->cur_start_pc;
-            o->max_end_pc = pc;
-        }
-    } else {
-        if (o->cur_len) tab5_movew570_finish_observed_run(o);
-        o->cur_len = 0u;
-        o->prev_op = 0u;
-        o->prev_pc = pc;
-    }
-}
-
-static void tab5_movew65b_reset(void)
-{
-    memset(&s_tab5_movew65b, 0, sizeof(s_tab5_movew65b));
-}
-
-static void tab5_movew65b_dump(void)
-{
-    tab5_movew65b_obs_t * const o = &s_tab5_movew65b;
-    const uint32_t runs = o->runs_ge2 + (o->cur_len >= 2u ? 1u : 0u);
-    printf("PX68K_FILL65B_OBS: logical candidates=%lu runs>=2=%lu maxrun=%lu op=$%04X pc=$%06lX-$%06lX; live-run batching may account for elided opcodes\n",
-           (unsigned long)o->total_candidates,
-           (unsigned long)runs,
-           (unsigned long)o->max_len,
-           (unsigned)o->max_op,
-           (unsigned long)o->max_start_pc,
-           (unsigned long)o->max_end_pc);
-}
-
+/* R139A6 production-clean: retired sparse PIE/MOVEW observation studies
+ * physically removed; accelerator semantics below are unchanged. */
 
 /*
  * Build 5.59 (ESP32-P4): retain the 256-entry zero-wait opcode-dispatch cache.
@@ -2045,15 +142,14 @@ static void tab5_movew65b_dump(void)
  * use the authoritative Musashi tables, so this changes no emulation state.
  */
 /* Intent: Keep the hot opcode handler/metadata working set in TCM/internal DRAM so CPU1 does not pay PSRAM latency on every guest instruction.  Layer8 Aug/17/2026 */
-#ifndef TAB5_M68K_DISPATCH_CACHE_BITS
-#define TAB5_M68K_DISPATCH_CACHE_BITS 8u
-#endif
-#define TAB5_M68K_DISPATCH_CACHE_SIZE (1u << TAB5_M68K_DISPATCH_CACHE_BITS)
-#define TAB5_M68K_DISPATCH_CACHE_MASK (TAB5_M68K_DISPATCH_CACHE_SIZE - 1u)
-/* Build 5.98g9: TCM L1 + internal-DRAM L2 avoids PSRAM metadata misses. */
-#define TAB5_M68K_DISPATCH_L2_BITS 12u
-#define TAB5_M68K_DISPATCH_L2_SIZE (1u << TAB5_M68K_DISPATCH_L2_BITS)
-#define TAB5_M68K_DISPATCH_L2_MASK (TAB5_M68K_DISPATCH_L2_SIZE - 1u)
+/* R57E138A: the old opcode dispatch L1/L2 are no longer in the execute path.
+ * Keep one-entry sentinels only for archived diagnostics/API compatibility. */
+#define TAB5_M68K_DISPATCH_CACHE_BITS 0u
+#define TAB5_M68K_DISPATCH_CACHE_SIZE 1u
+#define TAB5_M68K_DISPATCH_CACHE_MASK 0u
+#define TAB5_M68K_DISPATCH_L2_BITS 0u
+#define TAB5_M68K_DISPATCH_L2_SIZE 1u
+#define TAB5_M68K_DISPATCH_L2_MASK 0u
 
 typedef void (*tab5_m68k_handler_t)(void);
 
@@ -2126,6 +222,12 @@ static inline __attribute__((always_inline)) uint32_t tab5_post585_flags(uint16_
         (op & 0xfff8u) == 0x0280u || /* ANDI.L #imm,Dn */
         (op & 0xf1f8u) == 0x5040u || /* ADDQ.W #n,Dn */
         (op & 0xf1f8u) == 0x5140u || /* SUBQ.W #n,Dn */
+        (op & 0xf1f8u) == 0xd168u || /* R129A: ADD.W Dn,d16(An) measured hot */
+        (op & 0xf1f8u) == 0xe048u || /* R129A: LSR.W #n,Dn measured hot */
+        (op & 0xf1f8u) == 0x1010u || /* R130A: MOVE.B (An),Dn measured hot */
+        (op & 0xf1f8u) == 0xd068u || /* R130A: ADD.W d16(An),Dn measured hot */
+        (op & 0xfff8u) == 0x0c40u || /* R130A: CMPI.W #imm,Dn measured hot */
+        (op & 0xfff8u) == 0x4a00u || /* R130A: TST.B Dn measured hot */
         (op & 0xf1f8u) == 0xe040u || /* ASR.W #n,Dn */
         (op & 0xf1f8u) == 0xe080u)   /* ASR.L #n,Dn */
         f |= TAB5_POST598F_CORE_FAST;
@@ -2216,6 +318,116 @@ static inline __attribute__((always_inline)) int tab5_dbcc598f_exec(uint16_t op)
  * arithmetic/shift instructions, exactly like stock Musashi. */
 static inline __attribute__((always_inline)) void tab5_core598f_exec(uint16_t op)
 {
+    if ((op & 0xf1f8u) == 0xd168u) { /* R57E129A: ADD.W Dn,d16(An) */
+        /* The generated handler performs two top-level data-space traversals
+         * for the same EA (read then write).  This measured-hot family can
+         * classify the EA once.  Current PX68K production has FC/PMMU off;
+         * odd/MMIO/unusual addresses stay on the authoritative wrappers. */
+        const uint ea = AY + MAKE_INT_16(m68ki_read_imm_16());
+        const uint src = MASK_OUT_ABOVE_16(DX);
+#ifdef ESP_PLATFORM
+        const uint32_t bus = (uint32_t)ADDRESS_68K(ea);
+        if (__builtin_expect(((ea & 1u) == 0u) && bus <= 0x00bffffeu, 1)) {
+            const uint dst = (uint)tab5_data584_native_word_load(MEM + bus);
+            const uint res = src + dst;
+            const uint out = MASK_OUT_ABOVE_16(res);
+            BusErrFlag = 0;
+            FLAG_N = NFLAG_16(res);
+            FLAG_V = VFLAG_ADD_16(src, dst, res);
+            FLAG_X = FLAG_C = CFLAG_16(res);
+            FLAG_Z = out;
+            tab5_data584_native_word_store(MEM + bus, out);
+            m68k_tab5_exec123_note_ram_write16(bus);
+            return;
+        }
+#endif
+        {
+            const uint dst = m68ki_read_16(ea);
+            const uint res = src + dst;
+            const uint out = MASK_OUT_ABOVE_16(res);
+            FLAG_N = NFLAG_16(res);
+            FLAG_V = VFLAG_ADD_16(src, dst, res);
+            FLAG_X = FLAG_C = CFLAG_16(res);
+            FLAG_Z = out;
+            m68ki_write_16(ea, out);
+            return;
+        }
+    }
+    if ((op & 0xf1f8u) == 0xe048u) { /* R57E129A: LSR.W #n,Dn */
+        uint * const r_dst = &DY;
+        const uint shift = (((op >> 9) - 1u) & 7u) + 1u; /* exactly 1..8 */
+        const uint src = MASK_OUT_ABOVE_16(*r_dst);
+        const uint res = src >> shift;
+        USE_CYCLES(shift << CYC_SHIFT);
+        *r_dst = MASK_OUT_BELOW_16(*r_dst) | res;
+        FLAG_N = NFLAG_CLEAR;
+        FLAG_Z = res;
+        FLAG_X = FLAG_C = src << (9u - shift);
+        FLAG_V = VFLAG_CLEAR;
+        return;
+    }
+    if ((op & 0xf1f8u) == 0x1010u) { /* R57E130A: MOVE.B (An),Dn */
+        const uint ea = AY;
+        uint res;
+#ifdef ESP_PLATFORM
+        const uint32_t bus = (uint32_t)ADDRESS_68K(ea);
+        if (__builtin_expect(bus < 0x00c00000u, 1)) {
+            BusErrFlag = 0;
+            res = (uint)MEM[bus ^ 1u];
+        } else
+#endif
+            res = m68ki_read_8(ea);
+        {
+            uint * const r_dst = &DX;
+            *r_dst = MASK_OUT_BELOW_8(*r_dst) | res;
+        }
+        FLAG_N = NFLAG_8(res);
+        FLAG_Z = res;
+        FLAG_V = VFLAG_CLEAR;
+        FLAG_C = CFLAG_CLEAR;
+        return;
+    }
+    if ((op & 0xf1f8u) == 0xd068u) { /* R57E130A: ADD.W d16(An),Dn */
+        const uint ea = AY + MAKE_INT_16(m68ki_read_imm_16());
+        uint src;
+#ifdef ESP_PLATFORM
+        const uint32_t bus = (uint32_t)ADDRESS_68K(ea);
+        if (__builtin_expect(((ea & 1u) == 0u) && bus <= 0x00bffffeu, 1)) {
+            BusErrFlag = 0;
+            src = (uint)tab5_data584_native_word_load(MEM + bus);
+        } else
+#endif
+            src = m68ki_read_16(ea);
+        {
+            uint * const r_dst = &DX;
+            const uint dst = MASK_OUT_ABOVE_16(*r_dst);
+            const uint res = src + dst;
+            FLAG_N = NFLAG_16(res);
+            FLAG_V = VFLAG_ADD_16(src, dst, res);
+            FLAG_X = FLAG_C = CFLAG_16(res);
+            FLAG_Z = MASK_OUT_ABOVE_16(res);
+            *r_dst = MASK_OUT_BELOW_16(*r_dst) | FLAG_Z;
+        }
+        return;
+    }
+    if ((op & 0xfff8u) == 0x0c40u) { /* R57E130A: CMPI.W #imm,Dn */
+        const uint src = m68ki_read_imm_16();
+        const uint dst = MASK_OUT_ABOVE_16(DY);
+        const uint res = dst - src;
+        FLAG_N = NFLAG_16(res);
+        FLAG_Z = MASK_OUT_ABOVE_16(res);
+        FLAG_V = VFLAG_SUB_16(src, dst, res);
+        FLAG_C = CFLAG_16(res);
+        return;
+    }
+    if ((op & 0xfff8u) == 0x4a00u) { /* R57E130A: TST.B Dn */
+        const uint res = MASK_OUT_ABOVE_8(DY);
+        FLAG_N = NFLAG_8(res);
+        FLAG_Z = res;
+        FLAG_V = VFLAG_CLEAR;
+        FLAG_C = CFLAG_CLEAR;
+        return;
+    }
     if ((op & 0xfff8u) == 0x4a50u) { /* TST.W (An) */
         const uint res = OPER_AY_AI_16();
         FLAG_N = NFLAG_16(res);
@@ -2449,54 +661,1047 @@ typedef struct {
     tab5_m68k_handler_t handler;
 } tab5_m68k_dispatch_entry_t;
 
+/* ========================================================================
+ * R57E139A5: X68P4 PREDECODE LOCALITY v2 + REGION-GATED COHERENCY
+ * ------------------------------------------------------------------------
+ * Runtime opcode decode is forbidden in the normal RAM/IPL instruction loop.
+ * A 128-byte guest code page is decoded as one cold operation into Internal
+ * SRAM before any instruction in that page is executed.  The hot path then
+ * performs only:
+ *
+ *      PC -> direct page slot -> X68P4Op[(PC & 0x1ff) >> 1] -> execute
+ *
+ * No opcode load from guest RAM, no opcode-indexed L1/L2 lookup and no R123
+ * fused lookup remain on a resident-page hit.  v0 deliberately keeps the
+ * already-validated concrete Musashi semantic function pointer as a migration
+ * bridge *inside the predecoded op*.  The page ABI is independent so R139+ can
+ * replace `sem` with native X68P4 uops without changing page/cache/coherency.
+ *
+ * Code-page coherency is write driven.  Existing PX68K RAM writers already
+ * call m68k_tab5_exec123_invalidate_range/all(); R138 redirects those public
+ * invalidators to the X68P4 page directory. */
+#define X68P4_PRE138_PAGE_SHIFT    7u
+#define X68P4_PRE138_PAGE_BYTES    (1u << X68P4_PRE138_PAGE_SHIFT)
+#define X68P4_PRE138_PAGE_MASK     (X68P4_PRE138_PAGE_BYTES - 1u)
+#define X68P4_PRE138_WORDS_PER_PAGE (X68P4_PRE138_PAGE_BYTES / 2u)
+#define X68P4_PRE138_CACHE_BYTES   (64u * 1024u)
+#define X68P4_PRE138_OP_BYTES      8u
+#define X68P4_PRE138_PAGE_OP_BYTES (X68P4_PRE138_WORDS_PER_PAGE * X68P4_PRE138_OP_BYTES)
+#define X68P4_PRE138_PAGE_SLOTS    (X68P4_PRE138_CACHE_BYTES / X68P4_PRE138_PAGE_OP_BYTES)
+#define X68P4_PRE138_WAYS          2u
+#define X68P4_PRE138_SET_COUNT     (X68P4_PRE138_PAGE_SLOTS / X68P4_PRE138_WAYS)
+#define X68P4_PRE138_SET_MASK      (X68P4_PRE138_SET_COUNT - 1u)
+#define X68P4_PRE138_REGION_SHIFT  12u
+#define X68P4_PRE138_REGION_COUNT  (0x00c00000u >> X68P4_PRE138_REGION_SHIFT)
+#define X68P4_PRE138_INVALID_TAG   0xffffffffu
+
+typedef struct {
+    uint32_t sig_cycles; /* same compact payload as old fused entry, but page-AOT */
+    tab5_m68k_handler_t sem;
+} x68p4_pre138_op_t;
+
+_Static_assert(sizeof(x68p4_pre138_op_t) == X68P4_PRE138_OP_BYTES,
+               "X68P4Op v0 must stay 8 bytes on ESP32-P4");
+_Static_assert((X68P4_PRE138_PAGE_SLOTS & (X68P4_PRE138_PAGE_SLOTS - 1u)) == 0u,
+               "X68P4 page slots must be power-of-two");
+
+static DRAM_ATTR x68p4_pre138_op_t *s_x68p4_pre138_ops = NULL;
+static DRAM_ATTR uint32_t s_x68p4_pre138_cache_bytes = 0u;
+/* R57E139A: exported tiny page-directory metadata is the single coherency
+ * authority shared by CPU direct stores and HD63450 DMA writes.  The 64 KiB
+ * decoded payload stays private; 128 tags/versions plus the compact 4 KiB
+ * resident-region directory are visible to the inline write barriers. */
+DRAM_ATTR uint32_t g_x68p4_pre139_page_tag[X68P4_PRE138_PAGE_SLOTS];
+DRAM_ATTR uint32_t g_x68p4_pre139_page_version[X68P4_PRE138_PAGE_SLOTS];
+DRAM_ATTR uint8_t g_x68p4_pre139_region_count[X68P4_PRE138_REGION_COUNT];
+DRAM_ATTR uint32_t g_x68p4_pre139_enabled = 0u;
+DRAM_ATTR uint32_t g_x68p4_pre139_epoch = 1u;
+static DRAM_ATTR uint8_t s_x68p4_pre139_replace[X68P4_PRE138_SET_COUNT];
+
+/* R140X5: cold-only opcode metadata L1.
+ *
+ * X4 measured demand-decode at 0.2%, 7.1% and 13.1% of CPU time as the
+ * workload moved from resident code into churn-heavy code.  The pre-R138
+ * dispatch L1 already proved that a 256-entry direct cache with this folded
+ * opcode hash hits about 87% on the same SFXVI family of workloads.
+ *
+ * This cache is consulted ONLY when a PC word has not yet become an X68P4Op.
+ * Resident X68P4Op execution never touches it, so the X3 hot path is unchanged.
+ * Entries contain only immutable Musashi metadata: handler, base cycles and
+ * post-op classification.  Guest code bytes and coherency remain page-owned. */
+#define X68P4_X5_COLD_META_BITS 8u
+#define X68P4_X5_COLD_META_SIZE (1u << X68P4_X5_COLD_META_BITS)
+#define X68P4_X5_COLD_META_MASK (X68P4_X5_COLD_META_SIZE - 1u)
+static DRAM_ATTR tab5_m68k_dispatch_entry_t
+    s_x68p4_x5_cold_meta[X68P4_X5_COLD_META_SIZE];
+
+static inline __attribute__((always_inline)) unsigned
+x68p4_x5_cold_meta_index(uint16_t op)
+{
+    return (unsigned)(op ^ (op >> 7) ^ (op >> 12)) & X68P4_X5_COLD_META_MASK;
+}
+
+static inline __attribute__((always_inline)) unsigned
+x68p4_pre138_set(uint32_t page_base)
+{
+    /* A5 keeps A4's XOR fold, but maps to 64 sets x 2 ways.  Resident-page
+     * instructions still use the saved local slot generation and never pay
+     * this hash. */
+    uint32_t pn = page_base >> X68P4_PRE138_PAGE_SHIFT;
+    pn ^= pn >> 7;
+    pn ^= pn >> 14;
+    return (unsigned)(pn & X68P4_PRE138_SET_MASK);
+}
+
+static inline __attribute__((always_inline)) void
+x68p4_pre139_region_add(uint32_t page)
+{
+    if (page >= 0x00c00000u) return;
+    const unsigned r = (unsigned)(page >> X68P4_PRE138_REGION_SHIFT);
+    uint8_t v = g_x68p4_pre139_region_count[r];
+    if (v != 0xffu) g_x68p4_pre139_region_count[r] = (uint8_t)(v + 1u);
+}
+
+static inline __attribute__((always_inline)) void
+x68p4_pre139_region_remove(uint32_t page)
+{
+    if (page >= 0x00c00000u) return;
+    const unsigned r = (unsigned)(page >> X68P4_PRE138_REGION_SHIFT);
+    uint8_t v = g_x68p4_pre139_region_count[r];
+    if (v) {
+        --v;
+        g_x68p4_pre139_region_count[r] = v;
+    }
+}
+
+static inline __attribute__((always_inline)) int
+x68p4_pre139_invalidate_page_internal(uint32_t page)
+{
+    if (page >= 0x00c00000u) return 0;
+    const unsigned r = (unsigned)(page >> X68P4_PRE138_REGION_SHIFT);
+    if (!g_x68p4_pre139_region_count[r]) return 0;
+    const unsigned first = x68p4_pre138_set(page) << 1;
+    for (unsigned way = 0; way < X68P4_PRE138_WAYS; ++way) {
+        const unsigned slot = first + way;
+        if (g_x68p4_pre139_page_tag[slot] == page) {
+            g_x68p4_pre139_page_tag[slot] = X68P4_PRE138_INVALID_TAG;
+            ++g_x68p4_pre139_page_version[slot];
+            if (!g_x68p4_pre139_page_version[slot]) g_x68p4_pre139_page_version[slot] = 1u;
+            m68k_tab5_x68p4_bump_epoch();
+            x68p4_pre139_region_remove(page);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static inline __attribute__((always_inline)) x68p4_pre138_op_t *
+x68p4_pre138_slot_ops(unsigned slot)
+{
+    return s_x68p4_pre138_ops + ((uint32_t)slot * X68P4_PRE138_WORDS_PER_PAGE);
+}
+
+static void x68p4_pre138_invalidate_all_internal(void)
+{
+    for (unsigned i = 0; i < X68P4_PRE138_PAGE_SLOTS; ++i) {
+        g_x68p4_pre139_page_tag[i] = X68P4_PRE138_INVALID_TAG;
+        ++g_x68p4_pre139_page_version[i];
+        if (!g_x68p4_pre139_page_version[i]) g_x68p4_pre139_page_version[i] = 1u;
+    }
+    m68k_tab5_x68p4_bump_epoch();
+    memset(g_x68p4_pre139_region_count, 0, sizeof(g_x68p4_pre139_region_count));
+}
+
+static void x68p4_pre138_invalidate_range_internal(uint32_t address, uint32_t bytes)
+{
+    if (!g_x68p4_pre139_enabled || !bytes) return;
+    address &= 0x00ffffffu;
+    if (address >= 0x00c00000u) return; /* IPL is immutable; devices are not cached. */
+    if (bytes > 0x00c00000u - address) bytes = 0x00c00000u - address;
+    if (bytes >= 8192u) {
+        x68p4_pre138_invalidate_all_internal();
+        return;
+    }
+    const uint32_t first = address & ~X68P4_PRE138_PAGE_MASK;
+    const uint32_t last = (address + bytes - 1u) & ~X68P4_PRE138_PAGE_MASK;
+    for (uint32_t p = first;; p += X68P4_PRE138_PAGE_BYTES) {
+        (void)x68p4_pre139_invalidate_page_internal(p);
+        if (p == last) break;
+    }
+}
+
+void m68k_tab5_x68p4_predecode_bind(void *base, unsigned int bytes)
+{
+    g_x68p4_pre139_enabled = 0u;
+    s_x68p4_pre138_ops = NULL;
+    s_x68p4_pre138_cache_bytes = 0u;
+    if (!base || bytes < X68P4_PRE138_CACHE_BYTES ||
+        (((uintptr_t)base & 63u) != 0u)) {
+        return;
+    }
+    s_x68p4_pre138_ops = (x68p4_pre138_op_t *)base;
+    s_x68p4_pre138_cache_bytes = X68P4_PRE138_CACHE_BYTES;
+    memset(s_x68p4_pre138_ops, 0, X68P4_PRE138_CACHE_BYTES);
+    memset(g_x68p4_pre139_page_tag, 0xff, sizeof(g_x68p4_pre139_page_tag));
+    memset(g_x68p4_pre139_page_version, 0, sizeof(g_x68p4_pre139_page_version));
+    memset(g_x68p4_pre139_region_count, 0, sizeof(g_x68p4_pre139_region_count));
+    memset(s_x68p4_pre139_replace, 0, sizeof(s_x68p4_pre139_replace));
+    memset(s_x68p4_x5_cold_meta, 0, sizeof(s_x68p4_x5_cold_meta));
+    g_x68p4_pre139_epoch = 1u;
+    for (unsigned i = 0; i < X68P4_PRE138_PAGE_SLOTS; ++i) {
+        g_x68p4_pre139_page_tag[i] = X68P4_PRE138_INVALID_TAG;
+        g_x68p4_pre139_page_version[i] = 1u;
+    }
+    g_x68p4_pre139_enabled = 1u;
+}
+
+/* R140X5 demand-decode + cold metadata reuse.
+ *
+ * A4/A5 proved that page-fill amplification dominates when locality is poor:
+ * the old fill path decoded all 64 even-word positions in every 128-byte page,
+ * including extension words that were never executed as opcodes.  X2's return
+ * to 512-byte pages made this substantially worse on the same guest workload.
+ *
+ * Keep the proven 128-byte / 2-way directory and exact R139 coherency, but on
+ * page allocation clear only the 512-byte payload and decode the actual PC word
+ * on first execution.  A non-NULL semantic pointer is the per-word valid bit.
+ * Re-entering the same word is the same hot path plus one strongly-taken NULL
+ * check; no new opcode semantics or cycle accounting are introduced.
+ */
+static __attribute__((noinline)) x68p4_pre138_op_t *
+x68p4_pre138_decode_word(uint32_t page_base, unsigned slot, unsigned word_index)
+{
+    x68p4_pre138_op_t * const xop =
+        x68p4_pre138_slot_ops(slot) + word_index;
+    if (__builtin_expect(xop->sem != NULL, 1))
+        return xop;
+
+    const int ram = page_base <= (0x00c00000u - X68P4_PRE138_PAGE_BYTES);
+    const int ipl = page_base >= 0x00fc0000u &&
+                    page_base <= (0x01000000u - X68P4_PRE138_PAGE_BYTES);
+    if (!ram && !ipl)
+        return NULL;
+
+    const uint8_t * const src = ram ? (MEM + page_base)
+                                    : (IPL + (page_base & 0x0003ffffu));
+    uint16_t op;
+    __builtin_memcpy(&op, src + (word_index << 1), sizeof(op));
+
+    /* R140X5 cold metadata reuse.  The guest opcode itself is still fetched
+     * from the authoritative RAM/IPL page on first execution.  Only immutable
+     * host metadata is reused across PCs carrying the same opcode. */
+    const unsigned mi = x68p4_x5_cold_meta_index(op);
+    tab5_m68k_dispatch_entry_t * const me = &s_x68p4_x5_cold_meta[mi];
+    const uint32_t msig = me->sig_cycles;
+    tab5_m68k_handler_t sem;
+    uint32_t packed;
+    if (__builtin_expect(me->handler != NULL &&
+                         (uint16_t)(msig & 0xffffu) == op, 1)) {
+        sem = me->handler;
+        packed = msig;
+    } else {
+        sem = m68ki_instruction_jump_table[op];
+        const uint32_t cyc = CYC_INSTRUCTION[op] & 0xffu;
+        const uint32_t post = tab5_post585_flags(op) & 0x7fu;
+        packed = (post << 24) | (cyc << 16) | (uint32_t)op;
+        me->handler = sem;
+        me->sig_cycles = packed;
+    }
+
+    xop->sig_cycles = 0x80000000u | packed;
+    /* Publish semantic pointer after the compact metadata.  The valid bit in
+     * sig_cycles is consumed only by CPU1's executor; page invalidation still
+     * discards the entire X68P4Op generation exactly as in X3. */
+    xop->sem = sem;
+    return xop;
+}
+
+static __attribute__((noinline)) x68p4_pre138_op_t *
+x68p4_pre138_fill_page(uint32_t pc, uint32_t *version_out, unsigned *slot_out)
+{
+    if (!g_x68p4_pre139_enabled || !s_x68p4_pre138_ops) return NULL;
+    const uint32_t page_base = pc & ~X68P4_PRE138_PAGE_MASK;
+    const int ram = page_base <= (0x00c00000u - X68P4_PRE138_PAGE_BYTES);
+    const int ipl = page_base >= 0x00fc0000u &&
+                    page_base <= (0x01000000u - X68P4_PRE138_PAGE_BYTES);
+    if (!ram && !ipl) return NULL;
+
+    const unsigned set = x68p4_pre138_set(page_base);
+    const unsigned first = set << 1;
+    unsigned slot;
+    if (g_x68p4_pre139_page_tag[first] == X68P4_PRE138_INVALID_TAG)
+        slot = first;
+    else if (g_x68p4_pre139_page_tag[first + 1u] == X68P4_PRE138_INVALID_TAG)
+        slot = first + 1u;
+    else
+        slot = first + (unsigned)(s_x68p4_pre139_replace[set] & 1u);
+    s_x68p4_pre139_replace[set] = (uint8_t)((slot & 1u) ^ 1u);
+
+    const uint32_t old_page = g_x68p4_pre139_page_tag[slot];
+    if (old_page != X68P4_PRE138_INVALID_TAG)
+        x68p4_pre139_region_remove(old_page);
+
+    x68p4_pre138_op_t * const dst = x68p4_pre138_slot_ops(slot);
+    /* Invalidate all old per-word semantic pointers in one compact internal
+     * SRAM clear.  This replaces 64 opcode fetches + 64 table lookups +
+     * 64 post-flag decodes on every page miss. */
+    memset(dst, 0, X68P4_PRE138_PAGE_OP_BYTES);
+
+    g_x68p4_pre139_page_tag[slot] = page_base;
+    if (ram) x68p4_pre139_region_add(page_base);
+    ++g_x68p4_pre139_page_version[slot];
+    if (!g_x68p4_pre139_page_version[slot]) g_x68p4_pre139_page_version[slot] = 1u;
+    if (version_out) *version_out = g_x68p4_pre139_page_version[slot];
+    if (slot_out) *slot_out = slot;
+    return dst;
+}
+
+static inline __attribute__((always_inline)) x68p4_pre138_op_t *
+x68p4_pre138_resolve(uint32_t pc, uint32_t *local_tag, uint32_t *local_version,
+                     unsigned *local_slot, x68p4_pre138_op_t **local_ops,
+                     uint32_t *local_epoch)
+{
+    const uint32_t page_base = pc & ~X68P4_PRE138_PAGE_MASK;
+
+    /* R140P1: the write side bumps one scalar only when a resident code page
+     * is actually invalidated.  Same-page execution therefore avoids the
+     * indexed page_version[slot] dependency/load on every instruction. */
+    if (__builtin_expect(*local_ops != NULL && *local_tag == page_base &&
+                         *local_epoch == g_x68p4_pre139_epoch, 1)) {
+        return *local_ops + ((pc & X68P4_PRE138_PAGE_MASK) >> 1);
+    }
+
+    const unsigned set = x68p4_pre138_set(page_base);
+    const unsigned first = set << 1;
+    unsigned slot = first;
+    x68p4_pre138_op_t *ops = NULL;
+    uint32_t ver = 0u;
+    if (g_x68p4_pre139_page_tag[first] == page_base) {
+        slot = first;
+        ops = x68p4_pre138_slot_ops(slot);
+    } else if (g_x68p4_pre139_page_tag[first + 1u] == page_base) {
+        slot = first + 1u;
+        ops = x68p4_pre138_slot_ops(slot);
+    }
+    if (ops) {
+        ver = g_x68p4_pre139_page_version[slot];
+        s_x68p4_pre139_replace[set] = (uint8_t)((slot & 1u) ^ 1u);
+    } else {
+        ops = x68p4_pre138_fill_page(pc, &ver, &slot);
+    }
+    if (!ops) {
+        *local_ops = NULL;
+        *local_tag = X68P4_PRE138_INVALID_TAG;
+        *local_version = 0u;
+        *local_slot = 0u;
+        *local_epoch = g_x68p4_pre139_epoch;
+        return NULL;
+    }
+    *local_ops = ops;
+    *local_tag = page_base;
+    *local_version = ver;
+    *local_slot = slot;
+    *local_epoch = g_x68p4_pre139_epoch;
+    return ops + ((pc & X68P4_PRE138_PAGE_MASK) >> 1);
+}
+
+
+
+/* ------------------------------------------------------------------------ */
+/* R140S2 static compile-time superinstruction layer                        */
+/*                                                                          */
+/* R140S1 proved that generic warm CORE_FAST chaining is not profitable:    */
+/* its first 4096 followers required 4090 chain calls (1.001 follower/run),  */
+/* and frame209->392 regressed 5.61s -> 5.86s.  That mechanism is completely */
+/* retired here.  R140S2 keeps only fixed, compile-time SFXVI kernels at     */
+/* known PCs.  There is no runtime discovery, descriptor, hash, JIT or VM.   */
+/* ------------------------------------------------------------------------ */
+#ifdef ESP_PLATFORM
+
+typedef struct {
+    uint32_t version;
+    uint8_t slot;
+    uint8_t valid;
+    uint8_t initialized;
+} tab5_r140s2_cert760_t;
+
+typedef struct {
+    uint32_t version;
+    uint8_t slot;
+    uint8_t valid_mask;
+    uint8_t initialized;
+} tab5_r140s2_cert784_t;
+
+static DRAM_ATTR tab5_r140s2_cert760_t s_r140s2_cert760;
+static DRAM_ATTR tab5_r140s2_cert784_t s_r140s2_cert784;
+
+static inline __attribute__((always_inline)) uint16_t
+tab5_r140s2_code16(uint32_t a)
+{
+    return (uint16_t)tab5_data584_native_word_load(MEM + a);
+}
+
+static inline __attribute__((always_inline)) int
+tab5_r140s2_sig760(void)
+{
+    return tab5_r140s2_code16(0x00368760u)==0x3819u &&
+           tab5_r140s2_code16(0x00368762u)==0x2004u &&
+           tab5_r140s2_code16(0x00368764u)==0xc0bcu &&
+           tab5_r140s2_code16(0x0036876au)==0xe480u &&
+           tab5_r140s2_code16(0x0036876cu)==0x3204u &&
+           tab5_r140s2_code16(0x0036876eu)==0xc27cu &&
+           tab5_r140s2_code16(0x00368772u)==0xe441u &&
+           tab5_r140s2_code16(0x00368774u)==0x3404u &&
+           tab5_r140s2_code16(0x00368776u)==0xc47cu &&
+           tab5_r140s2_code16(0x0036877au)==0x3819u;
+}
+
+static inline __attribute__((always_inline)) int
+tab5_r140s2_sig784_at(uint32_t p)
+{
+    return tab5_r140s2_code16(p+0u)==0xe483u &&
+           tab5_r140s2_code16(p+2u)==0xd043u &&
+           tab5_r140s2_code16(p+4u)==0x3604u &&
+           tab5_r140s2_code16(p+6u)==0xc67cu &&
+           tab5_r140s2_code16(p+10u)==0xe443u &&
+           tab5_r140s2_code16(p+12u)==0xd243u &&
+           tab5_r140s2_code16(p+14u)==0x3604u &&
+           tab5_r140s2_code16(p+16u)==0xc67cu &&
+           tab5_r140s2_code16(p+20u)==0xd443u &&
+           tab5_r140s2_code16(p+22u)==0x381au &&
+           tab5_r140s2_code16(p+24u)==0x2604u &&
+           tab5_r140s2_code16(p+26u)==0xc6bcu;
+}
+
+static inline __attribute__((always_inline)) int
+tab5_r140s2_cert760_ok(uint32_t page_tag, uint32_t page_version, unsigned page_slot)
+{
+    if (__builtin_expect(page_tag != 0x00368700u, 0)) return 0;
+    if (!s_r140s2_cert760.initialized ||
+        s_r140s2_cert760.version != page_version ||
+        s_r140s2_cert760.slot != (uint8_t)page_slot) {
+        s_r140s2_cert760.version = page_version;
+        s_r140s2_cert760.slot = (uint8_t)page_slot;
+        s_r140s2_cert760.valid = (uint8_t)tab5_r140s2_sig760();
+        s_r140s2_cert760.initialized = 1u;
+    }
+    return s_r140s2_cert760.valid != 0u;
+}
+
+static inline __attribute__((always_inline)) unsigned
+tab5_r140s2_cert784_mask(uint32_t page_tag, uint32_t page_version, unsigned page_slot)
+{
+    if (__builtin_expect(page_tag != 0x00368780u, 0)) return 0u;
+    if (!s_r140s2_cert784.initialized ||
+        s_r140s2_cert784.version != page_version ||
+        s_r140s2_cert784.slot != (uint8_t)page_slot) {
+        unsigned mask = 0u;
+        if (tab5_r140s2_sig784_at(0x00368784u)) mask |= 1u;
+        if (tab5_r140s2_sig784_at(0x003687a4u)) mask |= 2u;
+        if (tab5_r140s2_sig784_at(0x003687c4u)) mask |= 4u;
+        s_r140s2_cert784.version = page_version;
+        s_r140s2_cert784.slot = (uint8_t)page_slot;
+        s_r140s2_cert784.valid_mask = (uint8_t)mask;
+        s_r140s2_cert784.initialized = 1u;
+    }
+    return (unsigned)s_r140s2_cert784.valid_mask;
+}
+
+static inline __attribute__((always_inline)) uint32_t
+tab5_r140s2_imm32(uint32_t a)
+{
+    return ((uint32_t)tab5_r140s2_code16(a) << 16) | (uint32_t)tab5_r140s2_code16(a+2u);
+}
+
+static inline __attribute__((always_inline)) int
+tab5_r140s2_ram_word(uint32_t areg, uint32_t *out)
+{
+    const uint32_t bus = ADDRESS_68K(areg);
+    if ((areg & 1u) || bus > 0x00bffffeu) return 0;
+    *out = (uint32_t)tab5_data584_native_word_load(MEM + bus);
+    BusErrFlag = 0;
+    return 1;
+}
+
+/* Static SFXVI prefix: 10 instructions / 28 bytes / 94 exact 68000 cycles.
+ * Old native-fragment measurements independently established 48-cycle and
+ * 28-cycle safe prefixes; choose only a prefix that fully fits this J2 slice. */
+static __attribute__((noinline, hot, optimize("O3"))) int
+tab5_r140s2_sfx760_try(uint32_t fetch_pc, uint32_t page_tag, uint32_t page_version, unsigned page_slot)
+{
+    if (fetch_pc != 0x00368760u || GET_CYCLES() < 28) return 0;
+    if (!tab5_r140s2_cert760_ok(page_tag, page_version, page_slot)) return 0;
+
+    uint32_t a1 = REG_A[1];
+    uint32_t w0, w1 = 0u;
+    if (!tab5_r140s2_ram_word(a1, &w0)) return 0;
+    int tier = 1;
+    if (GET_CYCLES() >= 48) tier = 2;
+    if (GET_CYCLES() >= 94 && tab5_r140s2_ram_word(a1 + 2u, &w1)) tier = 3;
+
+    uint32_t d4 = (REG_D[4] & 0xffff0000u) | (w0 & 0xffffu);
+    uint32_t d0 = d4 & tab5_r140s2_imm32(0x00368766u);
+    REG_D[4] = d4;
+    REG_D[0] = d0;
+    REG_A[1] = a1 + 2u;
+
+    if (tier == 1) {
+        FLAG_N = NFLAG_32(d0); FLAG_Z = d0; FLAG_V = VFLAG_CLEAR; FLAG_C = CFLAG_CLEAR;
+        REG_PPC = 0x00368764u; REG_IR = 0xc0bcu; REG_PC = 0x0036876au;
+        USE_CYCLES(28);
+        return 1;
+    }
+
+    {
+        const uint32_t src = d0;
+        d0 = src >> 2;
+        if (GET_MSB_32(src)) d0 |= m68ki_shift_32_table[2];
+        REG_D[0] = d0;
+        d4 = REG_D[4];
+        REG_D[1] = (REG_D[1] & 0xffff0000u) | (d4 & 0xffffu);
+        FLAG_X = src << 7;
+    }
+    if (tier == 2) {
+        const uint32_t z = REG_D[1] & 0xffffu;
+        FLAG_N = NFLAG_16(z); FLAG_Z = z; FLAG_V = VFLAG_CLEAR; FLAG_C = CFLAG_CLEAR;
+        REG_PPC = 0x0036876cu; REG_IR = 0x3204u; REG_PC = 0x0036876eu;
+        USE_CYCLES(48);
+        return 1;
+    }
+
+    {
+        uint32_t d1 = REG_D[1];
+        d1 = (d1 & 0xffff0000u) | ((d1 & 0xffffu) & (tab5_r140s2_code16(0x00368770u) & 0xffffu));
+        const uint32_t src1 = d1 & 0xffffu;
+        uint32_t r1 = src1 >> 2;
+        if (GET_MSB_16(src1)) r1 |= m68ki_shift_16_table[2];
+        REG_D[1] = (d1 & 0xffff0000u) | (r1 & 0xffffu);
+        FLAG_X = src1 << 7;
+
+        uint32_t d2 = (REG_D[2] & 0xffff0000u) | (REG_D[4] & 0xffffu);
+        d2 = (d2 & 0xffff0000u) | ((d2 & 0xffffu) & (tab5_r140s2_code16(0x00368778u) & 0xffffu));
+        REG_D[2] = d2;
+
+        REG_D[4] = (REG_D[4] & 0xffff0000u) | (w1 & 0xffffu);
+        REG_A[1] = a1 + 4u;
+        FLAG_N = NFLAG_16(w1); FLAG_Z = w1 & 0xffffu; FLAG_V = VFLAG_CLEAR; FLAG_C = CFLAG_CLEAR;
+        REG_PPC = 0x0036877au; REG_IR = 0x3819u; REG_PC = 0x0036877cu;
+        USE_CYCLES(94);
+        return 1;
+    }
+}
+
+static inline __attribute__((always_inline)) unsigned
+tab5_r140s2_pattern_bit(uint32_t pc)
+{
+    return pc == 0x00368784u ? 1u : pc == 0x003687a4u ? 2u : pc == 0x003687c4u ? 4u : 0u;
+}
+
+/* Repeating 12-op arithmetic body at $368784/$3687A4/$3687C4.  The three
+ * tiers end after 5, 9 or 12 instructions, so J2 never moves a scheduler
+ * boundary merely to enter the superinstruction. */
+static __attribute__((noinline, hot, optimize("O3"))) int
+tab5_r140s2_sfx784_try(uint32_t fetch_pc, uint32_t page_tag, uint32_t page_version, unsigned page_slot)
+{
+    const unsigned bit = tab5_r140s2_pattern_bit(fetch_pc);
+    if (!bit) return 0;
+    if (!(tab5_r140s2_cert784_mask(page_tag, page_version, page_slot) & bit)) return 0;
+
+    const unsigned need5 = (unsigned)CYC_INSTRUCTION[0xe483u] + (unsigned)CYC_INSTRUCTION[0xd043u] +
+                           (unsigned)CYC_INSTRUCTION[0x3604u] + (unsigned)CYC_INSTRUCTION[0xc67cu] +
+                           (unsigned)CYC_INSTRUCTION[0xe443u] + 8u;
+    const unsigned need9 = need5 + (unsigned)CYC_INSTRUCTION[0xd243u] +
+                           (unsigned)CYC_INSTRUCTION[0x3604u] + (unsigned)CYC_INSTRUCTION[0xc67cu] +
+                           (unsigned)CYC_INSTRUCTION[0xd443u];
+    const unsigned need12 = need9 + (unsigned)CYC_INSTRUCTION[0x381au] +
+                            (unsigned)CYC_INSTRUCTION[0x2604u] + (unsigned)CYC_INSTRUCTION[0xc6bcu];
+    if ((unsigned)GET_CYCLES() < need5) return 0;
+
+    unsigned tier = 5u;
+    uint32_t loaded = 0u;
+    uint32_t a2 = REG_A[2];
+    if ((unsigned)GET_CYCLES() >= need9) tier = 9u;
+    if ((unsigned)GET_CYCLES() >= need12 && tab5_r140s2_ram_word(a2, &loaded)) tier = 12u;
+
+    uint32_t d3 = REG_D[3];
+    {
+        const uint32_t src = d3;
+        d3 = src >> 2;
+        if (GET_MSB_32(src)) d3 |= m68ki_shift_32_table[2];
+    }
+    {
+        const uint32_t src = d3 & 0xffffu, dst = REG_D[0] & 0xffffu;
+        const uint32_t res = src + dst;
+        REG_D[0] = (REG_D[0] & 0xffff0000u) | (res & 0xffffu);
+    }
+    d3 = (d3 & 0xffff0000u) | (REG_D[4] & 0xffffu);
+    d3 = (d3 & 0xffff0000u) | ((d3 & 0xffffu) & tab5_r140s2_code16(fetch_pc + 8u));
+    {
+        const uint32_t src = d3 & 0xffffu; uint32_t r = src >> 2;
+        if (GET_MSB_16(src)) r |= m68ki_shift_16_table[2];
+        d3 = (d3 & 0xffff0000u) | (r & 0xffffu);
+        FLAG_X = FLAG_C = src << 7; FLAG_N = NFLAG_16(r); FLAG_Z = r & 0xffffu; FLAG_V = VFLAG_CLEAR;
+    }
+    REG_D[3] = d3;
+    if (tier == 5u) {
+        REG_PPC = fetch_pc + 10u; REG_IR = 0xe443u; REG_PC = fetch_pc + 12u;
+        USE_CYCLES(need5);
+        return 1;
+    }
+
+    {
+        const uint32_t src = d3 & 0xffffu, dst = REG_D[1] & 0xffffu;
+        const uint32_t res = src + dst;
+        REG_D[1] = (REG_D[1] & 0xffff0000u) | (res & 0xffffu);
+    }
+    d3 = (d3 & 0xffff0000u) | (REG_D[4] & 0xffffu);
+    d3 = (d3 & 0xffff0000u) | ((d3 & 0xffffu) & tab5_r140s2_code16(fetch_pc + 18u));
+    {
+        const uint32_t src = d3 & 0xffffu, dst = REG_D[2] & 0xffffu;
+        const uint32_t res = src + dst;
+        REG_D[2] = (REG_D[2] & 0xffff0000u) | (res & 0xffffu);
+        FLAG_N = NFLAG_16(res); FLAG_Z = res & 0xffffu;
+        FLAG_X = FLAG_C = CFLAG_16(res); FLAG_V = VFLAG_ADD_16(src, dst, res);
+    }
+    REG_D[3] = d3;
+    if (tier == 9u) {
+        REG_PPC = fetch_pc + 20u; REG_IR = 0xd443u; REG_PC = fetch_pc + 22u;
+        USE_CYCLES(need9);
+        return 1;
+    }
+
+    REG_D[4] = (REG_D[4] & 0xffff0000u) | (loaded & 0xffffu);
+    REG_A[2] = a2 + 2u;
+    d3 = REG_D[4] & tab5_r140s2_imm32(fetch_pc + 28u);
+    REG_D[3] = d3;
+    FLAG_N = NFLAG_32(d3); FLAG_Z = d3; FLAG_C = CFLAG_CLEAR; FLAG_V = VFLAG_CLEAR;
+    /* X remains from the preceding ADD.W, exactly as MOVE/AND preserve it. */
+    REG_PPC = fetch_pc + 26u; REG_IR = 0xc6bcu; REG_PC = fetch_pc + 32u;
+    USE_CYCLES(need12);
+    return 1;
+}
+
+
+/* ------------------------------------------------------------------------ */
+/* R140M2 MDX exact-PC compile-time fused block certification               */
+/* ------------------------------------------------------------------------ */
+/* M1B measured these exact residual paths. Unlike BAT160 broad memory-op
+ * classification and BAT161 BE01 shell handling, M2 certifies only fixed
+ * same-128B-page basic blocks. Page-version changes force revalidation.
+ * No runtime trace/descriptor/discovery is introduced. */
+#define R140M2_BLOCKS 10u
+static const uint16_t s_r140m2_sig_62a[20] = {
+    0xb228u, 0x0002u, 0x6708u, 0x08c6u, 0x000cu, 0x1141u, 0x0002u, 0x0800u,
+    0x0006u, 0x56c1u, 0xb228u, 0x0003u, 0x6708u, 0x08c6u, 0x000du, 0x1141u,
+    0x0003u, 0x7000u, 0x102bu, 0x0018u,
+};
+static const uint16_t s_r140m2_sig_666[11] = {
+    0x102bu, 0x001fu, 0xb028u, 0x0005u, 0x6708u, 0x08c6u, 0x0000u, 0x1140u,
+    0x0005u, 0x102bu, 0x001eu,
+};
+static const uint16_t s_r140m2_sig_68a[11] = {
+    0x302bu, 0x0010u, 0xb068u, 0x0008u, 0x6708u, 0x08c6u, 0x0002u, 0x3140u,
+    0x0008u, 0x302bu, 0x0036u,
+};
+static const uint16_t s_r140m2_sig_6c4[5] = {
+    0x4880u, 0x4440u, 0xb068u, 0x000eu, 0x6708u,
+};
+static const uint16_t s_r140m2_sig_6f2[6] = {
+    0x7000u, 0x102bu, 0x0022u, 0x0880u, 0x0007u, 0x6610u,
+};
+static const uint16_t s_r140m2_sig_708[9] = {
+    0x1031u, 0x0000u, 0x6006u, 0x4400u, 0xd03cu, 0x007fu, 0xb028u, 0x0012u,
+    0x6708u,
+};
+static const uint16_t s_r140m2_sig_730[24] = {
+    0x6708u, 0x08c6u, 0x0008u, 0x1140u, 0x0013u, 0x2013u, 0xb0a8u, 0x0014u,
+    0x6708u, 0x08c6u, 0x0009u, 0x2140u, 0x0014u, 0x302bu, 0x0012u, 0xb068u,
+    0x0018u, 0x6708u, 0x08c6u, 0x000au, 0x3140u, 0x0018u, 0x302bu, 0x0014u,
+};
+static const uint16_t s_r140m2_sig_7f0[6] = {
+    0x7a00u, 0x2685u, 0x3029u, 0x0014u, 0x9069u, 0x0012u,
+};
+static const uint16_t s_r140m2_sig_800[11] = {
+    0xb06bu, 0x0008u, 0x6708u, 0x3740u, 0x0008u, 0x08c5u, 0x0001u, 0x70c0u,
+    0xc029u, 0x001cu, 0xe518u,
+};
+static const uint16_t s_r140m2_sig_86c[10] = {
+    0xb02bu, 0x0010u, 0x670au, 0x177cu, 0x0001u, 0x0003u, 0x1740u, 0x0010u,
+    0x1029u, 0x0023u,
+};
+
+typedef struct {
+    uint32_t version;
+    uint8_t slot;
+    uint16_t valid_mask;
+    uint8_t initialized;
+} tab5_r140m2_pagecert_t;
+
+static DRAM_ATTR tab5_r140m2_pagecert_t s_r140m2_cert_600;
+static DRAM_ATTR tab5_r140m2_pagecert_t s_r140m2_cert_680;
+static DRAM_ATTR tab5_r140m2_pagecert_t s_r140m2_cert_700;
+static DRAM_ATTR tab5_r140m2_pagecert_t s_r140m2_cert_780;
+static DRAM_ATTR tab5_r140m2_pagecert_t s_r140m2_cert_800;
+
+/* Perfect 6-bit hash for the ten exact entry PCs. */
+static DRAM_ATTR uint32_t s_r140m2_gate[64] = {
+    [0]  = 0x0019d800u,
+    [4]  = 0x0019d708u,
+    [5]  = 0x0019d68au,
+    [21] = 0x0019d62au,
+    [24] = 0x0019d730u,
+    [34] = 0x0019d6c4u,
+    [51] = 0x0019d666u,
+    [54] = 0x0019d86cu,
+    [56] = 0x0019d7f0u,
+    [57] = 0x0019d6f2u,
+};
+
+static inline __attribute__((always_inline)) int
+tab5_r140m2_sig_words(uint32_t start, const uint16_t *sig, unsigned count)
+{
+    unsigned i;
+    for (i = 0; i < count; ++i)
+        if (tab5_r140s2_code16(start + i * 2u) != sig[i]) return 0;
+    return 1;
+}
+
+static inline __attribute__((always_inline)) unsigned tab5_r140m2_refresh_600(void)
+{
+    unsigned m = 0u;
+    if (tab5_r140m2_sig_words(0x0019d62au, s_r140m2_sig_62a, sizeof(s_r140m2_sig_62a)/sizeof(s_r140m2_sig_62a[0]))) m |= 1u<<0;
+    if (tab5_r140m2_sig_words(0x0019d666u, s_r140m2_sig_666, sizeof(s_r140m2_sig_666)/sizeof(s_r140m2_sig_666[0]))) m |= 1u<<1;
+    return m;
+}
+static inline __attribute__((always_inline)) unsigned tab5_r140m2_refresh_680(void)
+{
+    unsigned m = 0u;
+    if (tab5_r140m2_sig_words(0x0019d68au, s_r140m2_sig_68a, sizeof(s_r140m2_sig_68a)/sizeof(s_r140m2_sig_68a[0]))) m |= 1u<<2;
+    if (tab5_r140m2_sig_words(0x0019d6c4u, s_r140m2_sig_6c4, sizeof(s_r140m2_sig_6c4)/sizeof(s_r140m2_sig_6c4[0]))) m |= 1u<<3;
+    if (tab5_r140m2_sig_words(0x0019d6f2u, s_r140m2_sig_6f2, sizeof(s_r140m2_sig_6f2)/sizeof(s_r140m2_sig_6f2[0]))) m |= 1u<<4;
+    return m;
+}
+static inline __attribute__((always_inline)) unsigned tab5_r140m2_refresh_700(void)
+{
+    unsigned m = 0u;
+    if (tab5_r140m2_sig_words(0x0019d708u, s_r140m2_sig_708, sizeof(s_r140m2_sig_708)/sizeof(s_r140m2_sig_708[0]))) m |= 1u<<5;
+    if (tab5_r140m2_sig_words(0x0019d730u, s_r140m2_sig_730, sizeof(s_r140m2_sig_730)/sizeof(s_r140m2_sig_730[0]))) m |= 1u<<6;
+    return m;
+}
+static inline __attribute__((always_inline)) unsigned tab5_r140m2_refresh_780(void)
+{
+    return tab5_r140m2_sig_words(0x0019d7f0u, s_r140m2_sig_7f0, sizeof(s_r140m2_sig_7f0)/sizeof(s_r140m2_sig_7f0[0])) ? (1u<<7) : 0u;
+}
+static inline __attribute__((always_inline)) unsigned tab5_r140m2_refresh_800(void)
+{
+    unsigned m = 0u;
+    if (tab5_r140m2_sig_words(0x0019d800u, s_r140m2_sig_800, sizeof(s_r140m2_sig_800)/sizeof(s_r140m2_sig_800[0]))) m |= 1u<<8;
+    if (tab5_r140m2_sig_words(0x0019d86cu, s_r140m2_sig_86c, sizeof(s_r140m2_sig_86c)/sizeof(s_r140m2_sig_86c[0]))) m |= 1u<<9;
+    return m;
+}
+
+static inline __attribute__((always_inline)) int tab5_r140m2_gate_pc(uint32_t pc)
+{
+    if (__builtin_expect((pc & 0x00fff000u) != 0x0019d000u, 1)) return 0;
+    return s_r140m2_gate[(pc >> 1) & 63u] == pc;
+}
+
+/* R140P4S5C1: exact first opcodes for the ten already-certified M2 entries.
+ * These are not a new decode/discovery table: every value is the first word
+ * of the compile-time signature immediately above.  The early path is used
+ * only while the same 128-byte X68P4 page is already resident and its scalar
+ * coherency epoch still matches; otherwise the authoritative resolver below
+ * runs unchanged. */
+static inline __attribute__((always_inline)) uint16_t
+tab5_r140p4s5c1_m2_first_op(uint32_t pc)
+{
+    switch (pc) {
+    case 0x0019d62au: return 0xb228u;
+    case 0x0019d666u: return 0x102bu;
+    case 0x0019d68au: return 0x302bu;
+    case 0x0019d6c4u: return 0x4880u;
+    case 0x0019d6f2u: return 0x7000u;
+    case 0x0019d708u: return 0x1031u;
+    case 0x0019d730u: return 0x6708u;
+    case 0x0019d7f0u: return 0x7a00u;
+    case 0x0019d800u: return 0xb06bu;
+    case 0x0019d86cu: return 0xb02bu;
+    default: return 0u;
+    }
+}
+
+static inline __attribute__((always_inline)) int
+tab5_r140m2_cert_ok(uint32_t pc, uint32_t page_tag, uint32_t page_version, unsigned page_slot)
+{
+    tab5_r140m2_pagecert_t *c;
+    unsigned bit, mask;
+    switch (page_tag) {
+    case 0x0019d600u: c=&s_r140m2_cert_600; bit=(pc==0x0019d62au)?(1u<<0):(1u<<1); break;
+    case 0x0019d680u: c=&s_r140m2_cert_680; bit=(pc==0x0019d68au)?(1u<<2):(pc==0x0019d6c4u)?(1u<<3):(1u<<4); break;
+    case 0x0019d700u: c=&s_r140m2_cert_700; bit=(pc==0x0019d708u)?(1u<<5):(1u<<6); break;
+    case 0x0019d780u: c=&s_r140m2_cert_780; bit=1u<<7; break;
+    case 0x0019d800u: c=&s_r140m2_cert_800; bit=(pc==0x0019d800u)?(1u<<8):(1u<<9); break;
+    default: return 0;
+    }
+    if (!c->initialized || c->version != page_version || c->slot != (uint8_t)page_slot) {
+        switch (page_tag) {
+        case 0x0019d600u: mask=tab5_r140m2_refresh_600(); break;
+        case 0x0019d680u: mask=tab5_r140m2_refresh_680(); break;
+        case 0x0019d700u: mask=tab5_r140m2_refresh_700(); break;
+        case 0x0019d780u: mask=tab5_r140m2_refresh_780(); break;
+        case 0x0019d800u: mask=tab5_r140m2_refresh_800(); break;
+        default: mask=0u; break;
+        }
+        c->version=page_version; c->slot=(uint8_t)page_slot;
+        c->valid_mask=(uint16_t)mask; c->initialized=1u;
+    }
+    return (c->valid_mask & bit) != 0u;
+}
+
+#endif
+
+
+/* ------------------------------------------------------------------------ */
+/* R140J2 X68P4 deadline-driven Machine Kernel                              */
+/* ------------------------------------------------------------------------ */
+extern uint32_t VLINE;
+extern int ICount;
+extern int ClkUsed;
+
+#define X68P4_J2_DMA_SAFE_PERIPH 200
+
+
+static DRAM_ATTR int s_x68p4_machine_key_int_cnt = 0;
+static DRAM_ATTR int s_x68p4_machine_mouse_int_cnt = 0;
+
+/* Convert a peripheral-clock deadline into the smallest positive guest-CPU
+ * request whose existing ClkUsed conversion reaches that deadline.  This is
+ * the inverse of the exact conversion already used after m68k_execute(). */
+static inline __attribute__((always_inline)) int
+x68p4_j2_cpu_until_periph_p12(int periph)
+{
+    if (periph <= 0) return 1;
+    /* X68K Tab P12C1 product clock is fixed at 12 MHz.  This is the exact
+     * inverse of the selected 10/12 peripheral conversion. */
+    int64_t need = (int64_t)periph * 12LL - (int64_t)ClkUsed;
+    if (need <= 0) return 1;
+    int64_t cpu = (need + 9) / 10;
+    if (cpu < 1) cpu = 1;
+    if (cpu > 0x3fffffffLL) cpu = 0x3fffffffLL;
+    return (int)cpu;
+}
+
+static inline __attribute__((always_inline)) int
+x68p4_j2_choose_request_p12(int remaining)
+{
+    if (__builtin_expect(remaining <= 1, 0))
+        return remaining;
+
+    /* R140P4MK1 COMMON0: a deadline only matters if its converted CPU request
+     * is strictly smaller than 'remaining'.  Compute the first peripheral
+     * deadline that cannot shorten this slice and use it as a strict sentinel.
+     * RC1 measured reason=0 on 145146/145641 slices, so the normal path now
+     * returns without the old 64-bit inverse conversion. */
+    const unsigned early_periph =
+        ((unsigned)ClkUsed + (unsigned)(remaining - 1) * 10u) / 12u;
+    const int no_early_deadline = (int)early_periph + 1;
+    int best_periph = no_early_deadline;
+
+    /* MFP's exact next IRQ deadline is maintained as a shadow at guest state
+     * changes / true crossings.  The common choose path is one load+compare. */
+    int d = MFP_R140MK1DeadlineMin(best_periph);
+    if (d < best_periph) best_periph = d;
+
+    /* RTC can only preempt when MFP IRQ15 is enabled, unmasked and not already
+     * in service.  That gate is cached with the same MFP interrupt state. */
+    if (__builtin_expect(MFP_R140MK1IRQ15Open != 0u, 0)) {
+        d = RTC_R140J2NextIRQDeadline(best_periph);
+        if (d < best_periph) best_periph = d;
+    }
+
+    /* 68450 readiness is callback/device driven rather than represented by a
+     * guest-clock counter.  Keep the proven 200@10MHz service deadline only
+     * while channels 0..2 are actually active. */
+    if (__builtin_expect(((DMA[0].CSR | DMA[1].CSR | DMA[2].CSR) & 0x08u) != 0u, 0) &&
+        X68P4_J2_DMA_SAFE_PERIPH < best_periph) {
+        best_periph = X68P4_J2_DMA_SAFE_PERIPH;
+    }
+
+    /* Timer/interrupt register polling keeps the exact J2 200-clock guard. */
+    if (__builtin_expect(MFP_R140J2PollGuard != 0u, 0) &&
+        X68P4_J2_DMA_SAFE_PERIPH < best_periph) {
+        best_periph = X68P4_J2_DMA_SAFE_PERIPH;
+    }
+
+    if (__builtin_expect(best_periph == no_early_deadline, 1))
+        return remaining;
+
+    const int deadline_cpu = x68p4_j2_cpu_until_periph_p12(best_periph);
+    return (deadline_cpu < remaining) ? deadline_cpu : remaining;
+}
+
+int m68k_tab5_x68p4_machine_run_scanline(
+    uint32_t line, uint32_t total_lines, int cpu_cycles,
+    unsigned int midi_delay, int *periph_cycles_out)
+{
+    int clk_line = 0;
+    int total_executed = 0;
+    MFP_Int(0);
+    if ((line >= CRTC_VSTART) && (line < CRTC_VEND))
+        VLINE = ((line - CRTC_VSTART) * CRTC_VStep) / 2u;
+    else
+        VLINE = (uint32_t)-1;
+
+    if (!(MFP[MFP_AER] & 0x40u) && (line == CRTC_IntLine))
+        MFP_Int(1);
+    if (MFP[MFP_AER] & 0x10u) {
+        if (line == CRTC_VSTART) MFP_Int(9);
+    } else {
+        if (CRTC_VEND >= total_lines) {
+            if ((long)line == (long)(CRTC_VEND - total_lines)) MFP_Int(9);
+        } else if ((long)line == (long)(total_lines - 1u)) {
+            MFP_Int(9);
+        }
+    }
+
+    int remaining = cpu_cycles;
+    while (remaining > 0) {
+        const int request = x68p4_j2_choose_request_p12(remaining);
+        int executed = m68k_execute(request);
+        if (executed <= 0) executed = request;
+
+        total_executed += executed;
+        remaining -= executed;
+        if (remaining < 0) remaining = 0;
+        ICount -= executed;
+        if (ICount < 0) ICount = 0;
+
+        int usedclk;
+        if (__builtin_expect((unsigned)ClkUsed < 12u, 1)) {
+            const unsigned acc = (unsigned)ClkUsed + (unsigned)executed * 10u;
+            usedclk = (int)(acc / 12u);
+            ClkUsed = (int)(acc - (unsigned)usedclk * 12u);
+        } else {
+            /* Defensive save-state/foreign-context fallback only.  Normal P12
+             * execution maintains ClkUsed in the 0..11 numerator domain. */
+            ClkUsed += executed * 10;
+            usedclk = ClkUsed / 12;
+            ClkUsed -= usedclk * 12;
+        }
+        clk_line += usedclk;
+
+        MFP_Timer(usedclk);
+        RTC_Timer(usedclk);
+        DMA_ExecActive012Inline();
+    }
+
+    if (__builtin_expect(MFP_R140J2PollGuard != 0u, 0))
+        --MFP_R140J2PollGuard;
+
+    /* Timer-A event-count mode remains frozen at the exact scanline/vline
+     * boundary that is already known to be boot-sensitive. */
+    if (__builtin_expect(MIDI_R127DelayPending != 0u, 0))
+        MIDI_DelayOut(midi_delay);
+    MFP_TimerA();
+    if ((MFP[MFP_AER] & 0x40u) && (line == CRTC_IntLine))
+        MFP_Int(1);
+
+    *periph_cycles_out = clk_line;
+    return total_executed;
+}
+
+void m68k_tab5_x68p4_machine_finish_scanline(int periph_cycles,
+                                              int key_int_period,
+                                              int mouse_int_period)
+{
+
+    ADPCM_R127_PreCounter += (int)(ADPCM_R127_PreStepCurrent * (uint32_t)periph_cycles);
+    if (__builtin_expect(ADPCM_R127_PreCounter >= 10000000L, 0))
+        ADPCM_PreUpdateR127Due();
+    OPM_Timer((uint32_t)periph_cycles);
+    if (__builtin_expect(MIDI_R127TimerActive != 0u, 0))
+        MIDI_Timer((uint32_t)periph_cycles);
+
+    if (++s_x68p4_machine_key_int_cnt > key_int_period) {
+        s_x68p4_machine_key_int_cnt = 0;
+        Keyboard_Int();
+    }
+    if (++s_x68p4_machine_mouse_int_cnt > mouse_int_period) {
+        s_x68p4_machine_mouse_int_cnt = 0;
+        SCC_IntCheck();
+    }
+}
+
+void m68k_tab5_x68p4_machine_frame_end(void)
+{
+    FDD_SetFDInt();
+}
+
+/* ABI-compatible zero-stat stubs: production has no runtime accounting. */
+void m68k_tab5_x68p4_machine_stats(uint64_t *lines, uint64_t *slices,
+                                    uint64_t *periph_cycles)
+{
+    if (lines) *lines = 0u;
+    if (slices) *slices = 0u;
+    if (periph_cycles) *periph_cycles = 0u;
+}
+
+void m68k_tab5_x68p4_predecode_stats(uint32_t *fill, uint32_t *hit, uint32_t *miss,
+                                     uint32_t *inv, uint32_t *escape)
+{
+    if (fill) *fill = 0u;
+    if (hit) *hit = 0u;
+    if (miss) *miss = 0u;
+    if (inv) *inv = 0u;
+    if (escape) *escape = 0u;
+}
+
 #ifdef TCM_DRAM_ATTR
 static TCM_DRAM_ATTR tab5_m68k_dispatch_entry_t s_tab5_dispatch_cache[TAB5_M68K_DISPATCH_CACHE_SIZE];
-static TCM_DRAM_ATTR uint32_t s_tab5_dispatch_prof_enabled = 0;
-static TCM_DRAM_ATTR uint32_t s_tab5_dispatch_hits = 0;
-static TCM_DRAM_ATTR uint32_t s_tab5_dispatch_misses = 0;
 #else
 static DRAM_ATTR tab5_m68k_dispatch_entry_t s_tab5_dispatch_cache[TAB5_M68K_DISPATCH_CACHE_SIZE];
-static DRAM_ATTR uint32_t s_tab5_dispatch_prof_enabled = 0;
-static DRAM_ATTR uint32_t s_tab5_dispatch_hits = 0;
-static DRAM_ATTR uint32_t s_tab5_dispatch_misses = 0;
 #endif
 
 static DRAM_ATTR tab5_m68k_dispatch_entry_t s_tab5_dispatch_l2[TAB5_M68K_DISPATCH_L2_SIZE];
-static DRAM_ATTR uint32_t s_tab5_dispatch_l2_hits = 0;
 
-/* R57E70C: 256-entry direct-mapped PC/opcode cache in Internal DRAM.
- * It is deliberately slice-local: generation changes at every m68k_execute
- * entry, so DMA/HostFS/device writes between scheduler slices can never leave
- * stale code. Guest RAM writes inside a slice bump the same generation through
- * the direct Musashi RAM-write helpers. This caches only the 16-bit opcode
- * fetch; the existing TCM/L2 opcode-dispatch metadata cache remains unchanged. */
-#define TAB5_FETCH70C_BITS 8u
-#define TAB5_FETCH70C_SIZE (1u << TAB5_FETCH70C_BITS)
-#define TAB5_FETCH70C_MASK (TAB5_FETCH70C_SIZE - 1u)
-typedef struct {
-    uint32_t pc;
-    uint32_t epoch;
-    uint16_t word;
-    uint16_t pad;
-} tab5_fetch70c_entry_t;
-static DRAM_ATTR tab5_fetch70c_entry_t s_tab5_fetch70c[TAB5_FETCH70C_SIZE];
-DRAM_ATTR uint32_t g_tab5_fetch70c_epoch = 1u;
+/* R57E123A: 1024-entry persistent fused execution cache in Internal RAM.
+ * A hit avoids both the guest-RAM opcode load and opcode-indexed L1/L2 dispatch
+ * lookup.  Entry epochs are killed by RAM writes; the global epoch changes only
+ * for explicit full barriers, not at every m68k_execute() slice. */
+DRAM_ATTR tab5_exec123_entry_t g_tab5_exec123_cache[TAB5_EXEC123_SIZE];
+DRAM_ATTR uint32_t g_tab5_exec123_epoch = 1u;
 
-static inline __attribute__((always_inline)) uint16_t tab5_fetch70c_ram_word(
-    uint8_t *base, uint32_t pc)
+void m68k_tab5_exec123_invalidate_all(void)
 {
-    const uint32_t epoch = g_tab5_fetch70c_epoch;
-    tab5_fetch70c_entry_t * const e =
-        &s_tab5_fetch70c[(pc >> 1) & TAB5_FETCH70C_MASK];
-    if (__builtin_expect(e->pc == pc && e->epoch == epoch, 1))
-        return e->word;
+#if PX68K_TAB5_X68P4_PREDECODE
+    x68p4_pre138_invalidate_all_internal();
+    /* Keep the legacy epoch moving only for ABI/debug readers. */
+    if (++g_tab5_exec123_epoch == 0u) g_tab5_exec123_epoch = 1u;
+#else
+    if (++g_tab5_exec123_epoch == 0u) {
+        memset(g_tab5_exec123_cache, 0, sizeof(g_tab5_exec123_cache));
+        g_tab5_exec123_epoch = 1u;
+    }
+#endif
+}
 
-    uint16_t w;
-    __builtin_memcpy(&w, base + pc, sizeof(w));
-    e->word = w;
-    e->pc = pc;
-    e->epoch = epoch;
-    return w;
+void m68k_tab5_exec123_invalidate_range(uint32_t address, uint32_t bytes)
+{
+#if PX68K_TAB5_X68P4_PREDECODE
+    x68p4_pre138_invalidate_range_internal(address, bytes);
+#else
+    address &= 0x00ffffffu;
+    if (!bytes || address >= 0x00c00000u) return;
+    if (bytes > 0x00c00000u - address) bytes = 0x00c00000u - address;
+    if (bytes >= 2048u) {
+        m68k_tab5_exec123_invalidate_all();
+        return;
+    }
+    uint32_t a = address & ~1u;
+    const uint32_t end = (address + bytes + 1u) & ~1u;
+    for (; a < end; a += 2u)
+        g_tab5_exec123_cache[tab5_exec123_index(a)].epoch = 0u;
+#endif
 }
 
 
@@ -2510,165 +1715,10 @@ uint32_t m68k_tab5_dispatch_l2_bytes(void)
     return (uint32_t)sizeof(s_tab5_dispatch_l2);
 }
 
-/* Build 5.59 poll accelerator diagnostics live in ordinary internal DRAM,
- * not scarce TCM. */
-static DRAM_ATTR uint32_t s_tab5_poll58_diag_moveand = 0;
-static DRAM_ATTR uint32_t s_tab5_poll58_diag_btst = 0;
-static DRAM_ATTR uint32_t s_tab5_poll58_diag_skipped = 0;
-static DRAM_ATTR uint32_t s_tab5_poll58_total_moveand = 0;
-static DRAM_ATTR uint32_t s_tab5_poll58_total_btst = 0;
-static DRAM_ATTR uint32_t s_tab5_poll59_diag_fdc = 0;
-static DRAM_ATTR uint32_t s_tab5_poll59_total_fdc = 0;
-static DRAM_ATTR uint64_t s_tab5_poll58_total_skipped = 0;
-static DRAM_ATTR uint64_t s_tab5_poll59_total_fdc_skipped = 0;
-static DRAM_ATTR uint32_t s_tab5_poll58_announce_mask = 0;
-static DRAM_ATTR uint32_t s_tab5_poll58_observe_mask = 0;
-static DRAM_ATTR uint32_t s_tab5_poll58_last_pc = 0;
-
-/* Build 5.73: generic side-effect-free RAM polling + pure DBF self-loop. */
-static DRAM_ATTR uint32_t s_tab5_poll73_diag_ram_moveand = 0;
-static DRAM_ATTR uint32_t s_tab5_poll73_diag_ram_btst = 0;
-static DRAM_ATTR uint32_t s_tab5_poll73_diag_ram_cmpi = 0;
-static DRAM_ATTR uint32_t s_tab5_poll598f_diag_ram_tstw = 0;
-static DRAM_ATTR uint32_t s_tab5_poll598g6_diag_ram_tstw_abs = 0;
-static DRAM_ATTR uint32_t s_tab5_poll73_total_ram_moveand = 0;
-static DRAM_ATTR uint32_t s_tab5_poll73_total_ram_btst = 0;
-static DRAM_ATTR uint32_t s_tab5_poll73_total_ram_cmpi = 0;
-static DRAM_ATTR uint32_t s_tab5_poll598f_total_ram_tstw = 0;
-static DRAM_ATTR uint32_t s_tab5_poll598g6_total_ram_tstw_abs = 0;
-static DRAM_ATTR uint32_t s_tab5_dbf73_diag_hits = 0;
-static DRAM_ATTR uint32_t s_tab5_dbf73_diag_loops = 0;
-static DRAM_ATTR uint32_t s_tab5_dbf73_diag_maxbatch = 0;
-static DRAM_ATTR uint32_t s_tab5_dbf73_total_hits = 0;
-static DRAM_ATTR uint64_t s_tab5_dbf73_total_loops = 0;
-static DRAM_ATTR uint64_t s_tab5_dbf73_total_cycles = 0;
-static DRAM_ATTR uint32_t s_tab5_dbf73_total_maxbatch = 0;
-static DRAM_ATTR uint32_t s_tab5_dbf73_announced = 0;
-
-/* Build 5.98f: sampled fast-path attribution.  Counters increment only while
- * the existing opcode-profile window is enabled, so production hot paths do
- * not pay permanent instrumentation overhead. */
-static DRAM_ATTR uint32_t s_tab5_fast598f_bccw = 0;
-static DRAM_ATTR uint32_t s_tab5_fast598f_dbcc = 0;
-static DRAM_ATTR uint32_t s_tab5_fast598f_core = 0;
-static DRAM_ATTR uint32_t s_tab5_fast598f_core_mem = 0;
-
-/* Build 5.74: short repeated-store DBF body accelerator. */
-static DRAM_ATTR uint32_t s_tab5_dbf74_diag_hits = 0;
-static DRAM_ATTR uint32_t s_tab5_dbf74_diag_loops = 0;
-static DRAM_ATTR uint32_t s_tab5_dbf74_diag_maxbody = 0;
-static DRAM_ATTR uint32_t s_tab5_dbf74_diag_maxbatch = 0;
-static DRAM_ATTR uint32_t s_tab5_dbf74_total_hits = 0;
-static DRAM_ATTR uint64_t s_tab5_dbf74_total_loops = 0;
-static DRAM_ATTR uint64_t s_tab5_dbf74_total_instr = 0;
-static DRAM_ATTR uint64_t s_tab5_dbf74_total_bytes = 0;
-static DRAM_ATTR uint64_t s_tab5_dbf74_total_cycles = 0;
-static DRAM_ATTR uint32_t s_tab5_dbf74_total_maxbody = 0;
-static DRAM_ATTR uint32_t s_tab5_dbf74_total_maxbatch = 0;
-static DRAM_ATTR uint32_t s_tab5_dbf74_announced_mask = 0;
-
-/* Build 5.79: generalized scheduler-bounded MOVE stream engine.
- * The first instruction in each chunk executes normally; only a verified
- * homogeneous suffix is elided.  The descriptor records operand FORM rather
- * than a fixed memory REGION.  In particular, (An)+ is one generic AREG
- * source and the runtime backend dispatches RAM vs GVRAM from the live EA.
- * Backends today: Dn->GVRAM, RAM (An)+->GVRAM, GVRAM (An)+->GVRAM, MOVE.W. */
-static DRAM_ATTR uint32_t s_tab5_stream576_reg_hits = 0;
-static DRAM_ATTR uint64_t s_tab5_stream576_reg_words = 0;
-static DRAM_ATTR uint32_t s_tab5_stream576_ram_hits = 0;
-static DRAM_ATTR uint64_t s_tab5_stream576_ram_words = 0;
-static DRAM_ATTR uint32_t s_tab5_stream576_gv_hits = 0;
-static DRAM_ATTR uint64_t s_tab5_stream576_gv_words = 0;
-static DRAM_ATTR uint64_t s_tab5_stream576_cycles = 0;
-static DRAM_ATTR uint32_t s_tab5_stream576_maxchunk = 0;
-static DRAM_ATTR uint32_t s_tab5_stream576_same_next = 0;
-static DRAM_ATTR uint32_t s_tab5_stream576_src_reject = 0;
-static DRAM_ATTR uint32_t s_tab5_stream576_dst_reject = 0;
-/* Build 5.78: distinguish architectural 32-bit A-register values from the
- * X68000's 24-bit external bus address.  This both accelerates safe aliases
- * and makes any true non-RAM/GVRAM source reject self-identifying. */
-static DRAM_ATTR uint32_t s_tab5_stream578_alias_hits = 0;
-static DRAM_ATTR uint64_t s_tab5_stream578_alias_words = 0;
-static DRAM_ATTR uint32_t s_tab5_stream578_alias_ram_hits = 0;
-static DRAM_ATTR uint32_t s_tab5_stream578_alias_gv_hits = 0;
-static DRAM_ATTR uint32_t s_tab5_stream578_alias_ipl_hits = 0;
-static DRAM_ATTR uint32_t s_tab5_stream578_ipl_hits = 0;
-static DRAM_ATTR uint64_t s_tab5_stream578_ipl_words = 0;
-static DRAM_ATTR uint32_t s_tab5_stream579_tv_hits = 0;
-static DRAM_ATTR uint64_t s_tab5_stream579_tv_words = 0;
-static DRAM_ATTR uint32_t s_tab5_stream579_alias_tv_hits = 0;
-static DRAM_ATTR uint32_t s_tab5_stream578_rej_tvram = 0;
-static DRAM_ATTR uint32_t s_tab5_stream578_rej_mmio = 0;
-static DRAM_ATTR uint32_t s_tab5_stream578_rej_font = 0;
-static DRAM_ATTR uint32_t s_tab5_stream578_rej_other = 0;
-static DRAM_ATTR uint32_t s_tab5_stream578_dst_alias_hits = 0;
-static DRAM_ATTR uint32_t s_tab5_stream576_announced_mask = 0;
-
-
-/* Build 5.81: production P4 hybrid selected from the 5.80a live A/B.
- * DREG->GVRAM repeat streams keep the P4 PIE/XespV 128-bit backend when
- * eligible; native-word RAM/TVRAM/IPL copy streams stay on the scalar 5.79
- * backend because measured PIE copy cost was substantially higher.  No live
- * alternation or cycle sampling remains in the hot path. */
+/* R139A6 production-clean: historical poll/DBF/stream/fill/fast-family
+ * attribution counters physically removed.  Only the functional P4 stream
+ * backend enable state remains. */
 static DRAM_ATTR int s_tab5_stream581_pie_enabled = 0;
-static DRAM_ATTR uint32_t s_tab5_stream581_repeat_pie_calls = 0;
-static DRAM_ATTR uint64_t s_tab5_stream581_repeat_pie_words = 0;
-static DRAM_ATTR uint64_t s_tab5_stream581_repeat_vec_words = 0;
-static DRAM_ATTR uint32_t s_tab5_stream581_repeat_scalar_calls = 0;
-static DRAM_ATTR uint64_t s_tab5_stream581_repeat_scalar_words = 0;
-static DRAM_ATTR uint32_t s_tab5_stream581_pie_fallbacks = 0;
-
-/* Build 5.59: exact zero-fill micro-loop accelerator diagnostics. */
-static DRAM_ATTR uint32_t s_tab5_fill59_calls = 0;
-static DRAM_ATTR uint32_t s_tab5_fill59_loops = 0;
-static DRAM_ATTR uint32_t s_tab5_fill59_instr = 0;
-static DRAM_ATTR uint64_t s_tab5_fill59_bytes = 0;
-static DRAM_ATTR uint64_t s_tab5_fill59_cycles = 0;
-
-/* Build 5.98g6: exact CLR.L (An)+ / CMPA.L Am,An / BNE.B back-edge
- * accelerator diagnostics. */
-static DRAM_ATTR uint32_t s_tab5_clear598g6_calls = 0;
-static DRAM_ATTR uint64_t s_tab5_clear598g6_loops = 0;
-static DRAM_ATTR uint64_t s_tab5_clear598g6_instr = 0;
-static DRAM_ATTR uint64_t s_tab5_clear598g6_bytes = 0;
-static DRAM_ATTR uint64_t s_tab5_clear598g6_cycles = 0;
-static DRAM_ATTR uint32_t s_tab5_clear598g6_maxbatch = 0;
-static DRAM_ATTR uint32_t s_tab5_clear598g6_announced = 0;
-
-/* Build 5.98g7: measured single-op handler elimination counters.  These two
- * families dominated the g6 profile but are not vector-friendly by themselves:
- * MOVE.B Dn,Dm is register-only, while MOVE.W Dn,(An)+ may touch any bus
- * region.  Execute their exact generated-Musashi bodies inline and keep the
- * existing STREAM hook after the word store so future homogeneous runs can
- * still graduate to the PIE backend. */
-static DRAM_ATTR uint32_t s_tab5_fast598g7_moveb_rr = 0;
-static DRAM_ATTR uint32_t s_tab5_fast598g7_movew_pi = 0;
-static DRAM_ATTR uint32_t s_tab5_fast598g9_movel_pi = 0;
-static DRAM_ATTR uint32_t s_tab5_fast598g9_clrw_pi = 0;
-static DRAM_ATTR uint32_t s_tab5_fast598g9_addq_a = 0;
-static DRAM_ATTR uint32_t s_tab5_fast598g9_movem_pd = 0;
-static DRAM_ATTR uint32_t s_tab5_fast598g9_movem_pi = 0;
-static DRAM_ATTR uint32_t s_tab5_fast598g9_movem_regs = 0;
-static DRAM_ATTR uint32_t s_tab5_fast598g9_movem_bytes = 0;
-/* Build 5.98g10: remaining measured single-op hot families. */
-static DRAM_ATTR uint32_t s_tab5_fast598g10_movel_pipi = 0;
-static DRAM_ATTR uint32_t s_tab5_fast598g10_btst_imm_d = 0;
-static DRAM_ATTR uint32_t s_tab5_fast598g10_clrl_pi = 0;
-static DRAM_ATTR uint32_t s_tab5_fast598g10_extl = 0;
-
-/* Build 5.98g11: exact sparse-clear hot-loop batching.  The g10 profile
- * showed the five-instruction loop below consuming ~80% of one heavy sample:
- *   CLR.W (A0)+ ; CLR.W (A0)+ ; SUBQ.W #1,D0 ; ADDQ #4,A0 ; BPL.B loop
- * Only ordinary RAM writes are elided, within the current Musashi slice. */
-static DRAM_ATTR uint32_t s_tab5_loop598g11_calls = 0;
-static DRAM_ATTR uint64_t s_tab5_loop598g11_loops = 0;
-static DRAM_ATTR uint64_t s_tab5_loop598g11_instr = 0;
-static DRAM_ATTR uint64_t s_tab5_loop598g11_zero_bytes = 0;
-static DRAM_ATTR uint64_t s_tab5_loop598g11_span_bytes = 0;
-static DRAM_ATTR uint64_t s_tab5_loop598g11_cycles = 0;
-static DRAM_ATTR uint32_t s_tab5_loop598g11_maxbatch = 0;
-static DRAM_ATTR uint32_t s_tab5_loop598g11_announced = 0;
-
 
 extern int px68k_m68k_zero_fill_ram(uint32_t address, uint32_t bytes);
 extern int px68k_m68k_repeat_fill_ram(uint32_t address, uint32_t value,
@@ -2714,7 +1764,7 @@ static inline __attribute__((always_inline)) void tab5_ram598g9_store32(uint32_t
     __builtin_memcpy(MEM + a, &hi, 2u);
     __builtin_memcpy(MEM + a + 2u, &lo, 2u);
     BusErrFlag = 0;
-    tab5_fetch70c_note_ram_write();
+    m68k_tab5_exec123_note_ram_write32(a);
 }
 
 /* Return non-zero only when the instruction was fully executed here. Odd or
@@ -2750,7 +1800,6 @@ static inline __attribute__((always_inline)) int tab5_movem598g9_try(uint16_t op
         }
         REG_A[areg] = ea;
         USE_CYCLES((int)(count << CYC_MOVEM_L));
-        TAB5_PROF(++s_tab5_fast598g9_movem_pd);
     } else if ((op & 0xfff8u) == 0x4cd8u) { /* MOVEM.L (An)+,regs */
         if (bytes > (0x00c00000u - ea)) return 0;
         if (count && ea > 0x00bffffcu) return 0;
@@ -2763,13 +1812,10 @@ static inline __attribute__((always_inline)) int tab5_movem598g9_try(uint16_t op
         }
         REG_A[areg] = ea;
         USE_CYCLES((int)(count << CYC_MOVEM_L));
-        TAB5_PROF(++s_tab5_fast598g9_movem_pi);
     } else {
         return 0;
     }
 
-    TAB5_PROF(s_tab5_fast598g9_movem_regs += count);
-    TAB5_PROF(s_tab5_fast598g9_movem_bytes += bytes);
     return 1;
 }
 
@@ -2792,12 +1838,6 @@ static inline __attribute__((always_inline)) int tab5_movem598g9_try(uint16_t op
  */
 #define TAB5_MOVEW570_MAX_WORDS 128u
 
-static DRAM_ATTR uint32_t s_tab5_movew570_scans = 0;
-static DRAM_ATTR uint32_t s_tab5_movew570_batches = 0;
-static DRAM_ATTR uint64_t s_tab5_movew570_words = 0;
-static DRAM_ATTR uint64_t s_tab5_movew570_cycles = 0;
-static DRAM_ATTR uint32_t s_tab5_movew570_max_batch = 0;
-static DRAM_ATTR uint32_t s_tab5_movew570_fallbacks = 0;
 
 static inline __attribute__((always_inline))
 int tab5_movew570_try_live_run(uint16_t op, uint32_t move_cycles)
@@ -2836,11 +1876,9 @@ int tab5_movew570_try_live_run(uint16_t op, uint32_t move_cycles)
     if (REG_A[dst_a] != a || (a & 1u) || a > 0x00bffffeu)
         return 0;
 
-    TAB5_PROF(++s_tab5_movew570_scans);
     n = px68k_m68k_live_repeat_movew_ram(pc, a, value, op, max_n);
     if (n < 2u)
     {
-        TAB5_PROF(++s_tab5_movew570_fallbacks);
         return 0;
     }
 
@@ -2861,33 +1899,7 @@ int tab5_movew570_try_live_run(uint16_t op, uint32_t move_cycles)
      * dispatch-cache lookup. Account for the n-1 elided logical instructions
      * so sparse diagnostics continue to describe guest execution, not host
      * implementation details. */
-    if (__builtin_expect(PX68K_TAB5_PERF_PROFILE && n > 1u && s_tab5_opcode_profile_enabled, 0))
-    {
-        tab5_movew65b_obs_t * const o = &s_tab5_movew65b;
-        const uint32_t extra = n - 1u;
-        s_tab5_opcode_counts[op] += extra;
-        s_tab5_opcode_total += extra;
-        o->total_candidates += extra;
-        if (o->cur_len && o->prev_op == op && o->prev_pc == pc)
-        {
-            o->cur_len += extra;
-            o->prev_pc = pc + (extra << 1);
-            if (o->cur_len > o->max_len)
-            {
-                o->max_len = o->cur_len;
-                o->max_op = op;
-                o->max_start_pc = o->cur_start_pc;
-                o->max_end_pc = o->prev_pc;
-            }
-        }
-    }
-    if (__builtin_expect(PX68K_TAB5_PERF_PROFILE && n > 1u && s_tab5_dispatch_prof_enabled, 0))
-        s_tab5_dispatch_hits += n - 1u;
 
-    TAB5_PROF(++s_tab5_movew570_batches);
-    TAB5_PROF(s_tab5_movew570_words += n);
-    TAB5_PROF(s_tab5_movew570_cycles += (uint64_t)n * move_cycles);
-    TAB5_PROF(if (n > s_tab5_movew570_max_batch) s_tab5_movew570_max_batch = n);
     return 1;
 }
 
@@ -2964,16 +1976,10 @@ uint32_t tab5_stream581_repeat_backend(uint32_t dst, uint16_t value, uint32_t n)
         done = GVRAM_WriteWordRepeat256P4(dst, value, n, &vec_words);
         if (__builtin_expect(done != 0u, 1))
         {
-            TAB5_PROF(++s_tab5_stream581_repeat_pie_calls);
-            TAB5_PROF(s_tab5_stream581_repeat_pie_words += n);
-            TAB5_PROF(s_tab5_stream581_repeat_vec_words += vec_words);
             return done;
         }
-        TAB5_PROF(++s_tab5_stream581_pie_fallbacks);
     }
 
-    TAB5_PROF(++s_tab5_stream581_repeat_scalar_calls);
-    TAB5_PROF(s_tab5_stream581_repeat_scalar_words += n);
     return GVRAM_WriteWordRepeat256(dst, value, n);
 }
 
@@ -3001,8 +2007,6 @@ int tab5_stream576_try_postrun(uint16_t op, uint32_t move_cycles)
     int remain;
 
     if (move_cycles == 0u || FLAG_T1 || FLAG_T0) return 0;
-    if (__builtin_expect(PX68K_TAB5_PERF_PROFILE && (s_tab5_opcode_profile_enabled || s_tab5_dispatch_prof_enabled), 0))
-        return 0;
     if (!tab5_stream576_decode(op, &d)) return 0;
 
     remain = GET_CYCLES();
@@ -3024,7 +2028,6 @@ int tab5_stream576_try_postrun(uint16_t op, uint32_t move_cycles)
 
     /* One cheap lookahead gates the prefix scan. */
     if (tab5_poll58_fetch16(pc) != op) return 0;
-    TAB5_PROF(++s_tab5_stream576_same_next);
 
     n = 1u;
     while (n < max_n && tab5_poll58_fetch16(pc + (n << 1)) == op)
@@ -3039,16 +2042,13 @@ int tab5_stream576_try_postrun(uint16_t op, uint32_t move_cycles)
     dst_arch = REG_A[d.dst_reg];
     dst = dst_arch & 0x00ffffffu;
     if ((dst & 1u) || dst < 0x00c00000u || dst >= 0x00d00000u) {
-        TAB5_PROF(++s_tab5_stream576_dst_reject);
         return 0;
     }
     if (dst_arch & 0xff000000u)
-        TAB5_PROF(++s_tab5_stream578_dst_alias_hits);
     {
         const uint32_t dst_words = (0x00d00000u - dst) >> 1;
         if (n > dst_words) n = dst_words;
         if (n < 2u) {
-            TAB5_PROF(++s_tab5_stream576_dst_reject);
             return 0;
         }
     }
@@ -3057,15 +2057,7 @@ int tab5_stream576_try_postrun(uint16_t op, uint32_t move_cycles)
         last_value = REG_D[d.src_reg] & 0xffffu;
         done = tab5_stream581_repeat_backend(dst, (uint16_t)last_value, n);
         if (done != n) {
-            TAB5_PROF(++s_tab5_stream576_dst_reject);
             return 0;
-        }
-        TAB5_PROF(++s_tab5_stream576_reg_hits);
-        TAB5_PROF(s_tab5_stream576_reg_words += n);
-        if (__builtin_expect(PX68K_TAB5_PERF_PROFILE && !(s_tab5_stream576_announced_mask & 1u), 0)) {
-            s_tab5_stream576_announced_mask |= 1u;
-            printf("PX68K_STREAM580: ACTIVE kind=DREG->GVRAM op=$%04X D%u->A%u first_chunk=%lu; scheduler boundary preserved\n",
-                   (unsigned)op, d.src_reg, d.dst_reg, (unsigned long)n);
         }
     } else {
         const uint32_t src_arch = REG_A[d.src_reg];
@@ -3074,8 +2066,6 @@ int tab5_stream576_try_postrun(uint16_t op, uint32_t move_cycles)
         uint16_t last_word = 0;
 
         if (src & 1u) {
-            TAB5_PROF(++s_tab5_stream576_src_reject);
-            TAB5_PROF(++s_tab5_stream578_rej_other);
             return 0;
         }
 
@@ -3083,46 +2073,23 @@ int tab5_stream576_try_postrun(uint16_t op, uint32_t move_cycles)
             const uint32_t src_words = (0x00c00000u - src) >> 1;
             if (n > src_words) n = src_words;
             if (n < 2u) {
-                TAB5_PROF(++s_tab5_stream576_src_reject);
-                TAB5_PROF(++s_tab5_stream578_rej_other);
                 return 0;
             }
 
             done = tab5_stream581_copy_backend(dst, MEM + src, n, &last_word);
             if (done != n) {
-                TAB5_PROF(++s_tab5_stream576_dst_reject);
                 return 0;
-            }
-            TAB5_PROF(++s_tab5_stream576_ram_hits);
-            TAB5_PROF(s_tab5_stream576_ram_words += n);
-            TAB5_PROF(if (alias24) ++s_tab5_stream578_alias_ram_hits);
-            if (__builtin_expect(PX68K_TAB5_PERF_PROFILE && !(s_tab5_stream576_announced_mask & 2u), 0)) {
-                s_tab5_stream576_announced_mask |= 2u;
-                printf("PX68K_STREAM580: ACTIVE kind=RAM->GVRAM op=$%04X A%u->A%u first_chunk=%lu; scheduler boundary preserved\n",
-                       (unsigned)op, d.src_reg, d.dst_reg, (unsigned long)n);
             }
         } else if (src < 0x00e00000u) {
             const uint32_t src_words = (0x00e00000u - src) >> 1;
             if (n > src_words) n = src_words;
             if (n < 2u) {
-                TAB5_PROF(++s_tab5_stream576_src_reject);
-                TAB5_PROF(++s_tab5_stream578_rej_other);
                 return 0;
             }
 
             done = GVRAM_CopyWordStream256(src, dst, n, &last_word);
             if (done != n) {
-                TAB5_PROF(++s_tab5_stream576_src_reject);
-                TAB5_PROF(++s_tab5_stream578_rej_other);
                 return 0;
-            }
-            TAB5_PROF(++s_tab5_stream576_gv_hits);
-            TAB5_PROF(s_tab5_stream576_gv_words += n);
-            TAB5_PROF(if (alias24) ++s_tab5_stream578_alias_gv_hits);
-            if (__builtin_expect(PX68K_TAB5_PERF_PROFILE && !(s_tab5_stream576_announced_mask & 4u), 0)) {
-                s_tab5_stream576_announced_mask |= 4u;
-                printf("PX68K_STREAM580: ACTIVE kind=GVRAM->GVRAM op=$%04X A%u->A%u first_chunk=%lu; overlap-safe + scheduler boundary preserved\n",
-                       (unsigned)op, d.src_reg, d.dst_reg, (unsigned long)n);
             }
         } else if (src < 0x00e80000u) {
             /* Build 5.79: TVRAM reads are side-effect free.  TVRAM_Read() masks
@@ -3135,22 +2102,11 @@ int tab5_stream576_try_postrun(uint16_t op, uint32_t move_cycles)
             const uint32_t src_words = (0x00e80000u - src) >> 1;
             if (n > src_words) n = src_words;
             if (n < 2u) {
-                TAB5_PROF(++s_tab5_stream576_src_reject);
-                TAB5_PROF(++s_tab5_stream578_rej_tvram);
                 return 0;
             }
             done = tab5_stream581_copy_backend(dst, TVRAM + (src & 0x0007ffffu), n, &last_word);
             if (done != n) {
-                TAB5_PROF(++s_tab5_stream576_dst_reject);
                 return 0;
-            }
-            TAB5_PROF(++s_tab5_stream579_tv_hits);
-            TAB5_PROF(s_tab5_stream579_tv_words += n);
-            TAB5_PROF(if (alias24) ++s_tab5_stream579_alias_tv_hits);
-            if (__builtin_expect(PX68K_TAB5_PERF_PROFILE && !(s_tab5_stream576_announced_mask & 32u), 0)) {
-                s_tab5_stream576_announced_mask |= 32u;
-                printf("PX68K_STREAM580: ACTIVE kind=TVRAM->GVRAM op=$%04X A%u->A%u first_chunk=%lu; side-effect-free native-word source\n",
-                       (unsigned)op, d.src_reg, d.dst_reg, (unsigned long)n);
             }
         } else if (src >= 0x00fc0000u) {
             /* IPL is a plain 256 KiB ROM in the same host-native word-swapped
@@ -3159,42 +2115,17 @@ int tab5_stream576_try_postrun(uint16_t op, uint32_t move_cycles)
             const uint32_t src_words = (0x01000000u - src) >> 1;
             if (n > src_words) n = src_words;
             if (n < 2u) {
-                TAB5_PROF(++s_tab5_stream576_src_reject);
-                TAB5_PROF(++s_tab5_stream578_rej_other);
                 return 0;
             }
             done = tab5_stream581_copy_backend(dst, IPL + (src & 0x0003ffffu), n, &last_word);
             if (done != n) {
-                TAB5_PROF(++s_tab5_stream576_dst_reject);
                 return 0;
             }
-            TAB5_PROF(++s_tab5_stream578_ipl_hits);
-            TAB5_PROF(s_tab5_stream578_ipl_words += n);
-            TAB5_PROF(if (alias24) ++s_tab5_stream578_alias_ipl_hits);
-            if (__builtin_expect(PX68K_TAB5_PERF_PROFILE && !(s_tab5_stream576_announced_mask & 8u), 0)) {
-                s_tab5_stream576_announced_mask |= 8u;
-                printf("PX68K_STREAM580: ACTIVE kind=IPL->GVRAM op=$%04X A%u->A%u first_chunk=%lu; ROM read side effects absent\n",
-                       (unsigned)op, d.src_reg, d.dst_reg, (unsigned long)n);
-            }
         } else {
-            TAB5_PROF(
-                ++s_tab5_stream576_src_reject;
-                if (src < 0x00e80000u) ++s_tab5_stream578_rej_tvram;
-                else if (src < 0x00f00000u) ++s_tab5_stream578_rej_mmio;
-                else if (src < 0x00fc0000u) ++s_tab5_stream578_rej_font;
-                else ++s_tab5_stream578_rej_other;
-            );
             return 0;
         }
 
         if (alias24) {
-            TAB5_PROF(++s_tab5_stream578_alias_hits);
-            TAB5_PROF(s_tab5_stream578_alias_words += n);
-            if (__builtin_expect(PX68K_TAB5_PERF_PROFILE && !(s_tab5_stream576_announced_mask & 16u), 0)) {
-                s_tab5_stream576_announced_mask |= 16u;
-                printf("PX68K_STREAM580: 24-bit A-reg alias ACTIVE arch=$%08lX bus=$%06lX A%u; full A preserved, bus low24 used\n",
-                       (unsigned long)src_arch, (unsigned long)src, d.src_reg);
-            }
         }
 
         BusErrFlag = 0;
@@ -3214,8 +2145,6 @@ int tab5_stream576_try_postrun(uint16_t op, uint32_t move_cycles)
     FLAG_C = CFLAG_CLEAR;
     USE_CYCLES((int)(n * move_cycles));
 
-    TAB5_PROF(s_tab5_stream576_cycles += (uint64_t)n * move_cycles);
-    TAB5_PROF(if (n > s_tab5_stream576_maxchunk) s_tab5_stream576_maxchunk = n);
     return 1;
 }
 
@@ -3237,183 +2166,7 @@ static void tab5_dispatch_cache_reset(void)
     memset(s_tab5_dispatch_l2, 0, sizeof(s_tab5_dispatch_l2));
 }
 
-void m68k_tab5_dispatch_profile_set(int enabled)
-{
-    enabled = enabled ? 1 : 0;
-    if (enabled && !s_tab5_dispatch_prof_enabled) {
-        s_tab5_dispatch_hits = 0;
-        s_tab5_dispatch_l2_hits = 0;
-        s_tab5_dispatch_misses = 0;
-        s_tab5_poll58_diag_moveand = 0;
-        s_tab5_poll58_diag_btst = 0;
-        s_tab5_poll59_diag_fdc = 0;
-        s_tab5_poll58_diag_skipped = 0;
-        s_tab5_poll58_last_pc = 0;
-        s_tab5_poll73_diag_ram_moveand = 0;
-        s_tab5_poll73_diag_ram_btst = 0;
-        s_tab5_poll73_diag_ram_cmpi = 0;
-        s_tab5_poll598f_diag_ram_tstw = 0;
-        s_tab5_poll598g6_diag_ram_tstw_abs = 0;
-        s_tab5_fast598f_bccw = 0;
-        s_tab5_fast598f_dbcc = 0;
-        s_tab5_fast598f_core = 0;
-        s_tab5_fast598f_core_mem = 0;
-        s_tab5_fast598g7_moveb_rr = 0;
-        s_tab5_fast598g7_movew_pi = 0;
-        s_tab5_fast598g9_movel_pi = 0;
-        s_tab5_fast598g9_clrw_pi = 0;
-        s_tab5_fast598g9_addq_a = 0;
-        s_tab5_fast598g9_movem_pd = 0;
-        s_tab5_fast598g9_movem_pi = 0;
-        s_tab5_fast598g9_movem_regs = 0;
-        s_tab5_fast598g9_movem_bytes = 0;
-        s_tab5_fast598g10_movel_pipi = 0;
-        s_tab5_fast598g10_btst_imm_d = 0;
-        s_tab5_fast598g10_clrl_pi = 0;
-        s_tab5_fast598g10_extl = 0;
-        s_tab5_dbf73_diag_hits = 0;
-        s_tab5_dbf73_diag_loops = 0;
-        s_tab5_dbf73_diag_maxbatch = 0;
-        s_tab5_dbf74_diag_hits = 0;
-        s_tab5_dbf74_diag_loops = 0;
-        s_tab5_dbf74_diag_maxbody = 0;
-        s_tab5_dbf74_diag_maxbatch = 0;
-        s_tab5_dispatch_prof_enabled = 1;
-    } else if (!enabled && s_tab5_dispatch_prof_enabled) {
-        const uint32_t h = s_tab5_dispatch_hits;
-        const uint32_t m = s_tab5_dispatch_misses;
-        const uint32_t total = h + s_tab5_dispatch_l2_hits + m;
-        s_tab5_dispatch_prof_enabled = 0;
-        const uint32_t hit_x10 = total ? (h * 1000u) / total : 0u;
-        printf("PX68K_P4CPU: DISPATCH L1=%u hit=%lu L2=%u hit=%lu backing=%lu L1rate=%lu.%lu%% tcm=%uB l2dram=%uB\n",
-               (unsigned)TAB5_M68K_DISPATCH_CACHE_SIZE,
-               (unsigned long)h,
-               (unsigned)TAB5_M68K_DISPATCH_L2_SIZE,
-               (unsigned long)s_tab5_dispatch_l2_hits,
-               (unsigned long)m,
-               (unsigned long)(hit_x10 / 10u),
-               (unsigned long)(hit_x10 % 10u),
-               (unsigned)sizeof(s_tab5_dispatch_cache),
-               (unsigned)sizeof(s_tab5_dispatch_l2));
-        printf("PX68K_POLL73: sample gpip(moveand/btst)=%lu/%lu fdc=%lu skipped=%lu cycles lastpc=$%06lX; "
-               "total_gp=%lu/%lu total_fdc=%lu skipped_total=%llu fdc_skipped=%llu\n",
-               (unsigned long)s_tab5_poll58_diag_moveand,
-               (unsigned long)s_tab5_poll58_diag_btst,
-               (unsigned long)s_tab5_poll59_diag_fdc,
-               (unsigned long)s_tab5_poll58_diag_skipped,
-               (unsigned long)(s_tab5_poll58_last_pc & 0x00ffffffu),
-               (unsigned long)s_tab5_poll58_total_moveand,
-               (unsigned long)s_tab5_poll58_total_btst,
-               (unsigned long)s_tab5_poll59_total_fdc,
-               (unsigned long long)s_tab5_poll58_total_skipped,
-               (unsigned long long)s_tab5_poll59_total_fdc_skipped);
-        printf("PX68K_POLL598G6: sample ram(moveand/btst/cmpi/tstw-an/tstw-abs)=%lu/%lu/%lu/%lu/%lu; total=%lu/%lu/%lu/%lu/%lu\n",
-               (unsigned long)s_tab5_poll73_diag_ram_moveand,
-               (unsigned long)s_tab5_poll73_diag_ram_btst,
-               (unsigned long)s_tab5_poll73_diag_ram_cmpi,
-               (unsigned long)s_tab5_poll598f_diag_ram_tstw,
-               (unsigned long)s_tab5_poll598g6_diag_ram_tstw_abs,
-               (unsigned long)s_tab5_poll73_total_ram_moveand,
-               (unsigned long)s_tab5_poll73_total_ram_btst,
-               (unsigned long)s_tab5_poll73_total_ram_cmpi,
-               (unsigned long)s_tab5_poll598f_total_ram_tstw,
-               (unsigned long)s_tab5_poll598g6_total_ram_tstw_abs);
-        printf("PX68K_FAST598G9: sample bcc.w=%lu dbcc=%lu core=%lu core-mem=%lu moveb-rr=%lu movew-pi=%lu movel-pi=%lu clrw-pi=%lu addq-a=%lu MOVEM pd/pi=%lu/%lu regs=%lu bytes=%lu\n",
-               (unsigned long)s_tab5_fast598f_bccw,
-               (unsigned long)s_tab5_fast598f_dbcc,
-               (unsigned long)s_tab5_fast598f_core,
-               (unsigned long)s_tab5_fast598f_core_mem,
-               (unsigned long)s_tab5_fast598g7_moveb_rr,
-               (unsigned long)s_tab5_fast598g7_movew_pi,
-               (unsigned long)s_tab5_fast598g9_movel_pi,
-               (unsigned long)s_tab5_fast598g9_clrw_pi,
-               (unsigned long)s_tab5_fast598g9_addq_a,
-               (unsigned long)s_tab5_fast598g9_movem_pd,
-               (unsigned long)s_tab5_fast598g9_movem_pi,
-               (unsigned long)s_tab5_fast598g9_movem_regs,
-               (unsigned long)s_tab5_fast598g9_movem_bytes);
-        printf("PX68K_FAST598G10: sample movel-pipi=%lu btst-imm-d=%lu clrl-pi=%lu extl=%lu\n",
-               (unsigned long)s_tab5_fast598g10_movel_pipi,
-               (unsigned long)s_tab5_fast598g10_btst_imm_d,
-               (unsigned long)s_tab5_fast598g10_clrl_pi,
-               (unsigned long)s_tab5_fast598g10_extl);
-        printf("PX68K_LOOP598G11: total calls=%lu loops=%llu instr-elided=%llu zero-bytes=%llu span-bytes=%llu cycles=%llu maxbatch=%lu\n",
-               (unsigned long)s_tab5_loop598g11_calls,
-               (unsigned long long)s_tab5_loop598g11_loops,
-               (unsigned long long)s_tab5_loop598g11_instr,
-               (unsigned long long)s_tab5_loop598g11_zero_bytes,
-               (unsigned long long)s_tab5_loop598g11_span_bytes,
-               (unsigned long long)s_tab5_loop598g11_cycles,
-               (unsigned long)s_tab5_loop598g11_maxbatch);
-        printf("PX68K_DBF73: sample hits=%lu loops=%lu maxbatch=%lu; total hits=%lu loops=%llu cycles=%llu maxbatch=%lu\n",
-               (unsigned long)s_tab5_dbf73_diag_hits,
-               (unsigned long)s_tab5_dbf73_diag_loops,
-               (unsigned long)s_tab5_dbf73_diag_maxbatch,
-               (unsigned long)s_tab5_dbf73_total_hits,
-               (unsigned long long)s_tab5_dbf73_total_loops,
-               (unsigned long long)s_tab5_dbf73_total_cycles,
-               (unsigned long)s_tab5_dbf73_total_maxbatch);
-        printf("PX68K_DBF74: store-body total hits=%lu loops=%llu instr=%llu bytes=%llu cycles=%llu maxbody=%lu maxbatch=%lu\n",
-               (unsigned long)s_tab5_dbf74_total_hits,
-               (unsigned long long)s_tab5_dbf74_total_loops,
-               (unsigned long long)s_tab5_dbf74_total_instr,
-               (unsigned long long)s_tab5_dbf74_total_bytes,
-               (unsigned long long)s_tab5_dbf74_total_cycles,
-               (unsigned long)s_tab5_dbf74_total_maxbody,
-               (unsigned long)s_tab5_dbf74_total_maxbatch);
-        printf("PX68K_STREAM580: reg2gv=%lu/%llu ram2gv=%lu/%llu tv2gv=%lu/%llu gv2gv=%lu/%llu ipl2gv=%lu/%llu cycles=%llu maxchunk=%lu same-next=%lu\n",
-               (unsigned long)s_tab5_stream576_reg_hits,
-               (unsigned long long)s_tab5_stream576_reg_words,
-               (unsigned long)s_tab5_stream576_ram_hits,
-               (unsigned long long)s_tab5_stream576_ram_words,
-               (unsigned long)s_tab5_stream579_tv_hits,
-               (unsigned long long)s_tab5_stream579_tv_words,
-               (unsigned long)s_tab5_stream576_gv_hits,
-               (unsigned long long)s_tab5_stream576_gv_words,
-               (unsigned long)s_tab5_stream578_ipl_hits,
-               (unsigned long long)s_tab5_stream578_ipl_words,
-               (unsigned long long)s_tab5_stream576_cycles,
-               (unsigned long)s_tab5_stream576_maxchunk,
-               (unsigned long)s_tab5_stream576_same_next);
-        printf("PX68K_STREAM580: alias24 hits=%lu words=%llu backend(ram/tv/gv/ipl)=%lu/%lu/%lu/%lu reject src=%lu tvram/mmio/font/other=%lu/%lu/%lu/%lu dst=%lu dst-alias=%lu\n",
-               (unsigned long)s_tab5_stream578_alias_hits,
-               (unsigned long long)s_tab5_stream578_alias_words,
-               (unsigned long)s_tab5_stream578_alias_ram_hits,
-               (unsigned long)s_tab5_stream579_alias_tv_hits,
-               (unsigned long)s_tab5_stream578_alias_gv_hits,
-               (unsigned long)s_tab5_stream578_alias_ipl_hits,
-               (unsigned long)s_tab5_stream576_src_reject,
-               (unsigned long)s_tab5_stream578_rej_tvram,
-               (unsigned long)s_tab5_stream578_rej_mmio,
-               (unsigned long)s_tab5_stream578_rej_font,
-               (unsigned long)s_tab5_stream578_rej_other,
-               (unsigned long)s_tab5_stream576_dst_reject,
-               (unsigned long)s_tab5_stream578_dst_alias_hits);
-        printf("PX68K_STREAM581_P4: enabled=%d repeat pie=%lu/%llu vec=%llu scalar=%lu/%llu fallback=%lu; copy=scalar-fixed\n",
-               s_tab5_stream581_pie_enabled,
-               (unsigned long)s_tab5_stream581_repeat_pie_calls,
-               (unsigned long long)s_tab5_stream581_repeat_pie_words,
-               (unsigned long long)s_tab5_stream581_repeat_vec_words,
-               (unsigned long)s_tab5_stream581_repeat_scalar_calls,
-               (unsigned long long)s_tab5_stream581_repeat_scalar_words,
-               (unsigned long)s_tab5_stream581_pie_fallbacks);
-
-        printf("PX68K_FILL60: bulk-zero calls=%lu loops=%lu guest-instr-elided=%lu bytes=%llu cycles=%llu\n",
-               (unsigned long)s_tab5_fill59_calls,
-               (unsigned long)s_tab5_fill59_loops,
-               (unsigned long)s_tab5_fill59_instr,
-               (unsigned long long)s_tab5_fill59_bytes,
-               (unsigned long long)s_tab5_fill59_cycles);
-        printf("PX68K_CLEAR598G6: cmpa-loop calls=%lu loops=%llu guest-instr-elided=%llu bytes=%llu cycles=%llu maxbatch=%lu\n",
-               (unsigned long)s_tab5_clear598g6_calls,
-               (unsigned long long)s_tab5_clear598g6_loops,
-               (unsigned long long)s_tab5_clear598g6_instr,
-               (unsigned long long)s_tab5_clear598g6_bytes,
-               (unsigned long long)s_tab5_clear598g6_cycles,
-               (unsigned long)s_tab5_clear598g6_maxbatch);
-        printf("PX68K_MOVEW571: live scanner RETIRED (5.70 measured zero successful batches)\n");
-    }
-}
+void m68k_tab5_dispatch_profile_set(int enabled) { (void)enabled; }
 
 /*
  * Build 5.73 (ESP32-P4): scheduler-aware poll-loop accelerator.
@@ -3441,54 +2194,12 @@ static inline __attribute__((always_inline)) void tab5_poll59_fastforward(uint32
                                                                           uint32_t loop_pc)
 {
     const int remain = GET_CYCLES();
-    const int is_fdc = (kind_bit == 4u);
+    (void)kind_bit;
+    (void)loop_pc;
     if (remain <= 0) return;
 
-    TAB5_PROF(
-        if (kind_bit == 1u) s_tab5_poll58_total_moveand++;
-        else if (kind_bit == 2u) s_tab5_poll58_total_btst++;
-        else if (kind_bit == 4u) s_tab5_poll59_total_fdc++;
-        else if (kind_bit == 8u) s_tab5_poll73_total_ram_moveand++;
-        else if (kind_bit == 16u) s_tab5_poll73_total_ram_btst++;
-        else if (kind_bit == 32u) s_tab5_poll73_total_ram_cmpi++;
-        else if (kind_bit == 64u) s_tab5_poll598f_total_ram_tstw++;
-        else if (kind_bit == 128u) s_tab5_poll598g6_total_ram_tstw_abs++;
-        s_tab5_poll58_total_skipped += (uint32_t)remain;
-        if (is_fdc) s_tab5_poll59_total_fdc_skipped += (uint32_t)remain;
-    );
 
-    if (__builtin_expect(PX68K_TAB5_PERF_PROFILE && s_tab5_dispatch_prof_enabled, 0)) {
-        if (kind_bit == 1u) s_tab5_poll58_diag_moveand++;
-        else if (kind_bit == 2u) s_tab5_poll58_diag_btst++;
-        else if (kind_bit == 4u) s_tab5_poll59_diag_fdc++;
-        else if (kind_bit == 8u) s_tab5_poll73_diag_ram_moveand++;
-        else if (kind_bit == 16u) s_tab5_poll73_diag_ram_btst++;
-        else if (kind_bit == 32u) s_tab5_poll73_diag_ram_cmpi++;
-        else if (kind_bit == 64u) s_tab5_poll598f_diag_ram_tstw++;
-        else if (kind_bit == 128u) s_tab5_poll598g6_diag_ram_tstw_abs++;
-        s_tab5_poll58_diag_skipped += (uint32_t)remain;
-        s_tab5_poll58_last_pc = loop_pc;
-    }
 
-    if (__builtin_expect(PX68K_TAB5_PERF_PROFILE && (s_tab5_poll58_announce_mask & kind_bit) == 0u, 0)) {
-        s_tab5_poll58_announce_mask |= kind_bit;
-        if (is_fdc) {
-            printf("PX68K_POLL73: FDC-STATUS fast-forward ACTIVE kind=MOVE.B+AND+BNE loop=$%06lX; scheduler-resume per slice\n",
-                   (unsigned long)(loop_pc & 0x00ffffffu));
-        } else if (kind_bit == 1u || kind_bit == 2u) {
-            printf("PX68K_POLL73: MFP-GPIP fast-forward ACTIVE kind=%s loop=$%06lX; scheduler-resume per slice\n",
-                   (kind_bit == 1u) ? "MOVE.B+AND+BNE" : "BTST+BNE",
-                   (unsigned long)(loop_pc & 0x00ffffffu));
-        } else {
-            const char *kind = (kind_bit == 8u) ? "MOVE.B+AND+BNE"
-                              : (kind_bit == 16u) ? "BTST+BNE"
-                              : (kind_bit == 32u) ? "CMPI.W+BCS"
-                              : (kind_bit == 64u) ? "TST.W(An)+Bcc"
-                              : "TST.W abs.l+Bcc";
-            printf("PX68K_POLL73: stable-RAM fast-forward ACTIVE kind=%s loop=$%06lX; scheduler-resume per slice\n",
-                   kind, (unsigned long)(loop_pc & 0x00ffffffu));
-        }
-    }
 
     /* The loop has already completed one normal taken iteration.  Ordinary
      * RAM cannot be changed by these read-only loop bodies before the PX68K
@@ -3532,11 +2243,6 @@ static inline __attribute__((always_inline)) void tab5_poll58_try(uint16_t branc
             tab5_poll59_fastforward(8u, loop_pc);
             return;
         }
-        if (__builtin_expect((s_tab5_poll58_observe_mask & 1u) == 0u, 0)) {
-            s_tab5_poll58_observe_mask |= 1u;
-            printf("PX68K_POLL73: observe-only MOVE.B+AND+BNE loop=$%06lX read=$%06lX (not GPIP/FDC-status)\n",
-                   (unsigned long)loop_pc, (unsigned long)addr);
-        }
         return;
     }
 
@@ -3555,11 +2261,6 @@ static inline __attribute__((always_inline)) void tab5_poll58_try(uint16_t branc
         if (addr < 0x00c00000u) {
             tab5_poll59_fastforward(16u, loop_pc);
             return;
-        }
-        if (__builtin_expect((s_tab5_poll58_observe_mask & 2u) == 0u, 0)) {
-            s_tab5_poll58_observe_mask |= 2u;
-            printf("PX68K_POLL73: observe-only BTST+BNE loop=$%06lX read=$%06lX (volatile/unknown region)\n",
-                   (unsigned long)loop_pc, (unsigned long)addr);
         }
         return;
     }
@@ -3625,11 +2326,6 @@ static inline __attribute__((always_inline)) void tab5_poll58_try(uint16_t branc
             tab5_poll59_fastforward(32u, loop_pc);
             return;
         }
-        if (__builtin_expect((s_tab5_poll58_observe_mask & 4u) == 0u, 0)) {
-            s_tab5_poll58_observe_mask |= 4u;
-            printf("PX68K_POLL73: observe-only CMPI.W+BCS loop=$%06lX read=$%06lX (volatile/unknown region)\n",
-                   (unsigned long)loop_pc, (unsigned long)addr);
-        }
     }
 }
 
@@ -3649,10 +2345,6 @@ static inline __attribute__((always_inline)) void tab5_poll58_try(uint16_t branc
  * the final elided CMP exactly, so those flags are reconstructed from the last
  * folded subtraction.  REG_PC already points at loop_pc after the taken BHI and
  * remains there after any number of additional taken iterations. */
-static DRAM_ATTR uint32_t s_tab5_cmphi617_calls = 0;
-static DRAM_ATTR uint64_t s_tab5_cmphi617_loops = 0;
-static DRAM_ATTR uint32_t s_tab5_cmphi617_maxbatch = 0;
-static DRAM_ATTR uint8_t s_tab5_cmphi617_announced = 0;
 
 static inline __attribute__((always_inline))
 void tab5_cmphi617_try(uint16_t branch_op)
@@ -3714,36 +2406,16 @@ void tab5_cmphi617_try(uint16_t branch_op)
     BusErrFlag = 0;
     USE_CYCLES((int)(n * (uint32_t)loop_cycles));
 
-    ++s_tab5_cmphi617_calls;
-    s_tab5_cmphi617_loops += n;
-    if (n > s_tab5_cmphi617_maxbatch) s_tab5_cmphi617_maxbatch = n;
-    if (__builtin_expect(!s_tab5_cmphi617_announced, 0)) {
-        s_tab5_cmphi617_announced = 1;
-        printf("PX68K_CMPHI617: CMP.W (An)+ / BHI -4 RAM fast-forward ACTIVE pc=$%06lX D%u/A%u scheduler-bounded\n",
-               (unsigned long)loop_pc, dreg, areg);
-    }
 }
 
 void m68k_tab5_cmphi617_stats(unsigned int *calls, unsigned long long *loops, unsigned int *maxbatch)
 {
-    if (calls) *calls = (unsigned int)s_tab5_cmphi617_calls;
-    if (loops) *loops = (unsigned long long)s_tab5_cmphi617_loops;
-    if (maxbatch) *maxbatch = (unsigned int)s_tab5_cmphi617_maxbatch;
+    if (calls) *calls = 0u;
+    if (loops) *loops = 0u;
+    if (maxbatch) *maxbatch = 0u;
 }
-/* BAT162P: BE01 shell executor removed after BAT161 measured no speed gain.
- * Keep the BAT158 CPU core authoritative.  The only BE01-related helper in
- * this diagnostic build is an on-demand code snapshot called from CPU1 at a
- * benchmark log boundary.  It has zero per-instruction overhead. */
-void m68k_tab5_be01_target_snapshot(unsigned short *out_words, unsigned int max_words)
-{
-    unsigned int i;
-    if (!out_words || !MEM) return;
-    if (max_words > 64u) max_words = 64u; /* $19D7F0 + 128 bytes */
-    for (i = 0; i < max_words; ++i) {
-        const unsigned int a = 0x0019d7f0u + i * 2u;
-        out_words[i] = (unsigned short)(((unsigned int)MEM[a] << 8) | MEM[a + 1u]);
-    }
-}
+/* R139A6 production-clean: retired BE01 code-window diagnostic physically removed. */
+
 
 /* Build 6.15h17R20: corrected exact MDX hot-block executor for the dominant RAM-resident
  * loop measured by the R15 profiler.  This is deliberately not a new decoder
@@ -3788,23 +2460,26 @@ enum {
 
 static DRAM_ATTR tab5_mdx619_fixed_t s_tab5_mdx619_fixed[MDX619_FIXED_COUNT];
 static DRAM_ATTR uint8_t s_tab5_mdx619_cache_ready = 0;
-static DRAM_ATTR uint8_t s_tab5_mdx619_announced = 0;
-static DRAM_ATTR uint32_t s_tab5_mdx619_calls = 0;
-static DRAM_ATTR uint64_t s_tab5_mdx619_outer = 0;
-static DRAM_ATTR uint64_t s_tab5_mdx619_fixed_insn = 0;
-static DRAM_ATTR uint32_t s_tab5_mdx619_maxbatch = 0;
 static DRAM_ATTR uint8_t s_tab5_mdx619_cyc_672e = 0;
 static DRAM_ATTR uint8_t s_tab5_mdx619_cyc_670c = 0;
 static DRAM_ATTR uint8_t s_tab5_mdx619_cyc_62fc = 0;
 static DRAM_ATTR uint8_t s_tab5_mdx619_cyc_6502 = 0;
 static DRAM_ATTR uint8_t s_tab5_mdx619_cyc_51cf = 0;
 
+/* R57E128B: FB127 hot telemetry retired; R127B/R123 CPU path restored. */
 static DRAM_ATTR const uint16_t s_tab5_mdx619_signature[28] = {
     0x3019u,0x672eu,0x337cu,0x0000u,0xfffeu,0x4a2eu,0x12fau,0x670cu,
     0x7200u,0x122au,0x0001u,0xd241u,0xd074u,0x1000u,0x204bu,0xb058u,
     0x62fcu,0x2008u,0x908bu,0xe248u,0x5340u,0xb02au,0x0001u,0x6502u,
     0x1480u,0x5c8au,0x51cfu,0xffcau
 };
+
+static inline __attribute__((always_inline)) int tab5_r127_mdx_signature_ok(void)
+{
+    const int diff = memcmp(MEM + TAB5_MDX619_PC_START, s_tab5_mdx619_signature,
+                            sizeof(s_tab5_mdx619_signature));
+    return diff == 0;
+}
 
 static inline __attribute__((always_inline))
 void tab5_mdx619_cache_init(void)
@@ -3872,10 +2547,6 @@ int tab5_mdx619_code_overlap(uint32_t a, uint32_t bytes)
  * cycles (40 on terminal DBF) fit inside GET_CYCLES() are batched.  A partial
  * final iteration is left to the exact R20/stock path.
  */
-static DRAM_ATTR uint8_t  s_tab5_mdx622_announced = 0;
-static DRAM_ATTR uint32_t s_tab5_mdx622_calls = 0;
-static DRAM_ATTR uint64_t s_tab5_mdx622_loops = 0;
-static DRAM_ATTR uint32_t s_tab5_mdx622_maxbatch = 0;
 
 static inline __attribute__((always_inline)) uint16_t tab5_mdx622_load16(uint32_t a)
 {
@@ -3897,10 +2568,8 @@ int tab5_mdx622_zero_run_try(void)
     if (GET_CYCLES() <= 0) return 0;
 
     /* Same self-modifying-code safety gate as R20. */
-    if (memcmp(MEM + TAB5_MDX619_PC_START, s_tab5_mdx619_signature,
-               sizeof(s_tab5_mdx619_signature)) != 0) return 0;
+    if (!tab5_r127_mdx_signature_ok()) return 0;
 
-    ++s_tab5_mdx622_calls;
     m68ki_use_data_space();
     m68ki_set_fc(FLAG_S | FUNCTION_CODE_USER_PROGRAM);
 
@@ -3943,30 +2612,19 @@ int tab5_mdx622_zero_run_try(void)
 
         executed_any = 1;
         ++batch;
-        ++s_tab5_mdx622_loops;
 
         if (d7 == 0u || GET_CYCLES() <= 0)
             break;
     }
 
-    if (batch > s_tab5_mdx622_maxbatch)
-        s_tab5_mdx622_maxbatch = batch;
-
-    if (__builtin_expect(executed_any && !s_tab5_mdx622_announced, 0)) {
-        s_tab5_mdx622_announced = 1;
-        printf("PX68K_MDX622: ZERO-RUN batch ACTIVE exact 3019/672E/5C8A/51CF path; full-iteration scheduler fence maxOuter=%u\\n",
-               (unsigned)TAB5_MDX619_MAX_OUTER);
-    }
     return executed_any;
 }
 
-void m68k_tab5_mdx622_stats(unsigned int *calls,
-                            unsigned long long *loops,
-                            unsigned int *maxbatch)
+void m68k_tab5_mdx622_stats(unsigned int *calls, unsigned long long *loops, unsigned int *maxbatch)
 {
-    if (calls) *calls = (unsigned int)s_tab5_mdx622_calls;
-    if (loops) *loops = (unsigned long long)s_tab5_mdx622_loops;
-    if (maxbatch) *maxbatch = (unsigned int)s_tab5_mdx622_maxbatch;
+    if (calls) *calls = 0u;
+    if (loops) *loops = 0u;
+    if (maxbatch) *maxbatch = 0u;
 }
 
 /* Execute one fixed non-branch instruction exactly as the normal Musashi loop
@@ -3986,7 +2644,6 @@ int tab5_mdx619_fixed_step(uint32_t pc, unsigned slot, uint32_t expected_next)
     REG_PC = pc + 2u;
     f->handler();
     USE_CYCLES((int)f->cycles);
-    ++s_tab5_mdx619_fixed_insn;
     return ((REG_PC & 0x00ffffffu) == expected_next);
 }
 
@@ -4003,7 +2660,6 @@ int tab5_mdx619_bcc_step(uint32_t pc, uint16_t op, int taken, uint32_t expected_
     REG_PC = pc + 2u;
     tab5_bcc598f_exec(op, taken);
     USE_CYCLES((int)tab5_mdx619_bcc_cycles(op));
-    ++s_tab5_mdx619_fixed_insn;
     return ((REG_PC & 0x00ffffffu) == expected_next);
 }
 
@@ -4022,7 +2678,6 @@ int tab5_mdx619_dbf_step(uint32_t *next_pc)
     REG_PC = pc + 2u;
     (void)tab5_dbcc598f_exec(op);
     USE_CYCLES((int)s_tab5_mdx619_cyc_51cf);
-    ++s_tab5_mdx619_fixed_insn;
     *next_pc = REG_PC & 0x00ffffffu;
     return (*next_pc == TAB5_MDX619_PC_START || *next_pc == TAB5_MDX619_PC_END);
 }
@@ -4040,11 +2695,9 @@ int tab5_mdx619_try(void)
     /* Complete signature verification on every block entry.  The 56-byte
      * memcmp is much cheaper than the opcode-dispatch traffic it replaces and
      * ensures self-modifying or different guest code immediately falls back. */
-    if (memcmp(MEM + TAB5_MDX619_PC_START, s_tab5_mdx619_signature,
-               sizeof(s_tab5_mdx619_signature)) != 0) return 0;
+    if (!tab5_r127_mdx_signature_ok()) return 0;
 
     tab5_mdx619_cache_init();
-    ++s_tab5_mdx619_calls;
 
     while (outer_batch < TAB5_MDX619_MAX_OUTER && GET_CYCLES() > 0 &&
            (REG_PC & 0x00ffffffu) == TAB5_MDX619_PC_START) {
@@ -4142,27 +2795,20 @@ int tab5_mdx619_try(void)
         if (GET_CYCLES() <= 0) return 1;
         if (!tab5_mdx619_dbf_step(&next_pc)) return 1;
         ++outer_batch;
-        ++s_tab5_mdx619_outer;
         if (GET_CYCLES() <= 0) break;
         if (next_pc != TAB5_MDX619_PC_START) break;
     }
 
-    if (outer_batch > s_tab5_mdx619_maxbatch) s_tab5_mdx619_maxbatch = outer_batch;
-    if (__builtin_expect(executed_any && !s_tab5_mdx619_announced, 0)) {
-        s_tab5_mdx619_announced = 1;
-        printf("PX68K_MDX620: exact $1993BC-$1993F2 block executor ACTIVE; corrected DBF ext=$FFCA signature=56B maxOuter=%u CMPHI617 reused\n",
-               (unsigned)TAB5_MDX619_MAX_OUTER);
-    }
     return executed_any;
 }
 
 void m68k_tab5_mdx619_stats(unsigned int *calls, unsigned long long *outer,
-                            unsigned long long *fixed_insn, unsigned int *maxbatch)
+                              unsigned long long *fixed_insn, unsigned int *maxbatch)
 {
-    if (calls) *calls = (unsigned int)s_tab5_mdx619_calls;
-    if (outer) *outer = (unsigned long long)s_tab5_mdx619_outer;
-    if (fixed_insn) *fixed_insn = (unsigned long long)s_tab5_mdx619_fixed_insn;
-    if (maxbatch) *maxbatch = (unsigned int)s_tab5_mdx619_maxbatch;
+    if (calls) *calls = 0u;
+    if (outer) *outer = 0u;
+    if (fixed_insn) *fixed_insn = 0u;
+    if (maxbatch) *maxbatch = 0u;
 }
 
 
@@ -4248,7 +2894,7 @@ void tab5_sparse598g11_try_bpl(uint16_t branch_op)
         __builtin_memcpy(MEM + p + 2u, &zero16, 2u);
     }
     BusErrFlag = 0;
-    tab5_fetch70c_note_ram_write();
+    m68k_tab5_exec123_invalidate_range(a, span);
 
     REG_A[0] = a + span;
     counter -= n;
@@ -4262,32 +2908,10 @@ void tab5_sparse598g11_try_bpl(uint16_t branch_op)
     FLAG_V = VFLAG_CLEAR;
     FLAG_X = FLAG_C = CFLAG_CLEAR;
 
-    if (__builtin_expect(PX68K_TAB5_PERF_PROFILE && s_tab5_opcode_profile_enabled, 0)) {
-        s_tab5_opcode_counts[op_clr] += n * 2u;
-        s_tab5_opcode_counts[op_sub] += n;
-        s_tab5_opcode_counts[op_add] += n;
-        s_tab5_opcode_counts[op_bpl] += n;
-        s_tab5_opcode_total += n * 5u;
-    }
 
     USE_CYCLES((int)(n * (uint32_t)loop_cycles));
 
-    TAB5_PROF(
-        ++s_tab5_loop598g11_calls;
-        s_tab5_loop598g11_loops += n;
-        s_tab5_loop598g11_instr += (uint64_t)n * 5u;
-        s_tab5_loop598g11_zero_bytes += (uint64_t)n * 4u;
-        s_tab5_loop598g11_span_bytes += span;
-        s_tab5_loop598g11_cycles += (uint64_t)n * (uint32_t)loop_cycles;
-        if (n > s_tab5_loop598g11_maxbatch) s_tab5_loop598g11_maxbatch = n;
-    );
 
-    if (__builtin_expect(PX68K_TAB5_PERF_PROFILE && !s_tab5_loop598g11_announced, 0)) {
-        s_tab5_loop598g11_announced = 1;
-        printf("PX68K_LOOP598G11: sparse CLR.Wx2/SUBQ/ADDQ/BPL batch ACTIVE "
-               "pc=$%06lX-$%06lX; A0 ordinary-RAM stride=8 zero=4; scheduler-bounded\n",
-               (unsigned long)loop_pc, (unsigned long)branch_pc);
-    }
 }
 
 /* Build 5.98g6: collapse the exact hot RAM-clear loop observed in SFXVI:
@@ -4367,34 +2991,10 @@ void tab5_clear598g6_try_cmpa_bne(uint16_t branch_op)
     FLAG_V = VFLAG_SUB_32(end, new_a, res);
     FLAG_C = CFLAG_SUB_32(end, new_a, res);
 
-    if (__builtin_expect(PX68K_TAB5_PERF_PROFILE && s_tab5_opcode_profile_enabled, 0)) {
-        /* Preserve the logical guest profile even though n future iterations
-         * are executed as one host bulk operation.  The current architectural
-         * iteration was already counted by the main dispatch loop. */
-        s_tab5_opcode_counts[clr] += n;
-        s_tab5_opcode_counts[cmpa] += n;
-        s_tab5_opcode_counts[branch_op] += n;
-        s_tab5_opcode_total += n * 3u;
-    }
 
     USE_CYCLES((int)(n * (uint32_t)loop_cycles));
 
-    TAB5_PROF(
-        ++s_tab5_clear598g6_calls;
-        s_tab5_clear598g6_loops += n;
-        s_tab5_clear598g6_instr += (uint64_t)n * 3u;
-        s_tab5_clear598g6_bytes += bytes;
-        s_tab5_clear598g6_cycles += (uint64_t)n * (uint32_t)loop_cycles;
-        if (n > s_tab5_clear598g6_maxbatch) s_tab5_clear598g6_maxbatch = n;
-    );
 
-    if (__builtin_expect(PX68K_TAB5_PERF_PROFILE && !s_tab5_clear598g6_announced, 0)) {
-        s_tab5_clear598g6_announced = 1;
-        printf("PX68K_CLEAR598G6: CLR.L(A%u)+/CMPA.L A%u,A%u/BNE bulk-clear ACTIVE "
-               "pc=$%06lX-$%06lX; ordinary RAM + scheduler boundary; PIE-selected zero backend\n",
-               dst_a, end_a, dst_a,
-               (unsigned long)loop_pc, (unsigned long)branch_pc);
-    }
 }
 
 
@@ -4432,22 +3032,6 @@ static inline __attribute__((always_inline)) void tab5_dbf73_try_self(uint16_t d
     REG_D[cnt_d] = (REG_D[cnt_d] & 0xffff0000u) | ((counter - n) & 0xffffu);
     USE_CYCLES((int)(n * (uint32_t)per_taken));
 
-    TAB5_PROF(
-        s_tab5_dbf73_total_hits++;
-        s_tab5_dbf73_total_loops += n;
-        s_tab5_dbf73_total_cycles += (uint64_t)n * (uint32_t)per_taken;
-        if (n > s_tab5_dbf73_total_maxbatch) s_tab5_dbf73_total_maxbatch = n;
-    );
-    if (__builtin_expect(PX68K_TAB5_PERF_PROFILE && s_tab5_dispatch_prof_enabled, 0)) {
-        s_tab5_dbf73_diag_hits++;
-        s_tab5_dbf73_diag_loops += n;
-        if (n > s_tab5_dbf73_diag_maxbatch) s_tab5_dbf73_diag_maxbatch = n;
-    }
-    if (__builtin_expect(PX68K_TAB5_PERF_PROFILE && !s_tab5_dbf73_announced, 0)) {
-        s_tab5_dbf73_announced = 1;
-        printf("PX68K_DBF73: pure DBF self-loop fast-forward ACTIVE pc=$%06lX D%u; batch within current slice\n",
-               (unsigned long)branch_pc, cnt_d);
-    }
 }
 
 
@@ -4481,7 +3065,6 @@ static inline __attribute__((always_inline)) int tab5_dbf74_try_store_body(uint1
     int move_cycles, dbf_taken_cycles, loop_cycles, remain;
 
     if ((dbf_op & 0xfff8u) != 0x51c8u || FLAG_T1 || FLAG_T0) return 0;
-    if (__builtin_expect(PX68K_TAB5_PERF_PROFILE && (s_tab5_opcode_profile_enabled || s_tab5_dispatch_prof_enabled), 0)) return 0;
     if (loop_pc >= branch_pc) return 0;
 
     body_bytes = branch_pc - loop_pc;
@@ -4539,30 +3122,8 @@ static inline __attribute__((always_inline)) int tab5_dbf74_try_store_body(uint1
     REG_D[cnt_d] = (REG_D[cnt_d] & 0xffff0000u) | ((counter - n) & 0xffffu);
     USE_CYCLES((int)(n * (uint32_t)loop_cycles));
 
-    TAB5_PROF(
-        ++s_tab5_dbf74_total_hits;
-        s_tab5_dbf74_total_loops += n;
-        s_tab5_dbf74_total_instr += (uint64_t)n * (uint64_t)(body_ops + 1u);
-        s_tab5_dbf74_total_bytes += bytes;
-        s_tab5_dbf74_total_cycles += (uint64_t)n * (uint32_t)loop_cycles;
-        if (body_ops > s_tab5_dbf74_total_maxbody) s_tab5_dbf74_total_maxbody = body_ops;
-        if (n > s_tab5_dbf74_total_maxbatch) s_tab5_dbf74_total_maxbatch = n;
-    );
 
-    if (__builtin_expect(PX68K_TAB5_PERF_PROFILE && s_tab5_dispatch_prof_enabled, 0)) {
-        ++s_tab5_dbf74_diag_hits;
-        s_tab5_dbf74_diag_loops += n;
-        if (body_ops > s_tab5_dbf74_diag_maxbody) s_tab5_dbf74_diag_maxbody = body_ops;
-        if (n > s_tab5_dbf74_diag_maxbatch) s_tab5_dbf74_diag_maxbatch = n;
-    }
 
-    if (__builtin_expect(PX68K_TAB5_PERF_PROFILE && (s_tab5_dbf74_announced_mask & unit_bytes) == 0u, 0)) {
-        s_tab5_dbf74_announced_mask |= unit_bytes;
-        printf("PX68K_DBF74: repeated MOVE.%c store-body fast-forward ACTIVE body=%lu pc=$%06lX-$%06lX D%u->A%u DBF D%u; scheduler boundary preserved\n",
-               (unit_bytes == 2u) ? 'W' : 'L', (unsigned long)body_ops,
-               (unsigned long)loop_pc, (unsigned long)(branch_pc - 2u),
-               src_d, dst_a, cnt_d);
-    }
     return 1;
 }
 
@@ -4589,7 +3150,6 @@ static inline __attribute__((always_inline)) void tab5_fill59_try_dbf(uint16_t d
     unsigned src_d, dst_a, cnt_d;
     int move_cycles, dbf_taken_cycles, loop_cycles, remain;
 
-    if (__builtin_expect(PX68K_TAB5_PERF_PROFILE && (s_tab5_opcode_profile_enabled || s_tab5_dispatch_prof_enabled), 0)) return;
     if ((dbf_op & 0xfff8u) != 0x51c8u) return; /* DBF only */
     if (FLAG_T1 || FLAG_T0) return;
 
@@ -4640,137 +3200,17 @@ static inline __attribute__((always_inline)) void tab5_fill59_try_dbf(uint16_t d
     REG_D[cnt_d] = (REG_D[cnt_d] & 0xffff0000u) | ((counter - n) & 0xffffu);
     USE_CYCLES((int)(n * (uint32_t)loop_cycles));
 
-    TAB5_PROF(
-        s_tab5_fill59_calls++;
-        s_tab5_fill59_loops += n;
-        s_tab5_fill59_instr += n * 5u;
-        s_tab5_fill59_bytes += bytes;
-        s_tab5_fill59_cycles += (uint64_t)n * (uint32_t)loop_cycles;
-    );
 }
 
-static const char *tab5_opcode_family(uint16_t op)
-{
-    if ((op & 0xf100u) == 0x7000u) return "MOVEQ";
-    if ((op & 0xf000u) == 0x6000u) return ((op & 0x0f00u) == 0x0100u) ? "BSR" : "Bcc/BRA";
-    switch ((op >> 12) & 0x0f) {
-        case 0x0: return "IMM/BIT";
-        case 0x1: return "MOVE.B";
-        case 0x2: return "MOVE.L";
-        case 0x3: return "MOVE.W";
-        case 0x4: return "MISC";
-        case 0x5: return "ADDQ/SUBQ/Scc";
-        case 0x7: return "MOVEQ";
-        case 0x8: return "OR/DIV";
-        case 0x9: return "SUB";
-        case 0xa: return "A-LINE";
-        case 0xb: return "CMP/EOR";
-        case 0xc: return "AND/MUL/EXG";
-        case 0xd: return "ADD";
-        case 0xe: return "SHIFT/ROT";
-        case 0xf: return "F-LINE";
-        default:  return "OTHER";
-    }
-}
+/* R139A6 production-clean: opcode-family/PIE candidate dump helpers physically removed. */
 
-static void tab5_piecpu598g4b_dump(void)
-{
-    const tab5_piecpu598g4b_obs_t * const o = &s_tab5_piecpu598g4b;
-    printf("PX68K_PIECPU598G7: candidate sample MOVEM=%lu W/L=%lu/%lu R2M/M2R=%lu/%lu regs=%lu bytes=%lu R2M/M2Rbytes=%lu/%lu maxregs=%lu predec/postinc=%lu/%lu | post-store W/L=%lu/%lu post-copy W/L=%lu/%lu\n",
-           (unsigned long)o->movem_total,
-           (unsigned long)o->movem_w, (unsigned long)o->movem_l,
-           (unsigned long)o->movem_r2m, (unsigned long)o->movem_m2r,
-           (unsigned long)o->movem_regs, (unsigned long)o->movem_bytes,
-           (unsigned long)o->movem_r2m_bytes, (unsigned long)o->movem_m2r_bytes,
-           (unsigned long)o->movem_max_regs,
-           (unsigned long)o->movem_predec, (unsigned long)o->movem_postinc,
-           (unsigned long)o->store_w_post, (unsigned long)o->store_l_post,
-           (unsigned long)o->copy_w_post, (unsigned long)o->copy_l_post);
-    printf("PX68K_PIECPU598G7: candidate sample memory-op CLR=%lu OR=%lu AND=%lu EOR=%lu SHIFT=%lu | proven-batch DBF74 bytes=%llu loops=%llu STREAM repeatPIE words=%llu RAMcopy=%llu TVcopy=%llu IPLcopy=%llu GVcopy=%llu\n",
-           (unsigned long)o->clr_mem, (unsigned long)o->or_mem,
-           (unsigned long)o->and_mem, (unsigned long)o->eor_mem,
-           (unsigned long)o->mem_shift,
-           (unsigned long long)s_tab5_dbf74_total_bytes,
-           (unsigned long long)s_tab5_dbf74_total_loops,
-           (unsigned long long)s_tab5_stream581_repeat_pie_words,
-           (unsigned long long)s_tab5_stream576_ram_words,
-           (unsigned long long)s_tab5_stream579_tv_words,
-           (unsigned long long)s_tab5_stream578_ipl_words,
-           (unsigned long long)s_tab5_stream576_gv_words);
-}
-
-static void tab5_opcode_profile_dump(void)
-{
-    enum { TOPN = 20 };
-    uint32_t top_count[TOPN] = {0};
-    uint16_t top_op[TOPN] = {0};
-    uint32_t family[16] = {0};
-    unsigned op;
-
-    if (s_tab5_opcode_total == 0) return;
-
-    for (op = 0; op < 0x10000u; ++op) {
-        uint32_t c = s_tab5_opcode_counts[op];
-        unsigned i;
-        if (!c) continue;
-        family[(op >> 12) & 15u] += c;
-        if (c <= top_count[TOPN - 1]) continue;
-        for (i = 0; i < TOPN; ++i) {
-            if (c > top_count[i]) {
-                unsigned j;
-                for (j = TOPN - 1; j > i; --j) {
-                    top_count[j] = top_count[j - 1];
-                    top_op[j] = top_op[j - 1];
-                }
-                top_count[i] = c;
-                top_op[i] = (uint16_t)op;
-                break;
-            }
-        }
-    }
-
-    printf("PX68K_M68K: OPCODE PROFILE total=%lu top20 (sample frame; profiling overhead excluded from optimization judgement)\n",
-           (unsigned long)s_tab5_opcode_total);
-    for (op = 0; op < TOPN && top_count[op]; ++op) {
-        const uint32_t pct_x100 = s_tab5_opcode_total
-            ? (top_count[op] * 10000u) / s_tab5_opcode_total : 0u;
-        printf("PX68K_M68K: OP%02u $%04X count=%lu pct=%lu.%02lu family=%s handler=%p\n",
-               op + 1, (unsigned)top_op[op], (unsigned long)top_count[op],
-               (unsigned long)(pct_x100 / 100u), (unsigned long)(pct_x100 % 100u),
-               tab5_opcode_family(top_op[op]),
-               (void *)m68ki_instruction_jump_table[top_op[op]]);
-    }
-    printf("PX68K_M68K: FAMILY nibbles 0..F =");
-    for (op = 0; op < 16; ++op)
-        printf(" %X:%lu", op, (unsigned long)family[op]);
-    printf("\n");
-}
-
-void m68k_tab5_opcode_profile_set(int enabled)
-{
-    enabled = enabled ? 1 : 0;
-    if (enabled && !s_tab5_opcode_profile_enabled) {
-        memset(s_tab5_opcode_counts, 0, sizeof(s_tab5_opcode_counts));
-        s_tab5_opcode_total = 0;
-        tab5_hotpc613_reset();
-        tab5_backedge613_reset();
-        tab5_movew65b_reset();
-        tab5_piecpu598g4b_reset();
-        s_tab5_opcode_profile_enabled = 1;
-    } else if (!enabled && s_tab5_opcode_profile_enabled) {
-        s_tab5_opcode_profile_enabled = 0;
-        tab5_opcode_profile_dump();
-        tab5_hotpc613_dump();
-        tab5_backedge613_dump();
-        tab5_dyn613c_dump();
-        tab5_movew65b_dump();
-        tab5_piecpu598g4b_dump();
-    }
-}
+/* R57E127B FIX1: production builds retire the opcode profiler but keep its
+ * public control ABI because sparse perf plumbing still references it.
+ * This ESP-side no-op is intentionally outside the non-ESP #else below. */
+void m68k_tab5_opcode_profile_set(int enabled) { (void)enabled; }
 
 void m68k_tab5_dynarec_dump(void)
 {
-    tab5_dyn613c_dump();
 }
 #else
 void m68k_tab5_opcode_profile_set(int enabled) { (void)enabled; }
@@ -4841,11 +3281,6 @@ uint    m68ki_aerr_address;
 uint    m68ki_aerr_write_mode;
 uint    m68ki_aerr_fc;
 
-#ifdef ESP_PLATFORM
-DRAM_ATTR jmp_buf m68ki_bus_error_jmp_buf;
-#else
-jmp_buf m68ki_bus_error_jmp_buf;
-#endif
 
 /* Used by shift & rotate instructions */
 const uint8 m68ki_shift_8_table[65] =
@@ -5534,9 +3969,8 @@ void m68k_set_cpu_type(unsigned int cpu_type)
 {
 #ifdef ESP_PLATFORM
 	tab5_dispatch_cache_reset();
-#if PX68K_TAB5_DYNAREC
-	/* c12: JIT lifetime is independent of the research profiler. */
-	tab5_dyn613c_cache_reset(0);
+#if PX68K_TAB5_X68P4_PREDECODE
+	x68p4_pre138_invalidate_all_internal();
 #endif
 #endif
 	switch(cpu_type)
@@ -5701,41 +4135,8 @@ void m68k_set_cpu_type(unsigned int cpu_type)
 	}
 }
 
-#ifdef ESP_PLATFORM
-/* R57E65 slack prefetch.
- *
- * Pacing sometimes leaves ~100 us in which the guest must not execute yet.
- * Spend a few cycles warming only semantically safe instruction-side data:
- * the current RAM/IPL cache lines, the opcode jump-table entry and its handler.
- * Actual execution always refetches the opcode, so self-modifying RAM remains
- * authoritative.  MMIO/device regions are deliberately never touched. */
-unsigned int m68k_tab5_slack_prefetch_current(void)
-{
-    const uint32_t pc = REG_PC & 0x00ffffffu;
-    const uint8_t *p = 0;
-
-    if (pc <= 0x00bffffeu) {
-        p = MEM + pc;
-        __builtin_prefetch(p, 0, 3);
-        if (pc <= 0x00bfffdeu) __builtin_prefetch(p + 32u, 0, 2);
-        if (pc <= 0x00bfffbeu) __builtin_prefetch(p + 64u, 0, 1);
-    } else if (pc >= 0x00fc0000u && pc <= 0x00fffffeu) {
-        p = IPL + (pc & 0x0003ffffu);
-        __builtin_prefetch(p, 0, 3);
-        if ((pc & 0x0003ffffu) <= 0x0003ffdeu) __builtin_prefetch(p + 32u, 0, 2);
-        if ((pc & 0x0003ffffu) <= 0x0003ffbeu) __builtin_prefetch(p + 64u, 0, 1);
-    } else {
-        return 0u;
-    }
-
-    /* PX68K RAM/IPL is word-swapped for the little-endian host; the same
-     * native 16-bit load used by the production opcode fetch yields REG_IR. */
-    uint16_t op;
-    __builtin_memcpy(&op, p, sizeof(op));
-    __builtin_prefetch(&m68ki_instruction_jump_table[op], 0, 3);
-    return 1u;
-}
-#endif
+/* R140P3: R57E65 wait-time slack prefetch retired with wall-clock pacing.
+ * Instruction fetch/predecode remains authoritative. */
 
 /* Execute some instructions until we use up num_cycles clock cycles */
 /* ASG: removed per-instruction interrupt checks */
@@ -5754,12 +4155,6 @@ int m68k_execute(int num_cycles)
 		return rc;
 	}
 
-#ifdef ESP_PLATFORM
-	/* R57E70C: make the opcode-word cache slice-local. */
-	if (++g_tab5_fetch70c_epoch == 0u)
-		g_tab5_fetch70c_epoch = 1u;
-#endif
-
 	/* Set our pool of clock cycles available */
 	SET_CYCLES(num_cycles);
 	m68ki_initial_cycles = num_cycles;
@@ -5773,15 +4168,22 @@ int m68k_execute(int num_cycles)
 		/* Return point if we had an address error */
 		m68ki_set_address_error_trap(); /* auto-disable (see m68kcpu.h) */
 
-#if !defined(ESP_PLATFORM) || !PX68K_TAB5_SKIP_DEAD_BERR_ROLLBACK
-		m68ki_check_bus_error_trap();
-#endif
 
 		/* R57E62 production: MEM/IPL roots are TCM-pinned and stable for one
 		 * m68k_execute() slice.  Hoist them out of the per-instruction fetch. */
 #ifdef ESP_PLATFORM
 		uint8_t * const tab5_mem_fetch_base = MEM;
 		uint8_t * const tab5_ipl_fetch_base = IPL;
+#if PX68K_TAB5_X68P4_PREDECODE
+		/* Slice-local hot-page residency.  Self-modifying writes invalidate the
+		 * directory version, so the per-instruction guard is one Internal-SRAM
+		 * tag/version check rather than an opcode fetch/decode. */
+		x68p4_pre138_op_t *tab5_pre138_page_ops = NULL;
+		uint32_t tab5_pre138_page_tag = X68P4_PRE138_INVALID_TAG;
+		uint32_t tab5_pre138_page_version = 0u;
+		unsigned tab5_pre138_page_slot = 0u;
+		uint32_t tab5_pre138_epoch = g_x68p4_pre139_epoch;
+#endif
 #endif
 
 		/* Main loop.  Keep going until we run out of clock cycles */
@@ -5794,6 +4196,9 @@ int m68k_execute(int num_cycles)
 			m68ki_use_data_space(); /* auto-disable (see m68kcpu.h) */
 
 #ifdef ESP_PLATFORM
+			/* R57E138A: Trace134-137 runtime entry is retired.  The normal CPU
+			 * path below is now the X68P4 predecoded-page executor. */
+
 			/* Build 6.15h17R22: most MDX outer iterations are the four-op zero
 			 * path.  Batch complete zero iterations first; fall through to the
 			 * exact R20 handler block for non-zero entries / cycle-boundary
@@ -5818,119 +4223,129 @@ int m68k_execute(int num_cycles)
 			/* Record previous program counter */
 			REG_PPC = REG_PC;
 
-			/* Record previous D/A register state only when Musashi bus-error
-			 * rollback is actually reachable.  Build 5.64 removes this 64-byte
-			 * copy from every guest instruction on the Tab5 integration. */
-#if !defined(ESP_PLATFORM) || !PX68K_TAB5_SKIP_DEAD_BERR_ROLLBACK
-#ifdef ESP_PLATFORM
-			if (__builtin_expect(s_tab5_xespv_snapshot_enabled, 1))
-				tab5_xespv_copy64(REG_DA_SAVE, REG_DA);
-			else
-				tab5_scalar_copy64(REG_DA_SAVE, REG_DA);
-#else
-			for (int tab5_i = 0; tab5_i < 16; ++tab5_i) REG_DA_SAVE[tab5_i] = REG_DA[tab5_i];
-#endif
-#endif
-
-			/* Read an instruction and dispatch it.
-			 *
-			 * Build 5.72 (ESP32-P4): flatten the hottest opcode-fetch call.
-			 * m68ki_read_imm_16() used to call px68k_m68k_fetch_16() once for
-			 * every guest instruction.  Keep the exact 68000 address-error and
-			 * PC-update order, but perform the common RAM/IPL word fetch directly
-			 * in this execute loop.  Extension/immediate words intentionally keep
-			 * the existing helper path so this build measures opcode-call removal
-			 * in isolation. */
+			/* R140X5: resident page metadata is demand-decoded lazily.  After a PC word
+			 * has executed once, the hot path uses its Internal-SRAM X68P4Op and
+			 * never reloads that opcode from guest RAM/IPL.  First execution of a
+			 * word demand-decodes only that word; old L1/L2/R123 remain retired. */
 #ifdef ESP_PLATFORM
 			{
-				uint32_t tab5_fetch_pc = REG_PC;
-				uint16_t tab5_fetch_word;
-
-				m68ki_set_fc(FLAG_S | FUNCTION_CODE_USER_PROGRAM);
-				m68ki_check_address_error(tab5_fetch_pc, MODE_READ,
-				                          FLAG_S | FUNCTION_CODE_USER_PROGRAM);
-				REG_PC = tab5_fetch_pc + 2u;
-				tab5_fetch_pc = ADDRESS_68K(tab5_fetch_pc);
-
-				if (__builtin_expect(tab5_fetch_pc <= 0x00bffffeu, 1)) {
-					tab5_fetch_word = tab5_fetch70c_ram_word(tab5_mem_fetch_base, tab5_fetch_pc);
-					BusErrFlag = 0;
-					REG_IR = (uint32_t)tab5_fetch_word;
-				} else if (__builtin_expect(tab5_fetch_pc >= 0x00fc0000u &&
-				                               tab5_fetch_pc <= 0x00fffffeu, 0)) {
-					__builtin_memcpy(&tab5_fetch_word,
-					                 tab5_ipl_fetch_base + (tab5_fetch_pc & 0x0003ffffu),
-					                 sizeof(tab5_fetch_word));
-					BusErrFlag = 0;
-					REG_IR = (uint32_t)tab5_fetch_word;
-				} else {
-					REG_IR = (uint32_t)cpu_readmem24_word(tab5_fetch_pc);
-				}
-			}
-#else
-			REG_IR = m68ki_read_imm_16();
-#endif
-#ifdef ESP_PLATFORM
-			if (__builtin_expect(PX68K_TAB5_PERF_PROFILE && s_tab5_opcode_profile_enabled, 0)) {
-				s_tab5_opcode_counts[REG_IR]++;
-				s_tab5_opcode_total++;
-				tab5_hotpc613_observe(REG_PPC, (uint16_t)REG_IR);
-				tab5_backedge613_observe(REG_PPC);
-				tab5_movew65b_observe((uint16_t)REG_IR, REG_PPC);
-				tab5_piecpu598g4b_observe((uint16_t)REG_IR);
-			}
-
-			{
-				const uint16_t op = (uint16_t)REG_IR;
-				const unsigned ci = tab5_dispatch_index(op);
-				tab5_m68k_dispatch_entry_t * const ce = &s_tab5_dispatch_cache[ci];
-				const uint32_t sig = ce->sig_cycles;
+				const uint32_t tab5_fetch_pc_raw = REG_PC;
+				const uint32_t tab5_fetch_pc = ADDRESS_68K(tab5_fetch_pc_raw);
+				uint16_t op;
 				tab5_m68k_handler_t handler;
 				uint32_t instr_cycles;
 				uint32_t post_flags;
-#if PX68K_TAB5_DYNAREC
-				uint32_t dyn_backedge_target = 0xffffffffu;
-				uint32_t dyn_backedge_from = 0xffffffffu;
-#endif
+				const int tab5_r140m2_entry = tab5_r140m2_gate_pc(tab5_fetch_pc);
 
-				if (__builtin_expect((sig & 0x8000ffffu) == (0x80000000u | (uint32_t)op), 1)) {
-					handler = ce->handler;
-					instr_cycles = (sig >> 16) & 0xffu;
-					post_flags = (sig >> 24) & 0x7fu;
-					if (__builtin_expect(PX68K_TAB5_PERF_PROFILE && s_tab5_dispatch_prof_enabled, 0)) s_tab5_dispatch_hits++;
-				} else {
-					const unsigned ci2 = tab5_dispatch_l2_index(op);
-					tab5_m68k_dispatch_entry_t * const se = &s_tab5_dispatch_l2[ci2];
-					const uint32_t sig2 = se->sig_cycles;
-					if (__builtin_expect((sig2 & 0x8000ffffu) == (0x80000000u | (uint32_t)op), 1)) {
-						handler = se->handler;
-						instr_cycles = (sig2 >> 16) & 0xffu;
-						post_flags = (sig2 >> 24) & 0x7fu;
-						ce->handler = handler;
-						ce->sig_cycles = sig2;
-						if (__builtin_expect(PX68K_TAB5_PERF_PROFILE && s_tab5_dispatch_prof_enabled, 0)) s_tab5_dispatch_l2_hits++;
-					} else {
-						handler = m68ki_instruction_jump_table[op];
-						instr_cycles = CYC_INSTRUCTION[op];
-						post_flags = tab5_post585_flags(op);
-						const uint32_t newsig = 0x80000000u | ((post_flags & 0x7fu) << 24) |
-						                        ((instr_cycles & 0xffu) << 16) | (uint32_t)op;
-						se->handler = handler;
-						se->sig_cycles = newsig;
-						ce->handler = handler;
-						ce->sig_cycles = newsig;
-						if (__builtin_expect(PX68K_TAB5_PERF_PROFILE && s_tab5_dispatch_prof_enabled, 0)) s_tab5_dispatch_misses++;
+				m68ki_set_fc(FLAG_S | FUNCTION_CODE_USER_PROGRAM);
+				m68ki_check_address_error(tab5_fetch_pc_raw, MODE_READ,
+				                          FLAG_S | FUNCTION_CODE_USER_PROGRAM);
+				REG_PC = tab5_fetch_pc_raw + 2u;
+
+#if PX68K_TAB5_X68P4_PREDECODE
+				/* R140P4S5C1: M2 already owns exact handler chains and cycles.  When
+				 * the current 128-byte page is still the resident/coherent page, skip
+				 * the otherwise redundant first-word resolve + X68P4Op unpack.  Cold,
+				 * changed, evicted, trace, cycle-tail, and M2-specific reject cases all
+				 * fall through to the original resolver and original M2 gate below. */
+				if (__builtin_expect(tab5_r140m2_entry, 0) &&
+				    __builtin_expect(CPU_TYPE == CPU_TYPE_000 && !FLAG_T1 && !FLAG_T0 &&
+				                     GET_CYCLES() > 0, 1) &&
+				    __builtin_expect(tab5_pre138_page_ops != NULL &&
+				                     tab5_pre138_page_tag == (tab5_fetch_pc & ~X68P4_PRE138_PAGE_MASK) &&
+				                     tab5_pre138_epoch == g_x68p4_pre139_epoch, 1) &&
+				    tab5_r140m2_cert_ok(tab5_fetch_pc, tab5_pre138_page_tag,
+				                         tab5_pre138_page_version, tab5_pre138_page_slot)) {
+					const uint16_t m2op = tab5_r140p4s5c1_m2_first_op(tab5_fetch_pc);
+					BusErrFlag = 0;
+					REG_IR = (uint32_t)m2op;
+					if (__builtin_expect(m2op != 0u &&
+					                     m68k_tab5_mdxm2_exec(tab5_fetch_pc, m2op) != 0u, 1))
+						goto tab5_r140p4s5c1_m2_done;
+				}
+				x68p4_pre138_op_t * const xop = x68p4_pre138_resolve(
+				    tab5_fetch_pc, &tab5_pre138_page_tag, &tab5_pre138_page_version,
+				    &tab5_pre138_page_slot, &tab5_pre138_page_ops, &tab5_pre138_epoch);
+				if (__builtin_expect(xop != NULL, 1)) {
+					uint32_t xsig = xop->sig_cycles;
+					/* R140X5: bit31 is the predecode-valid marker.  The hot
+					 * path was going to load sig_cycles anyway, so demand-decode adds
+					 * only this strongly-not-taken bit test after first execution. */
+					if (__builtin_expect((xsig & 0x80000000u) == 0u, 0)) {
+						(void)x68p4_pre138_decode_word(
+						    tab5_fetch_pc & ~X68P4_PRE138_PAGE_MASK,
+						    tab5_pre138_page_slot,
+						    (unsigned)((tab5_fetch_pc & X68P4_PRE138_PAGE_MASK) >> 1));
+						xsig = xop->sig_cycles;
 					}
+					BusErrFlag = 0;
+					op = (uint16_t)(xsig & 0xffffu);
+					REG_IR = (uint32_t)op;
+					handler = xop->sem;
+					instr_cycles = (xsig >> 16) & 0xffu;
+					post_flags = (xsig >> 24) & 0x7fu;
+				} else
+#endif
+				{
+					/* Exceptional execute-from-device/unbound-cache escape only.
+					 * Ordinary RAM/IPL execution never enters this block once R138 is
+					 * bound.  Keep it for correctness during bring-up, not as the CPU
+					 * architecture. */
+					uint16_t tab5_fetch_word;
+					if (__builtin_expect(tab5_fetch_pc <= 0x00bffffeu, 1)) {
+						__builtin_memcpy(&tab5_fetch_word, tab5_mem_fetch_base + tab5_fetch_pc,
+						                 sizeof(tab5_fetch_word));
+						BusErrFlag = 0;
+					} else if (__builtin_expect(tab5_fetch_pc >= 0x00fc0000u &&
+					                               tab5_fetch_pc <= 0x00fffffeu, 0)) {
+						__builtin_memcpy(&tab5_fetch_word,
+						                 tab5_ipl_fetch_base + (tab5_fetch_pc & 0x0003ffffu),
+						                 sizeof(tab5_fetch_word));
+						BusErrFlag = 0;
+					} else {
+						tab5_fetch_word = (uint16_t)cpu_readmem24_word(tab5_fetch_pc);
+					}
+					op = tab5_fetch_word;
+					REG_IR = (uint32_t)op;
+					handler = m68ki_instruction_jump_table[op];
+					instr_cycles = CYC_INSTRUCTION[op];
+					post_flags = tab5_post585_flags(op);
 				}
 
+
+				/* R140M2: authoritative cold/change fallback for the same exact blocks. */
+				if (__builtin_expect(tab5_r140m2_entry, 0) &&
+				    tab5_r140m2_cert_ok(tab5_fetch_pc, tab5_pre138_page_tag,
+				                         tab5_pre138_page_version, tab5_pre138_page_slot) &&
+				    m68k_tab5_mdxm2_exec(tab5_fetch_pc, op)) {
+				}
+				/* R140S2: one cold range compare is the only normal-path tax.
+				 * Exact-PC checks and page-version certification stay inside the
+				 * fixed SFXVI path; generic chaining/discovery is fully retired. */
+				else if (__builtin_expect((tab5_fetch_pc & 0x00ffff00u) == 0x00368700u, 0) &&
+				    (((tab5_fetch_pc == 0x00368760u) && (op == 0x3819u) &&
+				      tab5_r140s2_sfx760_try(tab5_fetch_pc, tab5_pre138_page_tag, tab5_pre138_page_version, tab5_pre138_page_slot)) ||
+				     (((tab5_fetch_pc == 0x00368784u) || (tab5_fetch_pc == 0x003687a4u) ||
+				       (tab5_fetch_pc == 0x003687c4u)) && (op == 0xe483u) &&
+				      tab5_r140s2_sfx784_try(tab5_fetch_pc, tab5_pre138_page_tag, tab5_pre138_page_version, tab5_pre138_page_slot)))) {
+				}
 				/* Build 5.98f: one rare metadata gate covers Bcc.B/W, DBcc and
 				 * concrete register-only hot kernels.  Ordinary instructions keep the
 				 * unchanged direct handler-call path. */
-				if (__builtin_expect(post_flags == 0u, 1)) {
+				else if (__builtin_expect(post_flags == 0u, 1)) {
 					handler();
 					USE_CYCLES(instr_cycles);
 				} else {
-					if (post_flags & TAB5_POST598F_BNE_FAST) {
+					/* R57E130A: CORE_FAST dominates the measured dense mix.  Test it
+					 * first inside the already-rare post_flags!=0 branch so hot arithmetic
+					 * does not walk the four Bcc/DBcc tests before reaching its kernel. */
+					if (__builtin_expect((post_flags & TAB5_POST598F_CORE_FAST) != 0u, 1)) {
+						if (((op & 0xfff8u) == 0x48e0u || (op & 0xfff8u) == 0x4cd8u) &&
+						    !tab5_movem598g9_try(op))
+							handler();
+						else if ((op & 0xfff8u) != 0x48e0u && (op & 0xfff8u) != 0x4cd8u)
+							tab5_core598f_exec(op);
+					} else if (post_flags & TAB5_POST598F_BNE_FAST) {
 						if ((op & 0x00ffu) != 0u) {
 							/* Preserve the proven 5.98d/5.98e byte-BNE hot path. */
 							if (__builtin_expect(FLAG_Z != 0u, 1)) {
@@ -5939,7 +4354,6 @@ int m68k_execute(int num_cycles)
 								USE_CYCLES(CYC_BCC_NOTAKE_B);
 						} else {
 							tab5_bcc598f_exec(op, FLAG_Z != 0u);
-							if (__builtin_expect(PX68K_TAB5_PERF_PROFILE && s_tab5_dispatch_prof_enabled, 0)) s_tab5_fast598f_bccw++;
 						}
 					} else if (post_flags & TAB5_POST598F_BEQ_FAST) {
 						if ((op & 0x00ffu) != 0u) {
@@ -5949,35 +4363,11 @@ int m68k_execute(int num_cycles)
 								USE_CYCLES(CYC_BCC_NOTAKE_B);
 						} else {
 							tab5_bcc598f_exec(op, FLAG_Z == 0u);
-							if (__builtin_expect(PX68K_TAB5_PERF_PROFILE && s_tab5_dispatch_prof_enabled, 0)) s_tab5_fast598f_bccw++;
 						}
 					} else if (post_flags & TAB5_POST598F_BCC_FAST) {
 						tab5_bcc598f_exec(op, tab5_bcc598f_taken(op));
-						if (__builtin_expect(PX68K_TAB5_PERF_PROFILE && s_tab5_dispatch_prof_enabled, 0) && (op & 0x00ffu) == 0u)
-							s_tab5_fast598f_bccw++;
 					} else if (post_flags & TAB5_POST585_DBF) {
 						(void)tab5_dbcc598f_exec(op);
-						if (__builtin_expect(PX68K_TAB5_PERF_PROFILE && s_tab5_dispatch_prof_enabled, 0)) s_tab5_fast598f_dbcc++;
-					} else if (post_flags & TAB5_POST598F_CORE_FAST) {
-						if (((op & 0xfff8u) == 0x48e0u || (op & 0xfff8u) == 0x4cd8u) &&
-						    !tab5_movem598g9_try(op))
-							handler();
-						else if ((op & 0xfff8u) != 0x48e0u && (op & 0xfff8u) != 0x4cd8u)
-							tab5_core598f_exec(op);
-						if (__builtin_expect(PX68K_TAB5_PERF_PROFILE && s_tab5_dispatch_prof_enabled, 0)) {
-							s_tab5_fast598f_core++;
-							if ((op & 0xfff8u) == 0x4a50u) s_tab5_fast598f_core_mem++;
-							if ((op & 0xf1f8u) == 0x1000u) s_tab5_fast598g7_moveb_rr++;
-							if ((op & 0xf1f8u) == 0x30c0u) s_tab5_fast598g7_movew_pi++;
-							if ((op & 0xf1f8u) == 0x20c0u) s_tab5_fast598g9_movel_pi++;
-							if ((op & 0xf1f8u) == 0x20d8u) s_tab5_fast598g10_movel_pipi++;
-							if ((op & 0xfff8u) == 0x0800u) s_tab5_fast598g10_btst_imm_d++;
-							if ((op & 0xfff8u) == 0x4298u) s_tab5_fast598g10_clrl_pi++;
-							if ((op & 0xfff8u) == 0x48c0u) s_tab5_fast598g10_extl++;
-							if ((op & 0xfff8u) == 0x4258u) s_tab5_fast598g9_clrw_pi++;
-							if ((op & 0xf1f8u) == 0x5048u || (op & 0xf1f8u) == 0x5088u)
-								s_tab5_fast598g9_addq_a++;
-						}
 					} else {
 						handler();
 					}
@@ -5986,15 +4376,6 @@ int m68k_execute(int num_cycles)
 					/* Build 6.13c: learn only actually-taken backward conditional
 					 * edges.  Compilation happens after the current architectural
 					 * iteration, so a failed/rejected translation cannot alter it. */
-#if PX68K_TAB5_DYNAREC
-					if (__builtin_expect((post_flags & (TAB5_POST598F_BNE_FAST |
-					                                      TAB5_POST598F_BEQ_FAST |
-					                                      TAB5_POST598F_BCC_FAST)) &&
-					                     ((REG_PC & 0x00ffffffu) < (REG_PPC & 0x00ffffffu)), 0)) {
-						dyn_backedge_from = REG_PPC & 0x00ffffffu;
-						dyn_backedge_target = REG_PC & 0x00ffffffu;
-					}
-#endif
 
 					/* Build 5.98g6: the current BNE cycles are now charged, so any
 					 * future CLR/CMPA/BNE iterations may be bounded exactly by the
@@ -6029,28 +4410,9 @@ int m68k_execute(int num_cycles)
 							tab5_fill59_try_dbf(op);
 					}
 
-#if PX68K_TAB5_DYNAREC
-					/* Build 6.13c14r: discovery and dispatch both live at the true tail,
-					 * after the specialized poll/DBF/clear/stream helpers above.  If one
-					 * of those helpers consumed the loop or exhausted the scheduler slice,
-					 * generic JIT discovery pays nothing.  observe() performs the single
-					 * authoritative block lookup and returns a compiled block directly,
-					 * so c12's second lookup is gone as well. */
-					if (__builtin_expect(dyn_backedge_target != 0xffffffffu &&
-					                     dyn_backedge_from != 0xffffffffu &&
-					                     ((REG_PC & 0x00ffffffu) == dyn_backedge_target) &&
-					                     GET_CYCLES() > 0, 0)) {
-						tab5_dyn613c_block_t *dynb = tab5_dyn613c_observe_taken_bcc(
-						    dyn_backedge_from, dyn_backedge_target, op);
-						while (dynb && dynb->valid &&
-						       ((REG_PC & 0x00ffffffu) == dyn_backedge_target) &&
-						       GET_CYCLES() > 0) {
-							if (!tab5_dyn613c_try_execute_block(dynb))
-								break;
-						}
-					}
-#endif
 				}
+				tab5_r140p4s5c1_m2_done:
+				;
 			}
 #else
 			m68ki_instruction_jump_table[REG_IR]();
@@ -6145,32 +4507,30 @@ void m68k_init(void)
 		{
 		m68ki_build_opcode_table();
 #ifdef ESP_PLATFORM
-#if PX68K_TAB5_SKIP_DEAD_BERR_ROLLBACK
-		printf("PX68K_BERR64: Musashi bus-error rollback preparation BYPASSED; address-error emulation retained\n");
-#else
-		tab5_xespv_snapshot_selfcheck();
-#endif
 		s_tab5_stream581_pie_enabled = GVRAM_P4StreamSelfcheck();
 		printf("PX68K_STREAM581: Build 5.89a P4 PIE/XespV repeat backend self-check %s; repeat=%s copy=SCALAR\n",
 		       s_tab5_stream581_pie_enabled ? "PASS" : "FAIL",
 		       s_tab5_stream581_pie_enabled ? "PIE-128" : "SCALAR-FALLBACK");
 		printf("PX68K_POST585: fused dispatch-metadata post-op gate ACTIVE; normal instruction path tests one flag word, stream/poll/DBF recognizers unchanged\n");
 		printf("PX68K_BRANCH598F: Bcc.B/Bcc.W + DBcc inline via existing dispatch metadata gate; exact cycles/extension fetch retained\n");
-		printf("PX68K_CORE598F: measured register-only fast paths ACTIVE: MOVE.W/L rr, MOVEQ, ADD.W rr, AND rr/imm, TST.W, SWAP, ADDQ/SUBQ.W, ASR.W/L\n");
 		printf("PX68K_CPU598G10: g9 hot paths + MOVE.L (An)+,(Am)+ / BTST #imm,Dn / CLR.L (An)+ / EXT.L Dn inline armed; generated-handler semantics retained\n");
 		printf("PX68K_CPUHOT_R57E47: NW16 wide inline pack RETIRED; NW14 execute loop restored; NW15-measured FLASH hot handlers use IRAM12 placement only\n");
 #if PX68K_TAB5_MDX622_ZERO_RUN_AB
-		printf("PX68K_CPU615H22: no-JIT + L2=4096 + R20 MDX block + ZERO-RUN outer batching armed\n");
 #else
 		printf("PX68K_CPU615H29: R28 proven IRAM11 + profile-driven IRAM64 total handlers; ZERO-RUN=OFF, device exact paths retained\n");
 #endif
 		printf("PX68K_LOOP598G11: exact CLR.W(A0)+ x2 / SUBQ.W D0 / ADDQ #4,A0 / BPL -10 ordinary-RAM batch armed; scheduler boundary + final exit preserved\n");
-		printf("PX68K_DISPATCH598G9: TCM L1=%u entries + internal-DRAM L2=%u entries (%u bytes) armed before PSRAM metadata fallback\n",
-		       (unsigned)TAB5_M68K_DISPATCH_CACHE_SIZE, (unsigned)TAB5_M68K_DISPATCH_L2_SIZE,
-		       (unsigned)sizeof(s_tab5_dispatch_l2));
-		printf("PX68K_FETCH_R57E70C: slice-local PC/opcode cache ACTIVE entries=%u bytes=%u; guest RAM writes invalidate generation; dispatch L1/L2 unchanged\n",
-		       (unsigned)TAB5_FETCH70C_SIZE, (unsigned)sizeof(s_tab5_fetch70c));
-		printf("PX68K_POLL598F: stable ordinary-RAM TST.W(An)+BNE/BEQ scheduler-bounded fast-forward armed\n");
+		printf("X68P4_PRE138: legacy dispatch sentinels only L1=%u L2=%uB R123=%uB; normal execute path does not access them\n",
+		       (unsigned)TAB5_M68K_DISPATCH_CACHE_SIZE, (unsigned)sizeof(s_tab5_dispatch_l2),
+		       (unsigned)sizeof(g_tab5_exec123_cache));
+        printf("PX68K_EXEC_R57E128B: legacy fast semantic helpers retained only behind predecoded-op bridge; R123 runtime RETIRED\n");
+        printf("PX68K_EXEC_R57E130A: hot-family semantic kernels retained; fused PC/opcode lookup RETIRED\n");
+        printf("PX68K_EXEC_R140J2: X5 demand-decode/coldmeta retained + deadline-driven Machine Kernel ACTIVE; fixed 200/800 horizon retired; exact Musashi semantics/cycles retained\n");
+        printf("PX68K_EXEC_P12R1: STANDARD12 EXACT EXECUTOR ACTIVE; exact 10/12 CPU-peripheral conversion; MK1 deadlines retained; runtime discovery ZERO\n");
+		printf("PX68K_EXEC_R140P4MK1: Machine Kernel COMMON0 ACTIVE; exact MFP IRQ-deadline shadow + early-return window + RTC IRQ15 gate; J2 deadlines/cycles retained; runtime discovery ZERO\n");
+        printf("PX68K_EXEC_R140S2: STATIC SFXVI superinstructions ACTIVE; generic warm chain RETIRED; runtime trace/JIT/discovery ZERO; exact J2 CORE_FAST path restored\n");
+        printf("PX68K_EXEC_R140M2: MDX exact-page fused basic blocks ACTIVE; M1B profiler RETIRED; direct static Musashi handler chains; runtime discovery ZERO\n");
+        printf("PX68K_EXEC_R140P4S5C1: M2 EARLY STATIC ENTRY ACTIVE; resident-page exact blocks bypass redundant first-word resolve; cold/change fallback exact; runtime discovery ZERO\n");
 #endif
 		emulation_initialized = 1;
 	}
@@ -6187,18 +4547,10 @@ void m68k_init(void)
 	m68k_set_instr_hook_callback(NULL);
 }
 
-/* Trigger a Bus Error exception */
-void m68k_pulse_bus_error(void)
-{
-	m68ki_exception_bus_error();
-}
 
 /* Pulse the RESET line on the CPU */
 void m68k_pulse_reset(void)
 {
-#if defined(ESP_PLATFORM) && PX68K_TAB5_DYNAREC
-	tab5_dyn613c_cache_reset(0);
-#endif
 	/* Disable the PMMU on reset */
 	m68ki_cpu.pmmu_enabled = 0;
 

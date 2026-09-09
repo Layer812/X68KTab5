@@ -57,32 +57,14 @@
 #ifdef ESP_PLATFORM
 #include "esp_heap_caps.h"
 #include "esp_attr.h"
-#include "esp_cpu.h"
-#include "sdkconfig.h"
-/*
- * Build 5.12a: libretro.c is compiled as the standalone PX68K component.
- * PlatformIO does not expose esp_timer's public include directory to this
- * component unless it declares an ESP-IDF component dependency.  The app
- * already links esp_timer, and the profiler only needs this one stable IDF
- * function, so keep the PX68K component dependency-free and declare the
- * ABI here instead of including esp_timer.h.
- */
-extern int64_t esp_timer_get_time(void);
-extern void esp_rom_delay_us(uint32_t us);
 
-/* Build 5.43: scheduler/device profiler uses the local CPU cycle counter.
- * P4 runs at the configured 360 MHz here, and this is orders of magnitude
- * cheaper than thousands of esp_timer_get_time() calls in one sampled frame. */
-static inline uint32_t tab5_perf_ccount(void)
-{
-    return (uint32_t)esp_cpu_get_cycle_count();
-}
-
-static inline uint32_t tab5_perf_cycles_to_us(uint64_t cycles)
-{
-    const uint32_t mhz = (uint32_t)CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ;
-    return mhz ? (uint32_t)(cycles / mhz) : 0u;
-}
+/* R139A6 production Machine Kernel ABI: no profiling object crosses the hot path. */
+extern int m68k_tab5_x68p4_machine_run_scanline(
+    uint32_t line, uint32_t total_lines, int cpu_cycles,
+    unsigned int midi_delay, int *periph_cycles_out);
+extern void m68k_tab5_x68p4_machine_finish_scanline(
+    int periph_cycles, int key_int_period, int mouse_int_period);
+extern void m68k_tab5_x68p4_machine_frame_end(void);
 #endif
 
 #ifdef ESP_PLATFORM
@@ -169,7 +151,7 @@ static int PARAMCOUNT     = 0;
 static uint8_t DispFrame  = 0;
 static int FrameSkipCount = 0;
 static int FrameSkipQueue = 0;
-static PX68K_SCHEDHOT int ClkUsed = 0;
+PX68K_SCHEDHOT int ClkUsed = 0;
 
 uint32_t retrow           = 800;
 uint32_t retroh           = 600;
@@ -973,6 +955,9 @@ static int WinX68k_Init(void)
 
     memset(IPL,  0, 0x40000);
     memset(MEM,  0, MEM_SIZE);
+#ifdef ESP_PLATFORM
+    m68k_tab5_exec123_invalidate_all();
+#endif
     memset(FONT, 0, 0xc0000);
 
     return 1;
@@ -1074,9 +1059,6 @@ entry point) */
 			/* $FC0080: native IPL HD0 -> HDS disk IPL bridge. */
 			memcpy(&IPL[0x0080], hdd_boot_bridge, sizeof(hdd_boot_bridge));
 		}
-#if PX68K_TAB5_DIAG_VERBOSE
-		printf("PX68K_SCSIIN: Build 5.94c HD0 entry=$FC0080 installer=$FC0050 metadata=FC006C..007F IOCS=$EA00A0\n");
-#endif
 	}
    else /* SASI model sees the IPL as it is */
       memcpy(IPL, &IPL[0x20000], 0x20000);
@@ -1194,172 +1176,8 @@ int WinX68k_LoadEmbeddedROMs(void)
 #endif
 
 
-#ifdef ESP_PLATFORM
+/* R139A6: retired standalone diagnostic ExecProbeFrame removed. */
 
-int WinX68k_ExecProbeFrame(void)
-{
-#ifdef HAVE_MUSASHI
-
-    /*
-     * Minimal version of PX68K's native frame scheduler.
-     *
-     * Deliberately excluded for Build 1B:
-     *   WinDraw
-     *   DSound
-     *   ADPCM
-     *   MIDI
-     *   Mercury
-     *   keyboard/mouse polling
-     *
-     * Included:
-     *   68000 execution
-     *   CRTC scanline progression
-     *   MFP H-SYNC/raster/V-DISP events
-     *   MFP Timer-A
-     */
-
-    int clk_total;
-
-    clk_total =
-        (CRTC_Regs[0x29] & 0x10)
-            ? VSYNC_HIGH
-            : VSYNC_NORM;
-
-    clk_total =
-        (clk_total * Config.clockmhz) / 10;
-
-    /*
-     * Defensive fallback only.
-     * Normally Config.clockmhz is already valid.
-     */
-    if (clk_total <= 0)
-        clk_total = VSYNC_NORM;
-
-    const int total_lines =
-        (VLINE_TOTAL > 0)
-            ? VLINE_TOTAL
-            : 567;
-
-    int total_executed = 0;
-
-    for (int line = 0; line < total_lines; ++line)
-    {
-        vline = (uint32_t)line;
-
-        /*
-         * Beginning of horizontal scanline.
-         */
-        MFP_Int(0);
-
-        if ((vline >= CRTC_VSTART) &&
-            (vline < CRTC_VEND))
-        {
-            VLINE =
-                ((vline - CRTC_VSTART)
-                 * CRTC_VStep) / 2;
-        }
-        else
-        {
-            VLINE = (uint32_t)-1;
-        }
-
-        /*
-         * Raster interrupt edge.
-         */
-        if (!(MFP[MFP_AER] & 0x40) &&
-            (vline == CRTC_IntLine))
-        {
-            MFP_Int(1);
-        }
-
-        /*
-         * V-DISP edge.
-         *
-         * This follows PX68K's native scheduler logic.
-         */
-        if (MFP[MFP_AER] & 0x10)
-        {
-            if (vline == CRTC_VSTART)
-                MFP_Int(9);
-        }
-        else
-        {
-            if (CRTC_VEND >= total_lines)
-            {
-                if ((long)vline ==
-                    (long)(CRTC_VEND - total_lines))
-                {
-                    MFP_Int(9);
-                }
-            }
-            else
-            {
-                if (vline == CRTC_VEND)
-                    MFP_Int(9);
-            }
-        }
-
-        /*
-         * Distribute one frame's CPU clocks
-         * accurately across all scanlines.
-         */
-        int begin =
-            (int)(((int64_t)clk_total * line)
-                  / total_lines);
-
-        int end =
-            (int)(((int64_t)clk_total * (line + 1))
-                  / total_lines);
-
-        int remaining = end - begin;
-
-        while (remaining > 0)
-        {
-            int request =
-                (remaining > 200)
-                    ? 200
-                    : remaining;
-
-            int executed =
-                m68k_execute(request);
-
-            if (executed <= 0)
-            {
-                /*
-                 * Avoid an infinite host loop even if
-                 * CPU core reports no progress.
-                 */
-                executed = request;
-            }
-
-            total_executed += executed;
-            remaining -= executed;
-        }
-
-        /*
-         * End-of-scanline MFP processing.
-         */
-        MFP_TimerA();
-
-        if ((MFP[MFP_AER] & 0x40) &&
-            (vline == CRTC_IntLine))
-        {
-            MFP_Int(1);
-        }
-    }
-
-    vline = 0;
-
-    return total_executed;
-
-#else
-
-    return 0;
-
-#endif
-}
-
-#endif
 
 static  void WinX68k_Cleanup(void)
 {
@@ -1513,6 +1331,7 @@ static int pmain(int argc, char *argv[])
       {
          case 3:
             strcpy(Config.FDDImage[1], argv[2]);
+            /* fall through: argc=3 also supplies FDD0 in argv[1]. */
          case 2:
             strcpy(Config.FDDImage[0], argv[1]);
             break;
@@ -1547,8 +1366,6 @@ static int pre_main(void)
 
    if (Only1Arg)
    {
-      int cfgload = 0;
-
       Add_Option("px68k");
 
       if (strlen(RPATH) >= strlen("hdf"))
@@ -1556,7 +1373,6 @@ static int pre_main(void)
          if (!strcasecmp(&RPATH[strlen(RPATH) - strlen("hdf")], "hdf"))
          {
             Add_Option("-h");
-            cfgload = 1;
          }
       }
 
@@ -1719,58 +1535,12 @@ static void update_variables(int running)
       }
    }
 
-   var.key = "px68k_cpuspeed";
-   var.value = NULL;
+   /* P12R1 product CPU identity is fixed; frontend CPU/OC settings are ignored. */
+   Config.clockmhz = 12;
 
-   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
-   {
-      if (strcmp(var.value, "10Mhz") == 0)
-         Config.clockmhz = 10;
-      else if (strcmp(var.value, "16Mhz") == 0)
-         Config.clockmhz = 16;
-      else if (strcmp(var.value, "25Mhz") == 0)
-         Config.clockmhz = 25;
-      else if (strcmp(var.value, "33Mhz (OC)") == 0)
-         Config.clockmhz = 33;
-      else if (strcmp(var.value, "66Mhz (OC)") == 0)
-         Config.clockmhz = 66;
-      else if (strcmp(var.value, "100Mhz (OC)") == 0)
-         Config.clockmhz = 100;
-   }
-
-   var.key = "px68k_ramsize";
-   var.value = NULL;
-
-   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
-   {
-      int value = 0;
-      if (strcmp(var.value, "1MB") == 0)
-         value = 1;
-      else if (strcmp(var.value, "2MB") == 0)
-         value = 2;
-      else if (strcmp(var.value, "3MB") == 0)
-         value = 3;
-      else if (strcmp(var.value, "4MB") == 0)
-         value = 4;
-      else if (strcmp(var.value, "5MB") == 0)
-         value = 5;
-      else if (strcmp(var.value, "6MB") == 0)
-         value = 6;
-      else if (strcmp(var.value, "7MB") == 0)
-         value = 7;
-      else if (strcmp(var.value, "8MB") == 0)
-         value = 8;
-      else if (strcmp(var.value, "9MB") == 0)
-         value = 9;
-      else if (strcmp(var.value, "10MB") == 0)
-         value = 10;
-      else if (strcmp(var.value, "11MB") == 0)
-         value = 11;
-      else if (strcmp(var.value, "12MB") == 0)
-         value = 12;
-
-      Config.ram_size = (value * 1024 * 1024);
-   }
+   /* P12R2 Production: guest RAM is a fixed product property, not a frontend
+    * option. The 12 MiB MEM backing is already allocated by WinX68k_Init(). */
+   Config.ram_size = 12 * 1024 * 1024;
 
    var.key = "px68k_analog";
    var.value = NULL;
@@ -1925,16 +1695,8 @@ static void update_variables(int running)
          Config.VbtnSwap = 1;
    }
 
-   var.key    = "px68k_no_wait_mode";
-   var.value  = NULL;
-
-   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
-   {
-      if (!strcmp(var.value, "disabled"))
-         Config.NoWaitMode = 0;
-      else if (!strcmp(var.value, "enabled"))
-         Config.NoWaitMode = 1;
-   }
+   /* P12R1 product timing is fixed: the frontend cannot request unlimited guest execution. */
+   Config.NoWaitMode = 0;
 
    var.key    = "px68k_frameskip";
    var.value  = NULL;
@@ -1965,20 +1727,8 @@ static void update_variables(int running)
          Config.FrameRate = 1;
    }
 
-   var.key     = "px68k_adjust_frame_rates";
-   var.value   = NULL;
-
-   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
-   {
-      int temp = Config.AdjustFrameRates;
-      if (!strcmp(var.value, "disabled"))
-         Config.AdjustFrameRates = 0;
-      else if (!strcmp(var.value, "enabled"))
-         Config.AdjustFrameRates = 1;
-
-      if (running) /* minimize the chance of resetting av_info during startup */
-         CHANGEAV_TIMING = CHANGEAV_TIMING || Config.AdjustFrameRates != temp;
-   }
+   /* P12R1 keeps native guest timing; rounded frontend frame-rate substitution is disabled. */
+   Config.AdjustFrameRates = 0;
 
    var.key   = "px68k_audio_desync_hack";
    var.value = NULL;
@@ -2092,7 +1842,7 @@ int StateAction(StateMem *sm, int load, int data_only)
       SFEND
    };
 
-   int ret = 0, count = 0;
+   int ret = 0;
 
    ret = PX68KSS_StateAction(sm, load, data_only, StateRegs, "MAIN", false);
    ret &= m68000_StateAction(sm, load, data_only);
@@ -2331,8 +2081,8 @@ void retro_init(void)
 
    /* set sane defaults */
    Config.save_fdd_path = 1;
-   Config.clockmhz      = 10;
-   Config.ram_size      = 2 * 1024 *1024;
+   Config.clockmhz      = 12; /* P12R1 product default */
+   Config.ram_size      = 12 * 1024 * 1024;
    Config.JOY_TYPE[0]   = 0;
    Config.JOY_TYPE[1]   = 0;
 
@@ -2624,25 +2374,50 @@ static void handle_retrok(void)
 }
 
 #define CLOCK_SLICE 200
-/* R57E70A: when the within-scanline device state is provably idle, one
- * m68k_execute() call may consume the rest of the scanline (normally ~294
- * clocks at 10 MHz) instead of 200 + tail.  Any ordinary MFP timer or active
- * DMA0..2 channel immediately restores the exact R57E68 200-cycle scheduler.
- * Scanline edges, Timer-A event mode, OPM/ADPCM/MIDI line updates and pacing
- * remain at their existing boundaries. */
+/* R57E70A/R57E108U scheduler contract.
+ *
+ * CLOCK_SLICE and TAB5_R57E70A_IDLE_SLICE_MAX are 10 MHz *peripheral-time*
+ * horizons, not fixed guest-CPU-cycle counts.  At the old 10 MHz base they
+ * were numerically identical: 200 CPU clocks == 200 peripheral clocks.
+ *
+ * R57E107X changed only the 68000 domain to 16 MHz while MFP/RTC/DMA/audio
+ * remain in the historical 10 MHz domain.  Leaving the active CPU slice at
+ * 200 therefore shortened a device update horizon from 20 us to 12.5 us and
+ * increased scheduler/m68k_execute boundary traffic by up to 1.6x.  This is
+ * Keep the guest-device deadline/horizon separate from the CPU execution
+ * quantum: derive CPU work from the next X68000 guest-device horizon.
+ *
+ * R57E108U restores the original real-time horizon by scaling the CPU slice
+ * once per frame from the configured 68000 clock.  At XVI16:
+ *     active: 200@10MHz -> 320 CPU clocks@16MHz
+ *     idle:   800@10MHz -> 1280 CPU clocks@16MHz
+ * Scanline edges remain a hard boundary because 'remaining' is line-local.
+ * MFP/DMA active mode therefore still observes at most the same ~200 clocks
+ * in the 10 MHz peripheral domain as the proven 10 MHz production baseline. */
 #define TAB5_R57E70A_IDLE_SLICE_MAX 800
 
-static inline __attribute__((always_inline)) int tab5_r57e70a_slice_request(int remaining)
+static inline __attribute__((always_inline)) int tab5_r57e108u_cpu_horizon(int base_10mhz, int cpu_mhz)
+{
+    if (__builtin_expect(cpu_mhz == 16, 1))
+        return (base_10mhz * 8) / 5;
+    if (cpu_mhz == 10)
+        return base_10mhz;
+    if (cpu_mhz <= 0)
+        cpu_mhz = 10;
+    return (base_10mhz * cpu_mhz + 9) / 10;
+}
+
+static inline __attribute__((always_inline)) int tab5_r57e70a_slice_request(
+    int remaining, int active_cpu_horizon, int idle_cpu_horizon)
 {
 #ifdef ESP_PLATFORM
     if (__builtin_expect(MFP_TimerActiveMask == 0u &&
                          ((DMA[0].CSR | DMA[1].CSR | DMA[2].CSR) & 0x08u) == 0u, 1))
     {
-        return (remaining > TAB5_R57E70A_IDLE_SLICE_MAX)
-            ? TAB5_R57E70A_IDLE_SLICE_MAX : remaining;
+        return (remaining > idle_cpu_horizon) ? idle_cpu_horizon : remaining;
     }
 #endif
-    return (remaining > CLOCK_SLICE) ? CLOCK_SLICE : remaining;
+    return (remaining > active_cpu_horizon) ? active_cpu_horizon : remaining;
 }
 
 /*  Core Main Loop */
@@ -2712,13 +2487,19 @@ static void WinX68k_Exec(void)
       old_ram_size = Config.ram_size;
    }
 
+   /* R57E108U: keep the legacy executor's device-update horizon in the same
+    * 10 MHz peripheral-time domain as the standalone production executor. */
+   const int r57e108u_legacy_active_horizon =
+      tab5_r57e108u_cpu_horizon(CLOCK_SLICE, clkdiv);
+
    ICount  += clk_total;
    clk_next = (clk_total/VLINE_TOTAL);
    hsync    = 1;
 
    do
    {
-      int m, n = (ICount > CLOCK_SLICE) ? CLOCK_SLICE : ICount;
+      int m, n = (ICount > r57e108u_legacy_active_horizon)
+         ? r57e108u_legacy_active_horizon : ICount;
 
       if ( hsync )
       {
@@ -2760,10 +2541,34 @@ static void WinX68k_Exec(void)
          m68k_execute(n);
 #endif /* HAVE_C68K */ /* HAVE_MUSASHI */
          m          = (n-m68000_ICountBk);
-         ClkUsed   += m*10;
-         usedclk    = ClkUsed/clkdiv;
+         if (__builtin_expect(clkdiv == 16 && (unsigned)ClkUsed < 16u, 1))
+         {
+            /* R57E107X XVI16: exact 16MHz CPU -> 10MHz peripheral conversion.
+             * 10/16 = 5/8; keep the historical ClkUsed numerator domain but
+             * replace the hot integer divide with shift/mask. */
+            const unsigned acc = (unsigned)ClkUsed + (unsigned)m * 10u;
+            usedclk = (int)(acc >> 4);
+            ClkUsed = (int)(acc & 15u);
+         }
+         else if (clkdiv == 12 && (unsigned)ClkUsed < 12u)
+         {
+            /* P12C1: exact 12 MHz CPU -> 10 MHz peripheral conversion.
+             * Keep the divisor compile-time constant so RV32 avoids a variable divide. */
+            const unsigned acc = (unsigned)ClkUsed + (unsigned)m * 10u;
+            usedclk = (int)(acc / 12u);
+            ClkUsed = (int)(acc - (unsigned)usedclk * 12u);
+         }
+         else if (clkdiv == 10 && (unsigned)ClkUsed < 10u)
+         {
+            usedclk = m;
+         }
+         else
+         {
+            ClkUsed += m * 10;
+            usedclk = ClkUsed / clkdiv;
+            ClkUsed -= usedclk * clkdiv;
+         }
          clk_line  += usedclk;
-         ClkUsed   -= usedclk*clkdiv;
          ICount    -= m;
          clk_count += m;
       }
@@ -3044,8 +2849,6 @@ int WinX68k_VideoProbeInit(void)
     if (!videoBuffer)
     {
         const size_t pixels = 800u * 600u;
-        const size_t bytes  = pixels * sizeof(uint16_t);
-
         videoBuffer = (uint16_t *)heap_caps_calloc(
             pixels,
             sizeof(uint16_t),
@@ -3090,6 +2893,25 @@ uint32_t WinX68k_GetVideoPitchPixels(void)
      * PX68K libretro submits video with pitch = 800 * sizeof(uint16_t).
      */
     return 800;
+}
+
+/* P12R1 MULTISCAN AUTO. HSYNC_CLK is the guest CRTC cost of one scanline in
+ * the exact 10 MHz peripheral domain. This is observation only: no CRTC bit,
+ * timing register or guest-visible mode is forced by the Tab5 frontend. */
+uint32_t WinX68k_GetHSyncHz(void)
+{
+    const int h = HSYNC_CLK;
+    if (h <= 0) return 0u;
+    return (uint32_t)((10000000u + (uint32_t)h / 2u) / (uint32_t)h);
+}
+
+uint32_t WinX68k_GetMonitorClass(void)
+{
+    const uint32_t hz = WinX68k_GetHSyncHz();
+    if (!hz) return 0u;
+    if (hz < 20000u) return 15u;
+    if (hz < 28000u) return 24u;
+    return 31u;
 }
 
 /* R46: expose the producer-side dirty debt.  R39 deliberately advances the
@@ -3170,6 +2992,25 @@ uint32_t WinX68k_SourceBarrierPending(void)
     return __atomic_load_n(&s_source_barrier_pending_count, __ATOMIC_ACQUIRE);
 }
 
+/* P12R2 Production fixed-configuration seal.  This is intentionally cheap and
+ * is called only at startup/guest reset boundaries, never from the hot frame path.
+ * Human68k/SFXVI must always see the already-backed 12 MiB RAM expansion, and
+ * the CZ-6BM1/YM3802 device must remain present across in-process guest resets. */
+void WinX68k_ProductSealFixedConfig(void)
+{
+    Config.clockmhz = 12;
+    Config.ram_size = 12 * 1024 * 1024;
+    Config.NoWaitMode = 0;
+    Config.AdjustFrameRates = 0;
+    Config.AudioDesyncHack = 0;
+    Config.XVIMode = 1;
+    Config.MIDI_SW = 1;
+    Config.MIDI_Type = 0;
+
+    cpu_writemem24(0xE8E00D, 0x31);
+    cpu_writemem24_dword(0xED0008, (uint32_t)Config.ram_size);
+}
+
 /*
  * ESP32-P4 standalone startup path.
  *
@@ -3184,12 +3025,16 @@ int WinX68k_StandaloneInit(void)
     static int initialized = 0;
 
     if (initialized)
+    {
+        WinX68k_ProductSealFixedConfig();
         return 1;
+    }
 
     /* Match PX68K/libretro defaults that retro_init() would normally set. */
     Config.save_fdd_path = 0;
     Config.FrameRate = 1;
-    Config.clockmhz = 10;
+    Config.clockmhz = 12;
+    /* X68K Tab P12C1 product target: 12 MHz guest CPU. Peripheral time remains on PX68K's exact 10 MHz timebase via exact cycle scaling below. */
     /* Build 5.98: WinX68k_Init() already allocates the full 12 MiB MEM
      * backing in PSRAM (MEM_SIZE=0x00c00000).  The standalone path had
      * merely advertised 2 MiB to Human68k.  Expose the full backing so
@@ -3200,10 +3045,12 @@ int WinX68k_StandaloneInit(void)
     Config.PCM_VOL = 15;
     Config.MCR_VOL = 13;
     Config.BufferSize = 50;
-    Config.NoWaitMode = 1;
-    Config.AdjustFrameRates = 1;
+    /* P12R1 Standard12: remove frontend unlimited-run and rounded-rate requests.
+     * The standalone executor owns exact 12 MHz guest / 10 MHz peripheral time. */
+    Config.NoWaitMode = 0;
+    Config.AdjustFrameRates = 0;
     Config.AudioDesyncHack = 0;
-    Config.XVIMode = 0;
+    Config.XVIMode = 1;
     Config.JOY_TYPE[0] = PAD_CPSF_MD;
     Config.JOY_TYPE[1] = PAD_2BUTTON;
     Config.JoyOrMouse = 1;
@@ -3227,11 +3074,18 @@ int WinX68k_StandaloneInit(void)
     Joystick_Init();
     SRAM_Init();
 
+    /* R140P2 production specialization: RAM size is fixed at 12 MiB for this
+     * standalone XVI host.  The generic libretro executor re-validated this
+     * SRAM field every frame because frontend options could change at runtime.
+     * Tab5 has no such runtime RAM option, so establish the same value once. */
+    WinX68k_ProductSealFixedConfig();
+
     /* Build 5.13: activate the existing PX68K OPM + ADPCM mixer volumes. */
     DSound_Play();
 
     initialized = 1;
 
+    printf("PX68K_PRODUCT_P12R2: X68K Tab STANDARD 12MHz PRODUCTION; 10MHz peripheral domain exact; C1+F2+MK1+MFP1; runtime discovery ZERO\n");
     printf("PX68K_STANDALONE: init OK clock=%dMHz ram=%lu FDD/XDF/SRAM/SYSPORT initialized; MIDI=CZ-6BM1/YM3802 enabled\n",
            Config.clockmhz,
            (unsigned long)Config.ram_size);
@@ -3244,148 +3098,76 @@ int WinX68k_FloppyReady(int drive)
     return FDD_IsReady(drive);
 }
 
-/* Build 5.12: low-duty standalone profiler.  The host enables this only
- * for one frame every ~600 frames, so the many esp_timer_get_time() calls
- * below do not burden normal gameplay. */
-static int s_tab5_perf_sample = 0;
-static uint32_t s_tab5_perf_frame_us = 0;
-static uint32_t s_tab5_perf_cpu_us = 0;
-static uint32_t s_tab5_perf_compose_us = 0;
-static uint32_t s_tab5_perf_finalize_us = 0;
-/* Build 5.17: sample-only scheduler/device breakdown. */
-static uint32_t s_tab5_perf_timer_us = 0;
-static uint32_t s_tab5_perf_dma_us = 0;
-static uint32_t s_tab5_perf_line_us = 0;
-static uint32_t s_tab5_perf_audio_timer_us = 0;
-static uint32_t s_tab5_perf_input_us = 0;
-static uint32_t s_tab5_perf_soundmix_us = 0;
-static uint32_t s_tab5_perf_fdd_us = 0;
-/* Build 5.43: complete the previously hidden dev= bucket. */
-static uint32_t s_tab5_perf_mfp_us = 0;
-static uint32_t s_tab5_perf_rtc_us = 0;
-static uint32_t s_tab5_perf_edge_us = 0;
-static uint32_t s_tab5_perf_sched_us = 0;
-static uint32_t s_tab5_perf_adclk_us = 0;
-static uint32_t s_tab5_perf_opmclk_us = 0;
-static uint32_t s_tab5_perf_midi_us = 0;
-static uint32_t s_tab5_perf_post_us = 0;
-
-extern void m68k_tab5_opcode_profile_set(int enabled);
-
-void WinX68k_PerfSetSample(int enabled)
-{
-    s_tab5_perf_sample = enabled ? 1 : 0;
-    DSound_PerfSetSample(enabled);
-    WinDraw_PerfSetSample(enabled);
-    /* Build 5.21: the hot-op set is frozen from Build 5.20. Keep the profiler
-     * code available, but disable per-instruction counting during PERF samples
-     * so cpu= is clean for the IRAM experiment. */
-    m68k_tab5_opcode_profile_set(0);
-}
-
-void WinX68k_PerfGetLast(uint32_t *frame_us,
-                         uint32_t *cpu_us,
-                         uint32_t *compose_us,
-                         uint32_t *finalize_us)
-{
-    if (frame_us) *frame_us = s_tab5_perf_frame_us;
-    if (cpu_us) *cpu_us = s_tab5_perf_cpu_us;
-    if (compose_us) *compose_us = s_tab5_perf_compose_us;
-    if (finalize_us) *finalize_us = s_tab5_perf_finalize_us;
-}
-
-void WinX68k_PerfGetDetail(uint32_t *timer_us,
-                           uint32_t *dma_us,
-                           uint32_t *line_us,
-                           uint32_t *audio_timer_us,
-                           uint32_t *input_us,
-                           uint32_t *soundmix_us,
-                           uint32_t *fdd_us)
-{
-    if (timer_us) *timer_us = s_tab5_perf_timer_us;
-    if (dma_us) *dma_us = s_tab5_perf_dma_us;
-    if (line_us) *line_us = s_tab5_perf_line_us;
-    if (audio_timer_us) *audio_timer_us = s_tab5_perf_audio_timer_us;
-    if (input_us) *input_us = s_tab5_perf_input_us;
-    if (soundmix_us) *soundmix_us = s_tab5_perf_soundmix_us;
-    if (fdd_us) *fdd_us = s_tab5_perf_fdd_us;
-}
-
-void WinX68k_PerfGetDetail543(uint32_t *mfp_us, uint32_t *rtc_us,
-                              uint32_t *edge_us, uint32_t *sched_us,
-                              uint32_t *adclk_us, uint32_t *opmclk_us,
-                              uint32_t *midi_us, uint32_t *post_us)
-{
-    if (mfp_us) *mfp_us = s_tab5_perf_mfp_us;
-    if (rtc_us) *rtc_us = s_tab5_perf_rtc_us;
-    if (edge_us) *edge_us = s_tab5_perf_edge_us;
-    if (sched_us) *sched_us = s_tab5_perf_sched_us;
-    if (adclk_us) *adclk_us = s_tab5_perf_adclk_us;
-    if (opmclk_us) *opmclk_us = s_tab5_perf_opmclk_us;
-    if (midi_us) *midi_us = s_tab5_perf_midi_us;
-    if (post_us) *post_us = s_tab5_perf_post_us;
-}
-
-void WinX68k_VideoPerfGetLast(uint32_t *grp_us, uint32_t *text_us, uint32_t *bg_us,
-                              uint32_t *blend_us, uint32_t *clear_us,
-                              uint32_t *dirty_lines, uint32_t *grp_calls,
-                              uint32_t *text_calls, uint32_t *bg_calls,
-                              uint32_t *blend_calls)
-{
-    WinDraw_PerfGetLast(grp_us, text_us, bg_us, blend_us, clear_us,
-                        dirty_lines, grp_calls, text_calls, bg_calls, blend_calls);
-}
-
-int WinX68k_AudioReadFrames(int16_t *dst, int max_frames)
-{
-    return DSound_ReadFrames(dst, max_frames);
-}
-
-/* Build 5.98g12: final PCM extraction/mixing is a CPU0 host service. */
-int WinX68k_AudioHostFramesAvail(void)
-{
-    return DSound_HostFramesAvail();
-}
-
+/* P12R1 HF5: functional CPU0 host PCM consumer wrapper.
+ * This is not telemetry: tab5_audio.cpp pulls completed common-timeline PCM
+ * through DSound_HostReadFrames().  P12R1 cleanup accidentally removed only
+ * this wrapper while leaving the consumer call intact. */
 int WinX68k_AudioHostReadFrames(int16_t *dst, int max_frames)
 {
     return DSound_HostReadFrames(dst, max_frames);
 }
+
+void WinX68k_AudioSetSourceRate(uint32_t rate) { DSound_SetHostSourceRate(rate); }
+uint32_t WinX68k_AudioGetSourceRate(void) { return DSound_GetHostSourceRate(); }
 
 uint32_t WinX68k_AudioProducedFrames(void)
 {
     return DSound_HostProducedFrames();
 }
 
+/* R140P4: register a host-side completion wake once.  Source producers signal
+ * this callback whenever FM publication or an ADPCM render command can make
+ * the common sample timeline readable. */
+void WinX68k_AudioSetHostSourceReadyCallback(void (*cb)(void))
+{
+    DSound_SetHostSourceReadyCallback(cb);
+}
+
 void WinX68k_VideoPerfGetR57E40(uint32_t *gbt_us, uint32_t *commit_us,
                                  uint32_t *gbt_calls, uint32_t *commit_calls,
                                  uint32_t *arm_count, uint32_t *active)
 {
-    WinDraw_PerfGetR57E40(gbt_us, commit_us, gbt_calls, commit_calls, arm_count, active);
+    if(gbt_us)*gbt_us=0;
+    if(commit_us)*commit_us=0;
+    if(gbt_calls)*gbt_calls=0;
+    if(commit_calls)*commit_calls=0;
+    if(arm_count)*arm_count=0;
+    if(active)*active=0;
 }
 
 void WinX68k_VideoPerfGetR57E44(uint32_t *fused_lines, uint32_t *fallback_lines,
                                  uint32_t *cache_rebuilds, uint32_t *cache_failures)
 {
-    WinDraw_PerfGetR57E44(fused_lines, fallback_lines, cache_rebuilds, cache_failures);
+    if(fused_lines)*fused_lines=0;
+    if(fallback_lines)*fallback_lines=0;
+    if(cache_rebuilds)*cache_rebuilds=0;
+    if(cache_failures)*cache_failures=0;
 }
 
 void WinX68k_VideoPerfGetR57E48(uint32_t *direct_lines, uint32_t *fallback_lines,
-                                 uint32_t *text_reject, uint32_t *bg_reject,
-                                 uint32_t *final_reject)
+                                 uint32_t *text_reject, uint32_t *bg_reject, uint32_t *final_reject)
 {
-    WinDraw_PerfGetR57E48(direct_lines, fallback_lines, text_reject,
-                          bg_reject, final_reject);
+    if(direct_lines)*direct_lines=0;
+    if(fallback_lines)*fallback_lines=0;
+    if(text_reject)*text_reject=0;
+    if(bg_reject)*bg_reject=0;
+    if(final_reject)*final_reject=0;
 }
 
 void WinX68k_AudioPerfGetLast(uint32_t *adpcm_us, uint32_t *opm_us, uint32_t *mix_calls, uint32_t *mix_frames)
 {
-    DSound_PerfGetLast(adpcm_us, opm_us, mix_calls, mix_frames);
+    if(adpcm_us)*adpcm_us=0;
+    if(opm_us)*opm_us=0;
+    if(mix_calls)*mix_calls=0;
+    if(mix_frames)*mix_frames=0;
 }
 
 void WinX68k_AudioAsyncGetStats(uint32_t *qdepth, uint32_t *event_drops, uint32_t *ring_overruns, uint32_t *fm_avail)
 {
-    DSound_AsyncGetStats(qdepth, event_drops, ring_overruns, fm_avail);
+    if(qdepth)*qdepth=0;
+    if(event_drops)*event_drops=0;
+    if(ring_overruns)*ring_overruns=0;
+    if(fm_avail)*fm_avail=0;
 }
 
 /* Build 5.62: CPU1 always advances the complete X68000 time axis, while
@@ -3393,17 +3175,12 @@ void WinX68k_AudioAsyncGetStats(uint32_t *qdepth, uint32_t *event_drops, uint32_
  * flag is set once per guest frame by the Tab5 budget manager. */
 static volatile int s_tab5_host_render_enabled = 1;
 
-void WinX68k_SetHostRenderEnabled(int enabled)
-{
-    s_tab5_host_render_enabled = enabled ? 1 : 0;
-}
-
 /* R57E64: expose the configured X68000 CPU clock to the Tab5 wall-clock
  * governor.  Keep the fallback identical to the execution path below. */
 static inline uint32_t tab5_guest_clock_hz_inline(void)
 {
     int mhz = Config.clockmhz;
-    if (mhz <= 0) mhz = 10;
+    if (mhz <= 0) mhz = 12;
     return (uint32_t)mhz * 1000000u;
 }
 
@@ -3413,980 +3190,133 @@ uint32_t WinX68k_GetGuestClockHz(void)
 }
 
 #ifdef ESP_PLATFORM
-/* R57E67: phase-reservoir guest-time governor with bounded catch-up.
- *
- * R57E65 checked pacing at every 200-cycle scheduler slice.  The timing was
- * mathematically conservative, but the hot-path bookkeeping/trim and very
- * frequent waits consumed enough CPU1 time to pull real MDX throughput down
- * to roughly 9 MHz.  R57E67 leaves the existing 200-cycle
- * scheduler slices intact for device timing, but performs wall-clock pacing
- * only after a coarse guest-cycle quantum (normally ~2 ms at 10 MHz).
- *
- * The phase accumulator still has an exact long-term Config.clockmhz slope.
- * Positive phase is a bounded future reservoir; modest negative phase is preserved
- * as catch-up credit so a short host stall can be recovered by CPU1's spare
- * execution headroom.  Only a genuinely long lag is rebased, so ordinary
- * jitter is not converted into permanent slowdown.
- *
- * Slack prefetch is charged *inside* the wait budget: after the safe RAM/IPL
- * prefetch, the host cycle counter is sampled again and only the residual
- * lead is delayed.  Prefetch therefore replaces dead wait time instead of
- * extending it. */
-typedef struct {
-    uint32_t enabled;
-    uint32_t target_hz;
-    uint32_t host_hz;
-    uint32_t lead_max_us;
-    uint32_t lead_keep_us;
-    uint32_t lag_resync_us;
-    uint32_t check_guest_cycles;
-    uint32_t pending_guest_cycles;
-    uint32_t last_ccount;
-    uint64_t host_per_guest_q16;
-    int64_t lead_host_q16;
-    int64_t lead_max_q16;
-    int64_t lead_keep_q16;
-    int64_t lag_resync_q16;
-
-    /* R57E80: release-cheap governor accounting. These are intentionally
-     * independent of the old R57E63 periodic audit so the one-shot recorder
-     * can separate useful CPU work from deliberate 10-MHz pacing waits. */
-    uint64_t r80_wait_host_cycles;
-    uint64_t r80_wait_requested_us;
-    uint64_t r80_discarded_lag_q16;
-    uint64_t r80_max_lag_q16;
-    uint64_t r80_max_lead_q16;
-    uint32_t r80_wait_events;
-    uint32_t r80_clamp_events;
-    uint32_t r80_catchup_checks;
-
-    /* R57E86: phase overflow carry.
-     *
-     * The fast signed phase stays bounded at +/- the ordinary reservoir,
-     * but lag beyond the negative reservoir is no longer thrown away.
-     * It is carried separately and must be repaid from future positive
-     * phase before any real-time pacing wait is permitted again. */
-    uint64_t r86_overflow_debt_q16;
-    uint64_t r86_preserved_overflow_q16;
-    uint64_t r86_repaid_overflow_q16;
-    uint64_t r86_max_overflow_debt_q16;
-    uint64_t r86_capture_start_debt_q16;
-    uint32_t r86_wait_suppressed;
-
-    /* R57E87: audio-reserve-aware carry repayment.
-     *
-     * R86 proved that preserving debt is correct, but unrestricted repayment
-     * can generate PCM faster than the fixed 44.1-kHz sink can accept and fill
-     * the 32768-frame host ring.  Recovery therefore has hysteresis:
-     *   effectiveQ <= 8192  : catch-up repayment enabled
-     *   effectiveQ >= 16384 : catch-up repayment held
-     * While held, any newly observed negative visible phase is transferred
-     * into the 64-bit carry instead of being immediately chased. */
-    uint32_t r87_audio_q_effective;
-    uint32_t r87_audio_q_min;
-    uint32_t r87_audio_q_max;
-    uint32_t r87_recovery_allowed;
-    uint32_t r87_hold_events;
-    uint32_t r87_resume_events;
-    uint32_t r87_active_frames;
-    uint32_t r87_held_frames;
-    uint32_t r87_defer_checks;
-    uint32_t r87_repay_paused_checks;
-    uint64_t r87_deferred_lag_q16;
-
-#if PX68K_TAB5_R57E63_AUDIO_AUDIT
-    uint64_t max_lead_q16;
-    uint64_t max_lag_q16;
-    uint64_t guest_cycles;
-    uint32_t check_events;
-    uint32_t catchup_checks;
-    uint32_t wait_events;
-    uint64_t wait_us;
-    uint32_t max_wait_us;
-    uint32_t resyncs;
-    uint32_t prefetch_events;
+/* R140P3: wall-clock guest pacing retired. X68P4 remains the sole owner of
+ * guest CPU/device time. Frame policy may shed host rendering but cannot
+ * delay CPU1 or rewrite guest-time phase/carry state. */
+void WinX68k_ProductionFramePolicy(uint32_t effective_q, int host_render_enabled)
+{
+    (void)effective_q;
+    s_tab5_host_render_enabled = host_render_enabled ? 1 : 0;
+}
 #endif
-} tab5_guest_pace_t;
 
-static tab5_guest_pace_t s_tab5_guest_pace;
-
-static inline uint32_t tab5_guest_pace_host_hz(void)
+#ifdef ESP_PLATFORM
+static inline __attribute__((always_inline)) void tab5_adpcm_preupdate_r127(uint32_t clock)
 {
-    const uint32_t mhz = (uint32_t)CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ;
-    return mhz ? mhz * 1000000u : 360000000u;
-}
-
-static inline int64_t tab5_guest_pace_us_q16(uint32_t us, uint32_t host_hz)
-{
-    const uint64_t host_cycles = ((uint64_t)us * host_hz + 999999ULL) / 1000000ULL;
-    return (int64_t)(host_cycles << 16);
-}
-
-static inline uint32_t tab5_guest_pace_q16_to_us(uint64_t host_q16, uint32_t host_hz)
-{
-    if (!host_hz) return 0u;
-    const uint64_t host_cycles = (host_q16 + 0xffffULL) >> 16;
-    return (uint32_t)((host_cycles * 1000000ULL + host_hz - 1ULL) / host_hz);
-}
-
-static inline uint64_t tab5_guest_pace_q16_to_us64(uint64_t host_q16,
-                                                   uint32_t host_hz)
-{
-    if (!host_hz) return 0u;
-    const uint64_t host_cycles = (host_q16 + 0xffffULL) >> 16;
-    return (host_cycles * 1000000ULL + host_hz - 1ULL) / host_hz;
-}
-
-static inline uint32_t tab5_guest_pace_quantum(uint32_t guest_hz)
-{
-    /* One wall-clock decision per ~2 ms of guest time.  Keep bounds sane for
-     * legal non-10-MHz modes while avoiding pacing math in the 200-cycle hot
-     * scheduler loop. */
-    uint32_t q = guest_hz / 500u;
-    if (q < 4000u) q = 4000u;
-    if (q > 48000u) q = 48000u;
-    return q;
-}
-
-static inline void tab5_guest_pace_set_clock(tab5_guest_pace_t *p,
-                                              uint32_t guest_hz,
-                                              uint32_t ccount)
-{
-    p->target_hz = guest_hz;
-    p->host_hz = tab5_guest_pace_host_hz();
-    p->host_per_guest_q16 = guest_hz
-        ? (((uint64_t)p->host_hz << 16) + guest_hz / 2u) / guest_hz : 0u;
-    p->lead_max_q16 = tab5_guest_pace_us_q16(p->lead_max_us, p->host_hz);
-    p->lead_keep_q16 = tab5_guest_pace_us_q16(p->lead_keep_us, p->host_hz);
-    p->lag_resync_q16 = tab5_guest_pace_us_q16(p->lag_resync_us, p->host_hz);
-    p->check_guest_cycles = tab5_guest_pace_quantum(guest_hz);
-    p->pending_guest_cycles = 0u;
-    p->lead_host_q16 = 0;
-    p->r86_overflow_debt_q16 = 0u;
-    p->last_ccount = ccount;
-#if PX68K_TAB5_R57E63_AUDIO_AUDIT
-    ++p->resyncs;
-#endif
-}
-
-void WinX68k_GuestPaceConfigure(uint32_t lead_max_us,
-                                uint32_t lead_keep_us,
-                                uint32_t lag_resync_us)
-{
-    if (lead_max_us < 100u) lead_max_us = 100u;
-    if (lead_max_us > 20000u) lead_max_us = 20000u;
-    if (lead_keep_us >= lead_max_us) lead_keep_us = lead_max_us / 3u;
-    if (lag_resync_us < lead_max_us * 2u) lag_resync_us = lead_max_us * 2u;
-
-    memset(&s_tab5_guest_pace, 0, sizeof(s_tab5_guest_pace));
-    s_tab5_guest_pace.enabled = 1u;
-    s_tab5_guest_pace.lead_max_us = lead_max_us;
-    s_tab5_guest_pace.lead_keep_us = lead_keep_us;
-    s_tab5_guest_pace.lag_resync_us = lag_resync_us;
-    s_tab5_guest_pace.r87_recovery_allowed = 1u;
-    s_tab5_guest_pace.r87_audio_q_min = UINT32_MAX;
-    tab5_guest_pace_set_clock(&s_tab5_guest_pace, tab5_guest_clock_hz_inline(),
-                              (uint32_t)esp_cpu_get_cycle_count());
-}
-
-#define TAB5_R57E87_RECOVERY_RESUME_Q 8192u
-#define TAB5_R57E87_RECOVERY_HOLD_Q   16384u
-
-void WinX68k_GuestPaceR87SetAudioReserve(uint32_t effective_q)
-{
-    tab5_guest_pace_t * const p = &s_tab5_guest_pace;
-    p->r87_audio_q_effective = effective_q;
-
-    if (effective_q < p->r87_audio_q_min)
-        p->r87_audio_q_min = effective_q;
-    if (effective_q > p->r87_audio_q_max)
-        p->r87_audio_q_max = effective_q;
-
-    if (p->r87_recovery_allowed) {
-        if (effective_q >= TAB5_R57E87_RECOVERY_HOLD_Q) {
-            p->r87_recovery_allowed = 0u;
-            ++p->r87_hold_events;
-        }
-    } else {
-        if (effective_q <= TAB5_R57E87_RECOVERY_RESUME_Q) {
-            p->r87_recovery_allowed = 1u;
-            ++p->r87_resume_events;
-        }
+    ADPCM_R127_PreCounter += (int)(ADPCM_R127_PreStepCurrent * clock);
+    if (__builtin_expect(ADPCM_R127_PreCounter >= 10000000L, 0)) {
+        ADPCM_PreUpdateR127Due();
     }
-
-    if (p->r87_recovery_allowed)
-        ++p->r87_active_frames;
-    else
-        ++p->r87_held_frames;
 }
 
-static inline void tab5_guest_pace_wall_update(tab5_guest_pace_t *p,
-                                                uint32_t ccount)
+static inline __attribute__((always_inline)) void tab5_midi_delayout_r127(unsigned int delay)
 {
-    const uint32_t delta = ccount - p->last_ccount; /* wrap-safe */
-    p->last_ccount = ccount;
-    p->lead_host_q16 -= ((int64_t)(uint64_t)delta << 16);
+    if (__builtin_expect(MIDI_R127DelayPending != 0u, 0)) {
+        MIDI_DelayOut(delay);
+    }
 }
 
-static void tab5_guest_pace_after_slice(int executed)
+static inline __attribute__((always_inline)) void tab5_midi_timer_r127(uint32_t clock)
 {
-    tab5_guest_pace_t * const p = &s_tab5_guest_pace;
-    if (executed <= 0 || !p->enabled)
-        return;
-
-#if PX68K_TAB5_R57E63_AUDIO_AUDIT
-    p->guest_cycles += (uint32_t)executed;
-#endif
-    p->pending_guest_cycles += (uint32_t)executed;
-    if (p->pending_guest_cycles < p->check_guest_cycles)
-        return;
-
-    const uint32_t guest_hz = tab5_guest_clock_hz_inline();
-    uint32_t cc = (uint32_t)esp_cpu_get_cycle_count();
-    if (guest_hz < 1000000u)
-        return;
-    if (guest_hz != p->target_hz || p->host_per_guest_q16 == 0u) {
-        tab5_guest_pace_set_clock(p, guest_hz, cc);
-        return;
+    if (__builtin_expect(MIDI_R127TimerActive != 0u, 0)) {
+        MIDI_Timer(clock);
     }
-
-    tab5_guest_pace_wall_update(p, cc);
-    const uint32_t pending = p->pending_guest_cycles;
-    p->pending_guest_cycles = 0u;
-    p->lead_host_q16 += (int64_t)((uint64_t)pending * p->host_per_guest_q16);
-#if PX68K_TAB5_R57E63_AUDIO_AUDIT
-    ++p->check_events;
-#endif
-
-    /* Preserve ordinary lag as catch-up credit.  CPU1 may temporarily run at
-     * its natural >10-MHz capacity until the debt is repaid.  R57E67 keeps a
-     * bounded debt reservoir (normally 20 ms); larger stalls are clamped to
-     * that debt rather than rebased to zero. */
-    if (p->lead_host_q16 < 0) {
-        const uint64_t r80_lag_q16_now = (uint64_t)(-p->lead_host_q16);
-        if (r80_lag_q16_now > p->r80_max_lag_q16)
-            p->r80_max_lag_q16 = r80_lag_q16_now;
-        ++p->r80_catchup_checks;
-#if PX68K_TAB5_R57E63_AUDIO_AUDIT
-        const uint64_t lag_q16_now = r80_lag_q16_now;
-        if (lag_q16_now > p->max_lag_q16) p->max_lag_q16 = lag_q16_now;
-#endif
-        /* R57E87: when the PCM reserve is already healthy, do not chase
-         * historical wall-time debt and overfill the fixed-rate 44.1-kHz
-         * sink.  Preserve this visible lag in the same 64-bit carry, reset
-         * the fast visible phase to zero, and let normal 10-MHz pacing resume.
-         * Catch-up becomes eligible again only after effectiveQ drains to the
-         * lower hysteresis threshold. */
-        if (!p->r87_recovery_allowed) {
-            p->r86_overflow_debt_q16 += r80_lag_q16_now;
-            p->r86_preserved_overflow_q16 += r80_lag_q16_now;
-            p->r87_deferred_lag_q16 += r80_lag_q16_now;
-            if (p->r86_overflow_debt_q16 > p->r86_max_overflow_debt_q16)
-                p->r86_max_overflow_debt_q16 = p->r86_overflow_debt_q16;
-            p->lead_host_q16 = 0;
-            ++p->r87_defer_checks;
-            return;
-        }
-
-        if (p->lead_host_q16 < -p->lag_resync_q16) {
-            const uint64_t overflow_q16 =
-                r80_lag_q16_now - (uint64_t)p->lag_resync_q16;
-
-            /* R57E86: retain *all* lag.  The visible phase remains bounded
-             * for cheap hot-path arithmetic, while excess debt is carried in
-             * 64 bits.  This removes the wait-now / discard-lag-later bias
-             * without widening the normal 500-ms phase accumulator. */
-            p->r86_overflow_debt_q16 += overflow_q16;
-            p->r86_preserved_overflow_q16 += overflow_q16;
-            if (p->r86_overflow_debt_q16 > p->r86_max_overflow_debt_q16)
-                p->r86_max_overflow_debt_q16 = p->r86_overflow_debt_q16;
-            ++p->r80_clamp_events;
-            p->lead_host_q16 = -p->lag_resync_q16;
-#if PX68K_TAB5_R57E63_AUDIO_AUDIT
-            ++p->resyncs;
-            ++p->catchup_checks;
-#endif
-        } else {
-#if PX68K_TAB5_R57E63_AUDIO_AUDIT
-            ++p->catchup_checks;
-#endif
-        }
-        return;
-    }
-
-    /* R57E86: a positive visible phase is first used to repay any lag that
-     * previously overflowed the bounded negative reservoir.  Until that
-     * historical debt reaches zero, no pacing sleep is allowed. */
-    if (p->r86_overflow_debt_q16 != 0u && p->lead_host_q16 > 0) {
-        if (p->r87_recovery_allowed) {
-            const uint64_t positive_q16 = (uint64_t)p->lead_host_q16;
-            const uint64_t repay_q16 =
-                (positive_q16 < p->r86_overflow_debt_q16)
-                    ? positive_q16 : p->r86_overflow_debt_q16;
-            p->r86_overflow_debt_q16 -= repay_q16;
-            p->r86_repaid_overflow_q16 += repay_q16;
-            p->lead_host_q16 -= (int64_t)repay_q16;
-            ++p->r86_wait_suppressed;
-
-            if (p->r86_overflow_debt_q16 != 0u || p->lead_host_q16 <= 0)
-                return;
-        } else {
-            /* Carry is intentionally frozen while audio reserve is high.
-             * Do not return: the positive visible phase must proceed through
-             * the ordinary lead_max/lead_keep wait logic so guest time stays
-             * at exact real-time speed instead of continuing to sprint. */
-            ++p->r87_repay_paused_checks;
-        }
-    }
-
-    if ((uint64_t)p->lead_host_q16 > p->r80_max_lead_q16)
-        p->r80_max_lead_q16 = (uint64_t)p->lead_host_q16;
-#if PX68K_TAB5_R57E63_AUDIO_AUDIT
-    if ((uint64_t)p->lead_host_q16 > p->max_lead_q16)
-        p->max_lead_q16 = (uint64_t)p->lead_host_q16;
-#endif
-
-    if (p->lead_host_q16 < p->lead_max_q16)
-        return;
-
-    /* The current-PC prefetch is useful work done during timing slack.  Charge
-     * its latency against that slack, then delay only the residual amount. */
-    uint32_t wait_us = tab5_guest_pace_q16_to_us(
-        (uint64_t)(p->lead_host_q16 - p->lead_keep_q16), p->host_hz);
-    if (wait_us >= 200u && m68k_tab5_slack_prefetch_current()) {
-#if PX68K_TAB5_R57E63_AUDIO_AUDIT
-        ++p->prefetch_events;
-#endif
-        cc = (uint32_t)esp_cpu_get_cycle_count();
-        tab5_guest_pace_wall_update(p, cc);
-        if (p->lead_host_q16 <= p->lead_keep_q16)
-            return;
-        wait_us = tab5_guest_pace_q16_to_us(
-            (uint64_t)(p->lead_host_q16 - p->lead_keep_q16), p->host_hz);
-    }
-
-    if (wait_us == 0u)
-        return;
-
-    ++p->r80_wait_events;
-    p->r80_wait_requested_us += wait_us;
-#if PX68K_TAB5_R57E63_AUDIO_AUDIT
-    ++p->wait_events;
-    p->wait_us += wait_us;
-    if (wait_us > p->max_wait_us) p->max_wait_us = wait_us;
-#endif
-    {
-        const uint32_t wait_cc0 = (uint32_t)esp_cpu_get_cycle_count();
-        esp_rom_delay_us(wait_us);
-        cc = (uint32_t)esp_cpu_get_cycle_count();
-        p->r80_wait_host_cycles += (uint32_t)(cc - wait_cc0);
-    }
-    tab5_guest_pace_wall_update(p, cc);
 }
-
-void WinX68k_GuestPaceGetStats(uint64_t *guest_cycles,
-                               uint32_t *target_hz,
-                               uint32_t *lead_max_us,
-                               uint32_t *lead_keep_us,
-                               uint32_t *wait_events,
-                               uint64_t *wait_us,
-                               uint32_t *max_wait_us,
-                               uint32_t *resyncs,
-                               uint32_t *max_lag_us,
-                               uint32_t *max_lead_us,
-                               uint32_t *check_events,
-                               uint32_t *catchup_checks,
-                               uint32_t *prefetch_events)
-{
-    const tab5_guest_pace_t * const p = &s_tab5_guest_pace;
-    if (target_hz) *target_hz = p->target_hz;
-    if (lead_max_us) *lead_max_us = p->lead_max_us;
-    if (lead_keep_us) *lead_keep_us = p->lead_keep_us;
-#if PX68K_TAB5_R57E63_AUDIO_AUDIT
-    if (guest_cycles) *guest_cycles = p->guest_cycles;
-    if (wait_events) *wait_events = p->wait_events;
-    if (wait_us) *wait_us = p->wait_us;
-    if (max_wait_us) *max_wait_us = p->max_wait_us;
-    if (resyncs) *resyncs = p->resyncs;
-    if (max_lag_us) *max_lag_us = tab5_guest_pace_q16_to_us(p->max_lag_q16, p->host_hz);
-    if (max_lead_us) *max_lead_us = tab5_guest_pace_q16_to_us(p->max_lead_q16, p->host_hz);
-    if (check_events) *check_events = p->check_events;
-    if (catchup_checks) *catchup_checks = p->catchup_checks;
-    if (prefetch_events) *prefetch_events = p->prefetch_events;
 #else
-    if (guest_cycles) *guest_cycles = 0;
-    if (wait_events) *wait_events = 0;
-    if (wait_us) *wait_us = 0;
-    if (max_wait_us) *max_wait_us = 0;
-    if (resyncs) *resyncs = 0;
-    if (max_lag_us) *max_lag_us = 0;
-    if (max_lead_us) *max_lead_us = 0;
-    if (check_events) *check_events = 0;
-    if (catchup_checks) *catchup_checks = 0;
-    if (prefetch_events) *prefetch_events = 0;
-#endif
-}
-
-uint64_t WinX68k_GuestPaceR80WaitCycles(void)
-{
-    return s_tab5_guest_pace.r80_wait_host_cycles;
-}
-
-void WinX68k_GuestPaceR80ResetStats(void)
-{
-    tab5_guest_pace_t * const p = &s_tab5_guest_pace;
-    p->r80_wait_host_cycles = 0u;
-    p->r80_wait_requested_us = 0u;
-    p->r80_discarded_lag_q16 = 0u;
-    p->r80_max_lag_q16 = 0u;
-    p->r80_max_lead_q16 = 0u;
-    p->r80_wait_events = 0u;
-    p->r80_clamp_events = 0u;
-    p->r80_catchup_checks = 0u;
-
-    /* Do NOT erase functional R86 debt when the one-shot recorder starts. */
-    p->r86_capture_start_debt_q16 = p->r86_overflow_debt_q16;
-    p->r86_preserved_overflow_q16 = 0u;
-    p->r86_repaid_overflow_q16 = 0u;
-    p->r86_max_overflow_debt_q16 = p->r86_overflow_debt_q16;
-    p->r86_wait_suppressed = 0u;
-
-    p->r87_audio_q_min = p->r87_audio_q_effective;
-    p->r87_audio_q_max = p->r87_audio_q_effective;
-    p->r87_hold_events = 0u;
-    p->r87_resume_events = 0u;
-    p->r87_active_frames = 0u;
-    p->r87_held_frames = 0u;
-    p->r87_defer_checks = 0u;
-    p->r87_repay_paused_checks = 0u;
-    p->r87_deferred_lag_q16 = 0u;
-}
-
-void WinX68k_GuestPaceR80GetStats(uint64_t *wait_cycles,
-                                  uint64_t *requested_wait_us,
-                                  uint32_t *wait_events,
-                                  uint32_t *clamp_events,
-                                  uint64_t *discarded_lag_us,
-                                  uint32_t *max_lag_us,
-                                  uint32_t *max_lead_us,
-                                  int32_t *phase_us,
-                                  uint32_t *catchup_checks,
-                                  uint32_t *host_mhz)
-{
-    const tab5_guest_pace_t * const p = &s_tab5_guest_pace;
-    if (wait_cycles) *wait_cycles = p->r80_wait_host_cycles;
-    if (requested_wait_us) *requested_wait_us = p->r80_wait_requested_us;
-    if (wait_events) *wait_events = p->r80_wait_events;
-    if (clamp_events) *clamp_events = p->r80_clamp_events;
-    if (discarded_lag_us)
-        *discarded_lag_us = tab5_guest_pace_q16_to_us(
-            p->r80_discarded_lag_q16, p->host_hz);
-    if (max_lag_us)
-        *max_lag_us = tab5_guest_pace_q16_to_us(
-            p->r80_max_lag_q16, p->host_hz);
-    if (max_lead_us)
-        *max_lead_us = tab5_guest_pace_q16_to_us(
-            p->r80_max_lead_q16, p->host_hz);
-    if (phase_us) {
-        const int64_t q = p->lead_host_q16;
-        const uint32_t mag = tab5_guest_pace_q16_to_us(
-            (uint64_t)((q < 0) ? -q : q), p->host_hz);
-        *phase_us = (q < 0) ? -(int32_t)mag : (int32_t)mag;
-    }
-    if (catchup_checks) *catchup_checks = p->r80_catchup_checks;
-    if (host_mhz) *host_mhz = p->host_hz / 1000000u;
-}
-
-void WinX68k_GuestPaceR86GetStats(uint64_t *carry_start_us,
-                                  uint64_t *preserved_us,
-                                  uint64_t *repaid_us,
-                                  uint64_t *max_carry_us,
-                                  uint64_t *final_carry_us,
-                                  int64_t *effective_phase_us,
-                                  uint32_t *wait_suppressed)
-{
-    const tab5_guest_pace_t * const p = &s_tab5_guest_pace;
-    if (carry_start_us)
-        *carry_start_us = tab5_guest_pace_q16_to_us64(
-            p->r86_capture_start_debt_q16, p->host_hz);
-    if (preserved_us)
-        *preserved_us = tab5_guest_pace_q16_to_us64(
-            p->r86_preserved_overflow_q16, p->host_hz);
-    if (repaid_us)
-        *repaid_us = tab5_guest_pace_q16_to_us64(
-            p->r86_repaid_overflow_q16, p->host_hz);
-    if (max_carry_us)
-        *max_carry_us = tab5_guest_pace_q16_to_us64(
-            p->r86_max_overflow_debt_q16, p->host_hz);
-    if (final_carry_us)
-        *final_carry_us = tab5_guest_pace_q16_to_us64(
-            p->r86_overflow_debt_q16, p->host_hz);
-    if (effective_phase_us) {
-        int64_t visible_us = 0;
-        if (p->lead_host_q16 < 0) {
-            visible_us = -(int64_t)tab5_guest_pace_q16_to_us64(
-                (uint64_t)(-p->lead_host_q16), p->host_hz);
-        } else {
-            visible_us = (int64_t)tab5_guest_pace_q16_to_us64(
-                (uint64_t)p->lead_host_q16, p->host_hz);
-        }
-        const uint64_t carry_us = tab5_guest_pace_q16_to_us64(
-            p->r86_overflow_debt_q16, p->host_hz);
-        *effective_phase_us = visible_us - (int64_t)carry_us;
-    }
-    if (wait_suppressed) *wait_suppressed = p->r86_wait_suppressed;
-}
-
-void WinX68k_GuestPaceR87GetStats(uint32_t *q_min,
-                                  uint32_t *q_max,
-                                  uint32_t *q_final,
-                                  uint32_t *recovery_allowed,
-                                  uint32_t *hold_events,
-                                  uint32_t *resume_events,
-                                  uint32_t *active_frames,
-                                  uint32_t *held_frames,
-                                  uint32_t *defer_checks,
-                                  uint32_t *repay_paused_checks,
-                                  uint64_t *deferred_lag_us)
-{
-    const tab5_guest_pace_t * const p = &s_tab5_guest_pace;
-    if (q_min) *q_min = (p->r87_audio_q_min == UINT32_MAX) ? 0u : p->r87_audio_q_min;
-    if (q_max) *q_max = p->r87_audio_q_max;
-    if (q_final) *q_final = p->r87_audio_q_effective;
-    if (recovery_allowed) *recovery_allowed = p->r87_recovery_allowed;
-    if (hold_events) *hold_events = p->r87_hold_events;
-    if (resume_events) *resume_events = p->r87_resume_events;
-    if (active_frames) *active_frames = p->r87_active_frames;
-    if (held_frames) *held_frames = p->r87_held_frames;
-    if (defer_checks) *defer_checks = p->r87_defer_checks;
-    if (repay_paused_checks) *repay_paused_checks = p->r87_repay_paused_checks;
-    if (deferred_lag_us)
-        *deferred_lag_us = tab5_guest_pace_q16_to_us64(
-            p->r87_deferred_lag_q16, p->host_hz);
-}
+static inline void tab5_adpcm_preupdate_r127(uint32_t clock) { ADPCM_PreUpdate(clock); }
+static inline void tab5_midi_delayout_r127(unsigned int delay) { MIDI_DelayOut(delay); }
+static inline void tab5_midi_timer_r127(uint32_t clock) { MIDI_Timer(clock); }
 #endif
 
 int WinX68k_ExecVideoProbeFrame(void)
 {
 #ifdef HAVE_MUSASHI
-#ifdef ESP_PLATFORM
-    static int r57e70a_announced = 0;
-    if (!r57e70a_announced) {
-        r57e70a_announced = 1;
-        printf("PX68K_SCHED_R57E70A: adaptive idle scanline coalescing ACTIVE max=%d; MFP/DMA012 active path remains %d-cycle exact\n",
-               TAB5_R57E70A_IDLE_SLICE_MAX, CLOCK_SLICE);
-        printf("PX68K_DEVBOUND_R57E71: CPU scheduler boundary hot path ACTIVE; DMA012 idle calls eliminated + cached MFP B/C exact mode\n");
-        printf("PX68K_PACE_R57E80: governor accounting ACTIVE; wait/clamp/debt counters are one-shot readable, no periodic UART\n");
-        printf("PX68K_PACE_R57E86: overflow-debt carry ACTIVE; lag beyond bounded reservoir is preserved and repaid before any future pacing wait\n");
-        printf("PX68K_PACE_R57E87: audio-reserve-aware carry ACTIVE; recovery Q<=8192, hold Q>=16384; held lag is preserved, never discarded\n");
-        printf("PX68K_PACE_R57E88: mid-ring reservoir ACTIVE; 8K/16K hysteresis leaves >=16K host-ring headroom while covering measured ~124ms bursts\n");
-    }
-#endif
-    static int key_int_cnt = 0;
-    static int mouse_int_cnt = 0;
-    int clk_total;
-    int clkdiv;
     int total_executed = 0;
-    const int perf_sample = s_tab5_perf_sample;
-    int64_t perf_frame_start = 0;
-    uint64_t perf_cpu_us = 0;
-    uint64_t perf_compose_us = 0;
-    uint64_t perf_finalize_us = 0;
-    uint64_t perf_timer_us = 0;
-    uint64_t perf_dma_us = 0;
-    uint64_t perf_line_us = 0;
-    uint64_t perf_audio_timer_us = 0;
-    uint64_t perf_input_us = 0;
-    uint64_t perf_soundmix_us = 0;
-    uint64_t perf_fdd_us = 0;
-    uint64_t perf_mfp_us = 0;
-    uint64_t perf_rtc_us = 0;
-    uint64_t perf_edge_us = 0;
-    uint64_t perf_sched_us = 0;
-    uint64_t perf_adclk_us = 0;
-    uint64_t perf_opmclk_us = 0;
-    uint64_t perf_midi_us = 0;
-    uint64_t perf_post_us = 0;
 
-    if (perf_sample)
-        perf_frame_start = esp_timer_get_time();
+    /* P12R3 Production compatibility closure: restore the proven Build 5.97b
+     * standalone-frame RAM-size invariant.  Human68k/SWITCH-era software may
+     * rewrite the persistent SRAM RAM-size field after reset.  The generic
+     * PX68K executor revalidates $ED0008 every frame; the standalone product
+     * executor had lost that check during later cleanup.  Keep the product RAM
+     * fixed at the already-backed 12 MiB and repair SRAM only on mismatch.
+     * This is one dword read/compare per guest frame and never waits CPU0. */
+    enum { TAB5_PRODUCT_RAM_BYTES = 12 * 1024 * 1024 };
+    if (__builtin_expect(Config.ram_size != TAB5_PRODUCT_RAM_BYTES, 0))
+        Config.ram_size = TAB5_PRODUCT_RAM_BYTES;
+    if (__builtin_expect(cpu_readmem24_dword(0xED0008) != (uint32_t)TAB5_PRODUCT_RAM_BYTES, 0))
+    {
+        cpu_writemem24(0xE8E00D, 0x31); /* SRAM write permission */
+        cpu_writemem24_dword(0xED0008, (uint32_t)TAB5_PRODUCT_RAM_BYTES);
+    }
 
-    /* Standalone equivalent of the timing-critical parts of WinX68k_Exec(). */
     FDD_IsReading = 0;
 
-    if (Config.clockmhz <= 0)
-        Config.clockmhz = 10;
-    if (Config.ram_size <= 0)
-        Config.ram_size = 12 * 1024 * 1024;
-
-    if (cpu_readmem24_dword(0xED0008) != (uint32_t)Config.ram_size)
-    {
-        cpu_writemem24(0xE8E00D, 0x31);
-        cpu_writemem24_dword(0xED0008, Config.ram_size);
-    }
-
-    clk_total = (CRTC_Regs[0x29] & 0x10) ? VSYNC_HIGH : VSYNC_NORM;
-    clk_total = (clk_total * Config.clockmhz) / 10;
-    clkdiv = Config.clockmhz;
-
-    if (clk_total <= 0)
-        clk_total = VSYNC_NORM;
-    if (clkdiv <= 0)
-        clkdiv = 10;
+    /* X68K Tab P12C1: this entry point is the standalone product executor.
+     * The guest 68000 is fixed at 12 MHz while MFP/RTC/DMA/audio remain in
+     * PX68K's exact historical 10 MHz peripheral-time domain. */
+    int clk_total = (CRTC_Regs[0x29] & 0x10) ? VSYNC_HIGH : VSYNC_NORM;
+    clk_total = (clk_total * 12) / 10;
 
     const int total_lines = (VLINE_TOTAL > 0) ? VLINE_TOTAL : 567;
-
-    /* Build 5.64: distribute one frame's CPU clocks across scanlines without
-     * the two signed 64-bit multiply/divides previously done for every line.
-     * base/rem + a Bresenham-style remainder accumulator is mathematically
-     * identical to floor(clk_total*(line+1)/N)-floor(clk_total*line/N). */
     const int line_clk_base = clk_total / total_lines;
-    const int line_clk_rem  = clk_total % total_lines;
+    const int line_clk_rem = clk_total % total_lines;
+    const int key_int_period = total_lines / 4;
+    const int mouse_int_period = total_lines / 8;
     int line_clk_error = 0;
-
-    /*
-     * Build 5.3: keep PX68K's global ICount in step with the standalone
-     * Musashi scheduler.  MFP GetGPIP() derives the horizontal sync level
-     * from ICount % HSYNC_CLK.  The earlier standalone loop never changed
-     * ICount, so guest code polling MFP GPIP could see HSYNC permanently
-     * stuck.  Human68k's text-console scroll path synchronizes before the
-     * CRTC raster-copy sequence, which explains a full screen followed by
-     * RC=0 and an apparently dead console.
-     *
-     * Native WinX68k_Exec() adds one frame of clocks to ICount and consumes
-     * it as the CPU runs.  This standalone loop already schedules an exact
-     * frame, so start at the frame budget and consume the same executed
-     * cycles below.
-     */
     ICount = clk_total;
 
-#define TAB5_PERF_DRAWLINE() do { \
-        if (perf_sample) { \
-            uint32_t _t0 = tab5_perf_ccount(); \
-            WinDraw_DrawLine(); \
-            perf_compose_us += (uint32_t)(tab5_perf_ccount() - _t0); \
-        } else { \
-            WinDraw_DrawLine(); \
-        } \
-    } while (0)
+    /* R140P2: host config cannot change inside a guest frame.  The old generic
+     * executor recomputed MIDI delay and reloaded the volatile render flag on
+     * every scanline (~567 times/frame). */
+    const unsigned int midi_delay = (unsigned int)(
+        Config.MIDIAutoDelay ? (Config.BufferSize * 5) : Config.MIDIDelay);
+    const int host_render_enabled = s_tab5_host_render_enabled;
 
-    for (int line = 0; line < total_lines; ++line)
-    {
+    for (int line = 0; line < total_lines; ++line) {
         int clk_line = 0;
+        /* A3 correctness fix retained: legacy Timer-A helper consumes vline. */
         vline = (uint32_t)line;
-
-        uint32_t perf_edge_t0 = perf_sample ? tab5_perf_ccount() : 0u;
-        /* Beginning of scanline: same MFP edges as native PX68K. */
-        MFP_Int(0);
-
-        if ((vline >= CRTC_VSTART) && (vline < CRTC_VEND))
-            VLINE = ((vline - CRTC_VSTART) * CRTC_VStep) / 2;
-        else
-            VLINE = (uint32_t)-1;
-
-        if (!(MFP[MFP_AER] & 0x40) && (vline == CRTC_IntLine))
-            MFP_Int(1);
-
-        if (MFP[MFP_AER] & 0x10)
-        {
-            if (vline == CRTC_VSTART)
-                MFP_Int(9);
-        }
-        else
-        {
-            if (CRTC_VEND >= total_lines)
-            {
-                if ((long)vline == (long)(CRTC_VEND - total_lines))
-                    MFP_Int(9);
-            }
-            else if ((long)vline == (long)(total_lines - 1))
-            {
-                MFP_Int(9);
-            }
-        }
-
-        int remaining = line_clk_base;
+        int line_cpu_cycles = line_clk_base;
         line_clk_error += line_clk_rem;
-        if (line_clk_error >= total_lines)
-        {
+        if (line_clk_error >= total_lines) {
             line_clk_error -= total_lines;
-            ++remaining;
+            ++line_cpu_cycles;
         }
-        if (perf_sample)
-            perf_edge_us += (uint32_t)(tab5_perf_ccount() - perf_edge_t0);
+        total_executed += m68k_tab5_x68p4_machine_run_scanline(
+            (uint32_t)line, (uint32_t)total_lines, line_cpu_cycles,
+            midi_delay, &clk_line);
 
-        while (remaining > 0)
-        {
-            const uint32_t perf_iter_t0 = perf_sample ? tab5_perf_ccount() : 0u;
-            uint32_t perf_cpu_cc = 0u, perf_mfp_cc = 0u, perf_rtc_cc = 0u, perf_dma_cc = 0u;
-            int request = tab5_r57e70a_slice_request(remaining);
-            int executed;
-            if (perf_sample)
-            {
-                uint32_t t0 = tab5_perf_ccount();
-                executed = m68k_execute(request);
-                perf_cpu_cc = (uint32_t)(tab5_perf_ccount() - t0);
-                perf_cpu_us += perf_cpu_cc;
-            }
-            else
-            {
-                executed = m68k_execute(request);
-            }
-
-            if (executed <= 0)
-                executed = request;
-
-            total_executed += executed;
-            remaining -= executed;
-            if (remaining < 0)
-                remaining = 0;
-
-            /* Match native PX68K timing state used by MFP GetGPIP(). */
-            ICount -= executed;
-            if (ICount < 0)
-                ICount = 0;
-
-            /* Build 5.64: the normal X68000 10 MHz configuration maps CPU
-             * clocks 1:1 onto PX68K's 10 MHz peripheral timebase.  For any
-             * legal residual ClkUsed (0..9), the old multiply/divide sequence
-             * produces exactly usedclk=executed and leaves the residual intact.
-             * Keep the generic converter for 16/24 MHz modes and unusual
-             * restored state. */
-            int usedclk;
-            if (__builtin_expect(clkdiv == 10 && (unsigned)ClkUsed < 10u, 1))
-            {
-                usedclk = executed;
-            }
-            else
-            {
-                ClkUsed += executed * 10;
-                usedclk = ClkUsed / clkdiv;
-                ClkUsed -= usedclk * clkdiv;
-            }
-            clk_line += usedclk;
-
-            if (perf_sample)
-            {
-                uint32_t t0 = tab5_perf_ccount();
-                MFP_Timer(usedclk);
-                perf_mfp_cc = (uint32_t)(tab5_perf_ccount() - t0);
-                perf_mfp_us += perf_mfp_cc;
-
-                t0 = tab5_perf_ccount();
-                RTC_Timer(usedclk);
-                perf_rtc_cc = (uint32_t)(tab5_perf_ccount() - t0);
-                perf_rtc_us += perf_rtc_cc;
-                perf_timer_us += (uint64_t)perf_mfp_cc + perf_rtc_cc;
-
-                t0 = tab5_perf_ccount();
-                DMA_ExecActive012();
-                perf_dma_cc = (uint32_t)(tab5_perf_ccount() - t0);
-                perf_dma_us += perf_dma_cc;
-
-                const uint32_t iter_cc = (uint32_t)(tab5_perf_ccount() - perf_iter_t0);
-                const uint32_t known_cc = perf_cpu_cc + perf_mfp_cc + perf_rtc_cc + perf_dma_cc;
-                if (iter_cc > known_cc)
-                    perf_sched_us += (uint32_t)(iter_cc - known_cc);
-            }
-            else
-            {
-                MFP_Timer(usedclk);
-                RTC_Timer(usedclk);
-                DMA_ExecActive012();
-            }
-#ifdef ESP_PLATFORM
-            /* Pace only after CPU + same-slice device time have both advanced. */
-            tab5_guest_pace_after_slice(executed);
-#endif
-        }
-
-        if (perf_sample)
-        {
-            uint32_t t0 = tab5_perf_ccount();
-            MIDI_DelayOut((Config.MIDIAutoDelay) ? (Config.BufferSize * 5) : Config.MIDIDelay);
-            MFP_TimerA();
-            if ((MFP[MFP_AER] & 0x40) && (vline == CRTC_IntLine))
-                MFP_Int(1);
-            perf_line_us += (uint32_t)(tab5_perf_ccount() - t0);
-        }
-        else
-        {
-            MIDI_DelayOut((Config.MIDIAutoDelay) ? (Config.BufferSize * 5) : Config.MIDIDelay);
-            MFP_TimerA();
-            if ((MFP[MFP_AER] & 0x40) && (vline == CRTC_IntLine))
-                MFP_Int(1);
-        }
-
-        if (s_tab5_host_render_enabled &&
-            (vline >= CRTC_VSTART) && (vline < CRTC_VEND))
-        {
-            if (CRTC_VStep == 1)
-            {
-                if (vline & 1U)
-                    TAB5_PERF_DRAWLINE();
-            }
-            else if (CRTC_VStep == 4)
-            {
-                TAB5_PERF_DRAWLINE();
-                VLINE++;
-                TAB5_PERF_DRAWLINE();
-            }
-            else
-            {
-                TAB5_PERF_DRAWLINE();
+        if (host_render_enabled &&
+            ((uint32_t)line >= CRTC_VSTART) && ((uint32_t)line < CRTC_VEND)) {
+            if (CRTC_VStep == 1) {
+                if (((uint32_t)line) & 1U) WinDraw_DrawLine();
+            } else if (CRTC_VStep == 4) {
+                WinDraw_DrawLine(); VLINE++; WinDraw_DrawLine();
+            } else {
+                WinDraw_DrawLine();
             }
         }
 
-        /* Native PX68K device time progression. */
-        if (perf_sample)
-        {
-            uint32_t t0 = tab5_perf_ccount();
-            ADPCM_PreUpdate(clk_line);
-            uint32_t cc = (uint32_t)(tab5_perf_ccount() - t0);
-            perf_adclk_us += cc;
-            perf_audio_timer_us += cc;
-
-            t0 = tab5_perf_ccount();
-            OPM_Timer(clk_line);
-            cc = (uint32_t)(tab5_perf_ccount() - t0);
-            perf_opmclk_us += cc;
-            perf_audio_timer_us += cc;
-
-            t0 = tab5_perf_ccount();
-            MIDI_Timer(clk_line);
-            cc = (uint32_t)(tab5_perf_ccount() - t0);
-            perf_midi_us += cc;
-            perf_audio_timer_us += cc;
-        }
-        else
-        {
-            ADPCM_PreUpdate(clk_line);
-            OPM_Timer(clk_line);
-            MIDI_Timer(clk_line);
-        }
-
-        if (perf_sample)
-        {
-            uint32_t t0 = tab5_perf_ccount();
-            if (++key_int_cnt > (total_lines / 4))
-            {
-                key_int_cnt = 0;
-                Keyboard_Int();
-            }
-            if (++mouse_int_cnt > (total_lines / 8))
-            {
-                mouse_int_cnt = 0;
-                SCC_IntCheck();
-            }
-            perf_input_us += (uint32_t)(tab5_perf_ccount() - t0);
-        }
-        else
-        {
-            if (++key_int_cnt > (total_lines / 4))
-            {
-                key_int_cnt = 0;
-                Keyboard_Int();
-            }
-            if (++mouse_int_cnt > (total_lines / 8))
-            {
-                mouse_int_cnt = 0;
-                SCC_IntCheck();
-            }
-        }
-
-        /* Build 5.13: this native PX68K call was the missing standalone
-         * audio-production step.  It mixes OPM + ADPCM into dswin's 44.1 kHz
-         * stereo PCM ring according to emulated clock progress. */
-        if (perf_sample)
-        {
-            uint32_t t0 = tab5_perf_ccount();
-            DSound_Send0(clk_line);
-            perf_soundmix_us += (uint32_t)(tab5_perf_ccount() - t0);
-        }
-        else
-        {
-            DSound_Send0(clk_line);
-        }
+        m68k_tab5_x68p4_machine_finish_scanline(clk_line,
+                                                  key_int_period,
+                                                  mouse_int_period);
+        DSound_Send0(clk_line);
     }
 
-    uint32_t perf_post_t0 = perf_sample ? tab5_perf_ccount() : 0u;
     vline = 0;
-
-    if (CRTC_Mode & 2)
-    {
-        if (CRTC_FastClr)
-        {
+    if (CRTC_Mode & 2) {
+        if (CRTC_FastClr) {
             CRTC_FastClr--;
-            if (!CRTC_FastClr)
-                CRTC_Mode &= 0xFD;
-        }
-        else
-        {
+            if (!CRTC_FastClr) CRTC_Mode &= 0xFD;
+        } else {
             CRTC_FastClr = (CRTC_Regs[0x29] & 0x10) ? 1 : 2;
             TVRAM_SetAllDirtyReason(TAB5_DIRTY_ALL_FASTCLR);
             GVRAM_FastClear();
         }
     }
-    if (perf_sample)
-        perf_post_us += (uint32_t)(tab5_perf_ccount() - perf_post_t0);
-
-    /* Build 5.19: render any PCM still pending at the emulated frame boundary. */
-    if (perf_sample)
-    {
-        uint32_t t0 = tab5_perf_ccount();
-        DSound_FlushPending();
-        perf_soundmix_us += (uint32_t)(tab5_perf_ccount() - t0);
-    }
-    else
-    {
-        DSound_FlushPending();
-    }
-
-    if (perf_sample)
-    {
-        uint32_t t0 = tab5_perf_ccount();
-        FDD_SetFDInt();
-        perf_fdd_us = (uint32_t)(tab5_perf_ccount() - t0);
-    }
-    else
-    {
-        FDD_SetFDInt();
-    }
-
-    if (perf_sample)
-    {
-        uint32_t t0 = tab5_perf_ccount();
-        if (s_tab5_host_render_enabled)
-            WinDraw_Draw();
-        perf_finalize_us = (uint32_t)(tab5_perf_ccount() - t0);
-
-        s_tab5_perf_cpu_us = tab5_perf_cycles_to_us(perf_cpu_us);
-        s_tab5_perf_compose_us = tab5_perf_cycles_to_us(perf_compose_us);
-        s_tab5_perf_finalize_us = tab5_perf_cycles_to_us(perf_finalize_us);
-        s_tab5_perf_timer_us = tab5_perf_cycles_to_us(perf_timer_us);
-        s_tab5_perf_dma_us = tab5_perf_cycles_to_us(perf_dma_us);
-        s_tab5_perf_line_us = tab5_perf_cycles_to_us(perf_line_us);
-        s_tab5_perf_audio_timer_us = tab5_perf_cycles_to_us(perf_audio_timer_us);
-        s_tab5_perf_input_us = tab5_perf_cycles_to_us(perf_input_us);
-        s_tab5_perf_soundmix_us = tab5_perf_cycles_to_us(perf_soundmix_us);
-        s_tab5_perf_fdd_us = tab5_perf_cycles_to_us(perf_fdd_us);
-        s_tab5_perf_mfp_us = tab5_perf_cycles_to_us(perf_mfp_us);
-        s_tab5_perf_rtc_us = tab5_perf_cycles_to_us(perf_rtc_us);
-        s_tab5_perf_edge_us = tab5_perf_cycles_to_us(perf_edge_us);
-        s_tab5_perf_sched_us = tab5_perf_cycles_to_us(perf_sched_us);
-        s_tab5_perf_adclk_us = tab5_perf_cycles_to_us(perf_adclk_us);
-        s_tab5_perf_opmclk_us = tab5_perf_cycles_to_us(perf_opmclk_us);
-        s_tab5_perf_midi_us = tab5_perf_cycles_to_us(perf_midi_us);
-        s_tab5_perf_post_us = tab5_perf_cycles_to_us(perf_post_us);
-        s_tab5_perf_frame_us = (uint32_t)(esp_timer_get_time() - perf_frame_start);
-    }
-    else if (s_tab5_host_render_enabled)
-    {
-        WinDraw_Draw();
-    }
-
-#undef TAB5_PERF_DRAWLINE
-
+    DSound_FlushPending();
+    m68k_tab5_x68p4_machine_frame_end();
+    if (host_render_enabled) WinDraw_Draw();
     return total_executed;
 #else
     return 0;
@@ -4428,6 +3358,22 @@ int WinX68k_MountFloppy(int drive, const char *path)
      * libretro disk-control insertion.
      */
     FDD_SetFD(drive, Config.FDDImage[drive], flash_human ? 1 : 0);
+
+    /*
+     * R57E107Xc: Flash Human68k is fixed boot media, not a physically inserted
+     * removable disk. The historical FDD backend gives every insertion a
+     * three-frame SetDelay. At XVI 16 MHz the IPL can outrun that synthetic
+     * delay, so expire it only for the dedicated flash boot image before the
+     * first guest instruction. Ordinary SD floppy/hot-swap timing is unchanged.
+     */
+    if (flash_human)
+    {
+        FDD_SetFDInt();
+        FDD_SetFDInt();
+        FDD_SetFDInt();
+        printf("PX68K_FDD107XC: Flash Human boot media pre-ready ready=%d clock=%dMHz\n",
+               FDD_IsReady(drive), Config.clockmhz);
+    }
 
     /*
      * FDD_SetFD() itself returns void.

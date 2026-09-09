@@ -167,6 +167,7 @@ extern "C" void tab5_media_ui_draw_setup(const tab5_media_ui_setup_view_t *view)
 {
     if (!view) return;
     const bool fdd0_boot = view->boot_source == TAB5_LAUNCH_BOOT_FLOPPY0;
+    const bool fdd1_boot = view->boot_source == TAB5_LAUNCH_BOOT_FLOPPY1;
     const bool hdd0_boot = view->boot_source == TAB5_LAUNCH_BOOT_HDD0;
 
     M5.Display.fillScreen(TFT_BLACK);
@@ -183,9 +184,9 @@ extern "C" void tab5_media_ui_draw_setup(const tab5_media_ui_setup_view_t *view)
      * self-explanatory from their grey treatment; tiny per-row debug/help
      * captions were removed from the release UI. */
     draw_setup_row(76,  "FLOPPY 0", view->floppy0, fdd0_boot, true, true, nullptr);
-    draw_setup_row(146, "FLOPPY 1", view->floppy1, false, false, true, nullptr);
-    draw_setup_row(216, "FLOPPY 2", "", false, false, false, nullptr);
-    draw_setup_row(286, "FLOPPY 3", "", false, false, false, nullptr);
+    draw_setup_row(146, "FLOPPY 1", view->floppy1, fdd1_boot, true, true, nullptr);
+    draw_setup_row(216, "MONITOR", "MULTISCAN AUTO   15 / 24 / 31 kHz", false, false, false, nullptr);
+    draw_setup_row(286, "SYSTEM", "Standard 12 MHz   Audio 44.1 kHz", false, false, false, nullptr);
     draw_setup_row(356, "HDD 0", view->hdd0, hdd0_boot, true, true, nullptr);
 
     const uint16_t lfill = view->bottom_left_enabled ? 0x1948 : 0x18E3;
@@ -311,7 +312,7 @@ extern "C" tab5_media_ui_setup_hit_t tab5_media_ui_setup_hit(int x, int y)
     if (inside(x, y, 24, 76, 80, 64)) return TAB5_MEDIA_UI_SETUP_BOOT_FDD0;
     if (inside(x, y, 24, 146, 80, 64)) return TAB5_MEDIA_UI_SETUP_BOOT_FDD1;
     if (inside(x, y, 24, 216, 1232, 64) || inside(x, y, 24, 286, 1232, 64))
-        return TAB5_MEDIA_UI_SETUP_DISABLED_FDD23;
+        return TAB5_MEDIA_UI_SETUP_NONE;
     if (inside(x, y, 24, 356, 80, 64)) return TAB5_MEDIA_UI_SETUP_BOOT_HDD0;
     if (inside(x, y, 1040, 85, 180, 46)) return TAB5_MEDIA_UI_SETUP_CHANGE_FDD0;
     if (inside(x, y, 1040, 155, 180, 46)) return TAB5_MEDIA_UI_SETUP_CHANGE_FDD1;

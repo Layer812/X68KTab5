@@ -5,9 +5,6 @@
  */
 #include "tab5_usb_keyboard.h"
 
-#ifndef PX68K_TAB5_RELEASE_DIAGNOSTICS
-#define PX68K_TAB5_RELEASE_DIAGNOSTICS 0
-#endif
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -72,14 +69,8 @@ static uint8_t s_prev_modifier = 0;
 static uint8_t s_prev_keys[TAB5_USB_BOOT_KEYS];
 
 static uint32_t s_connected = 0;
-static uint32_t s_key_events = 0;
-static uint32_t s_reports = 0;
 static uint32_t s_mouse_connected = 0;
-static uint32_t s_mouse_events = 0;
 static uint32_t s_joypad_connected = 0;
-static uint32_t s_joypad_reports = 0;
-static uint32_t s_joypad_events = 0;
-static uint32_t s_joypad_recognized = 0;
 static uint32_t s_hotkeys = 0;
 static esp_err_t s_usb_install_result = ESP_FAIL;
 
@@ -229,7 +220,6 @@ static int pad_install_known_8byte_profile(const uint8_t *data, size_t length)
     memcpy(s_pad.button_mask, button_mask, sizeof(button_mask));
     s_pad.learning_ready = false;
     pad_profile_capture();
-    __atomic_store_n(&s_joypad_recognized, 1u, __ATOMIC_RELEASE);
     ESP_LOGI(TAG,
              "USB PAD known 8-byte profile APPLIED: A/B/C + upper A/B/C + L/R fixed; reconnect-safe");
     return 1;
@@ -353,7 +343,6 @@ static void pad_learn_buttons(const uint8_t *data, size_t length)
                         ESP_LOGI(TAG, "USB PAD learned %s: byte=%u mask=%02X",
                                  labels[b], (unsigned)i, (unsigned)mask);
                     }
-                    __atomic_store_n(&s_joypad_recognized, 1u, __ATOMIC_RELEASE);
                     pad_profile_capture();
                     break;
                 }
@@ -433,8 +422,6 @@ static void process_generic_joypad_report(const uint8_t *data, size_t length)
     if (!data || !length || length > TAB5_USB_PAD_REPORT_MAX)
         return;
 
-    __atomic_add_fetch(&s_joypad_reports, 1u, __ATOMIC_RELAXED);
-
     if (!s_pad.neutral_valid || s_pad.report_len != length)
     {
         /* A transient disconnect can deliver the first report with a button or
@@ -446,7 +433,6 @@ static void process_generic_joypad_report(const uint8_t *data, size_t length)
             joy = pad_decode_state(data, length);
             s_pad.last_joy = joy;
             if (s_pad.axis_x >= 0 || s_pad.hat >= 0 || pad_learned_button_count())
-                __atomic_store_n(&s_joypad_recognized, 1u, __ATOMIC_RELEASE);
             (void)tab5_guest_input_queue_joypad(joy);
             return;
         }
@@ -471,7 +457,6 @@ static void process_generic_joypad_report(const uint8_t *data, size_t length)
         pad_log_raw(data, length);
         pad_discover_layout(data, length);
         if (s_pad.axis_x >= 0 || s_pad.hat >= 0)
-            __atomic_store_n(&s_joypad_recognized, 1u, __ATOMIC_RELEASE);
         (void)tab5_guest_input_queue_joypad(0);
         return;
     }
@@ -496,7 +481,6 @@ static void process_generic_joypad_report(const uint8_t *data, size_t length)
     if (joy != s_pad.last_joy)
     {
         s_pad.last_joy = joy;
-        __atomic_add_fetch(&s_joypad_events, 1u, __ATOMIC_RELAXED);
         (void)tab5_guest_input_queue_joypad(joy);
 #if PX68K_TAB5_INPUT_TRACE
         ESP_LOGI(TAG, "USB PAD -> X68000 JOY1 state=%04X%s%s%s%s%s%s%s%s%s%s%s%s",
@@ -563,8 +547,7 @@ static void queue_retro_event(uint32_t retro_key, int pressed)
     if (retro_key == RETROK_UNKNOWN)
         return;
 
-    if (tab5_guest_input_queue_key(retro_key, pressed))
-        __atomic_add_fetch(&s_key_events, 1u, __ATOMIC_RELAXED);
+    (void)tab5_guest_input_queue_key(retro_key, pressed);
 }
 
 static void release_previous_report(void)
@@ -599,8 +582,6 @@ static void process_boot_keyboard_report(const uint8_t *data, size_t length)
 
     modifier = data[0];
     keys = &data[2];
-
-    __atomic_add_fetch(&s_reports, 1u, __ATOMIC_RELAXED);
 
     /* Release ordinary keys that disappeared from the six-key array. */
     for (i = 0; i < TAB5_USB_BOOT_KEYS; ++i)
@@ -656,8 +637,7 @@ static void process_boot_mouse_report(const uint8_t *data, size_t length)
     dx = (int)(int8_t)data[1];
     dy = (int)(int8_t)data[2];
 
-    if (tab5_guest_input_queue_mouse(dx, dy, buttons))
-        __atomic_add_fetch(&s_mouse_events, 1u, __ATOMIC_RELAXED);
+    (void)tab5_guest_input_queue_mouse(dx, dy, buttons);
 }
 
 static void hid_interface_callback(hid_host_device_handle_t handle,
@@ -720,7 +700,6 @@ static void hid_interface_callback(hid_host_device_handle_t handle,
             {
                 (void)tab5_guest_input_queue_joypad(0);
                 __atomic_store_n(&s_joypad_connected, 0u, __ATOMIC_RELEASE);
-                __atomic_store_n(&s_joypad_recognized, 0u, __ATOMIC_RELEASE);
                 s_joypad_handle = NULL;
                 pad_live_reset(); /* keep s_pad_profile across re-enumeration */
                 kind = "JoyPAD candidate";
@@ -768,15 +747,6 @@ static void hid_driver_callback(hid_host_device_handle_t handle,
 
 static void usb_control_task(void *arg)
 {
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-    {
-        const uintptr_t r56k5_base = (uintptr_t)pxTaskGetStackStart(NULL);
-        esp_rom_printf("R56K5_TASKSELF name=tab5_usb_ctl core=%d base=0x%08x top=0x%08x bytes=4096 hwm=%u\\n",
-                       (int)xPortGetCoreID(), (unsigned)r56k5_base,
-                       (unsigned)(r56k5_base + 4096u),
-                       (unsigned)uxTaskGetStackHighWaterMark(NULL));
-    }
-#endif
 
     usb_ctrl_event_t ctrl;
     (void)arg;
@@ -884,7 +854,6 @@ static void usb_control_task(void *arg)
                 pad_live_reset(); /* first input report restores compatible learned profile */
                 s_joypad_handle = ctrl.handle;
                 __atomic_store_n(&s_joypad_connected, 1u, __ATOMIC_RELEASE);
-                __atomic_store_n(&s_joypad_recognized, 0u, __ATOMIC_RELEASE);
                 (void)tab5_guest_input_queue_joypad(0);
                 ESP_LOGI(TAG,
                          "USB HID Generic interface CONNECTED: gamepad candidate (raw auto-map enabled)");
@@ -901,15 +870,6 @@ static void usb_control_task(void *arg)
 
 static void usb_library_task(void *arg)
 {
-#if PX68K_TAB5_RELEASE_DIAGNOSTICS
-    {
-        const uintptr_t r56k5_base = (uintptr_t)pxTaskGetStackStart(NULL);
-        esp_rom_printf("R56K5_TASKSELF name=tab5_usb_lib core=%d base=0x%08x top=0x%08x bytes=4096 hwm=%u\\n",
-                       (int)xPortGetCoreID(), (unsigned)r56k5_base,
-                       (unsigned)(r56k5_base + 4096u),
-                       (unsigned)uxTaskGetStackHighWaterMark(NULL));
-    }
-#endif
 
     TaskHandle_t starter = (TaskHandle_t)arg;
     const usb_host_config_t config = {
@@ -960,14 +920,8 @@ int tab5_usb_keyboard_start(void)
     esp_err_t err;
 
     __atomic_store_n(&s_connected, 0u, __ATOMIC_RELAXED);
-    __atomic_store_n(&s_key_events, 0u, __ATOMIC_RELAXED);
-    __atomic_store_n(&s_reports, 0u, __ATOMIC_RELAXED);
     __atomic_store_n(&s_mouse_connected, 0u, __ATOMIC_RELAXED);
-    __atomic_store_n(&s_mouse_events, 0u, __ATOMIC_RELAXED);
     __atomic_store_n(&s_joypad_connected, 0u, __ATOMIC_RELAXED);
-    __atomic_store_n(&s_joypad_reports, 0u, __ATOMIC_RELAXED);
-    __atomic_store_n(&s_joypad_events, 0u, __ATOMIC_RELAXED);
-    __atomic_store_n(&s_joypad_recognized, 0u, __ATOMIC_RELAXED);
     __atomic_store_n(&s_hotkeys, 0u, __ATOMIC_RELAXED);
     s_keyboard_handle = NULL;
     s_mouse_handle = NULL;
@@ -1067,53 +1021,24 @@ int tab5_usb_keyboard_connected(void)
     return __atomic_load_n(&s_connected, __ATOMIC_ACQUIRE) ? 1 : 0;
 }
 
-uint32_t tab5_usb_keyboard_event_count(void)
-{
-    return __atomic_load_n(&s_key_events, __ATOMIC_RELAXED);
-}
 
-uint32_t tab5_usb_keyboard_report_count(void)
-{
-    return __atomic_load_n(&s_reports, __ATOMIC_RELAXED);
-}
 
 int tab5_usb_mouse_connected(void)
 {
     return __atomic_load_n(&s_mouse_connected, __ATOMIC_ACQUIRE) ? 1 : 0;
 }
 
-uint32_t tab5_usb_mouse_event_count(void)
-{
-    return __atomic_load_n(&s_mouse_events, __ATOMIC_RELAXED);
-}
 
 int tab5_usb_joypad_connected(void)
 {
     return __atomic_load_n(&s_joypad_connected, __ATOMIC_ACQUIRE) ? 1 : 0;
 }
 
-int tab5_usb_joypad_recognized(void)
-{
-    return __atomic_load_n(&s_joypad_recognized, __ATOMIC_ACQUIRE) ? 1 : 0;
-}
 
-uint32_t tab5_usb_joypad_report_count(void)
-{
-    return __atomic_load_n(&s_joypad_reports, __ATOMIC_RELAXED);
-}
 
-uint32_t tab5_usb_joypad_event_count(void)
-{
-    return __atomic_load_n(&s_joypad_events, __ATOMIC_RELAXED);
-}
 
 uint32_t tab5_usb_keyboard_take_hotkeys(void)
 {
     return __atomic_exchange_n(&s_hotkeys, 0u, __ATOMIC_ACQ_REL);
 }
 
-void tab5_usb_keyboard_stack_highwater(uint32_t *lib_bytes, uint32_t *ctl_bytes)
-{
-    if (lib_bytes) *lib_bytes = s_usb_lib_task ? (uint32_t)uxTaskGetStackHighWaterMark(s_usb_lib_task) : 0u;
-    if (ctl_bytes) *ctl_bytes = s_usb_ctl_task ? (uint32_t)uxTaskGetStackHighWaterMark(s_usb_ctl_task) : 0u;
-}

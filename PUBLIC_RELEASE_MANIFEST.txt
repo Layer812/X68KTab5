@@ -1,0 +1,13 @@
+X68K Tab public release folder
+Source: G:\px68k-tab5
+Destination: G:\X68KTab5
+Latest M5Burner Share Code: wUgYltOEbYF7mrBn
+
+Whitelisted directories:
+  boards
+  components
+  lp_source
+  managed_components\espressif__usb_host_hid
+  src
+
+Private/proprietary ROM, Human68k and user disk images are excluded.

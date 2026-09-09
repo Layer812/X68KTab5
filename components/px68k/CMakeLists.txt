@@ -9,7 +9,6 @@ set(PX68K_C_SOURCES
     # ------------------------------------------------------------
     m68000/musashi/m68kcpu.c
     m68000/musashi/m68kops.c
-    m68000/musashi/tab5_xespv_copy64.S
     m68000/musashi/softfloat/softfloat.c
 
     # ------------------------------------------------------------
@@ -106,7 +105,7 @@ idf_component_register(
         "px68k_ext_ram.lf"
 
     WHOLE_ARCHIVE
-)
+    PRIV_REQUIRES\n        esp_timer\n\n)
 if(NOT CONFIG_SPIRAM)
     message(FATAL_ERROR
         "PX68K: CONFIG_SPIRAM is OFF - PSRAM is required")
@@ -125,15 +124,15 @@ endif()
 message(STATUS "PX68K: PSRAM enabled")
 message(STATUS "PX68K: external BSS enabled")
 
-# PX68K Makefile.common ï¿½Ì•Wï¿½ï¿½ Musashi ï¿½\ï¿½ï¿½
+# PX68K Makefile.common ¿½Ì•W¿½¿½ Musashi ¿½\¿½¿½
 target_compile_definitions(
     ${COMPONENT_LIB}
     PRIVATE
         HAVE_MUSASHI=1
 )
 
-# ï¿½Ã‚ï¿½C++ï¿½Rï¿½[ï¿½hï¿½ï¿½ESP-IDF/GCC 14ï¿½Å‚Ü‚ï¿½ï¿½Ê‚ï¿½ï¿½ï¿½ï¿½ßB
-# ï¿½Kï¿½vï¿½È‰Óï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Åï¿½ï¿½í‰»ï¿½ï¿½ï¿½ï¿½B
+# ¿½Ã‚ï¿½C++¿½R¿½[¿½h¿½¿½ESP-IDF/GCC 14¿½Å‚Ü‚ï¿½¿½Ê‚ï¿½¿½¿½¿½ßB
+# ¿½K¿½v¿½È‰Óï¿½¿½¿½¿½¿½¿½¿½Åï¿½¿½í‰»¿½¿½¿½¿½B
 target_compile_options(
     ${COMPONENT_LIB}
     PRIVATE
@@ -144,3 +143,6 @@ target_compile_options(
 # Diagnostics remain visible; only promotion to errors is disabled for known migration warnings.
 target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-error=stringop-truncation -Wno-error=format-truncation -Wno-error=maybe-uninitialized -Wno-error=multistatement-macros -Wno-error=shift-count-overflow -Wno-error=overflow -Wno-error=deprecated-declarations -Wno-error=discarded-qualifiers -Wno-error=incompatible-pointer-types -Wno-error=int-conversion)
 
+
+# P12R1 Production Quiet: suppress raw PX68K stdout diagnostics at compile time.
+target_compile_options(${COMPONENT_LIB} PRIVATE "-include${CMAKE_CURRENT_LIST_DIR}/product_quiet.h")

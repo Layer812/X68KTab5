@@ -198,7 +198,8 @@ static bool select_media(const MediaList &list, SlotKind slot, char *out_path, s
 static void draw_setup(const tab5_launcher_config_t &cfg)
 {
     const bool can_boot = (cfg.boot_source == TAB5_LAUNCH_BOOT_HDD0) ? (cfg.hdd0[0] != '\0')
-                                                                  : (cfg.floppy0[0] != '\0');
+                        : (cfg.boot_source == TAB5_LAUNCH_BOOT_FLOPPY1) ? (cfg.floppy1[0] != '\0')
+                                                                       : (cfg.floppy0[0] != '\0');
     tab5_media_ui_setup_view_t view = {};
     view.back_label = nullptr;
     view.header_note = "FDD0 / FDD1 / HDD0 media selection";
@@ -261,7 +262,8 @@ static bool setup_screen(const MediaList &list, tab5_launcher_config_t &cfg)
                 draw_setup(cfg);
                 break;
             case TAB5_MEDIA_UI_SETUP_BOOT_FDD1:
-                toast("FLOPPY 1 boot selector", "Media mount works; explicit boot source is not wired yet.");
+                if (!cfg.floppy1[0]) toast("FLOPPY 1 boot", "Select an XDF/DIM image with CHANGE first.");
+                else cfg.boot_source = TAB5_LAUNCH_BOOT_FLOPPY1;
                 draw_setup(cfg);
                 break;
             case TAB5_MEDIA_UI_SETUP_DISABLED_FDD23:
@@ -293,13 +295,16 @@ static bool setup_screen(const MediaList &list, tab5_launcher_config_t &cfg)
                 return false;
             case TAB5_MEDIA_UI_SETUP_BOTTOM_RIGHT: {
                 const bool hdd_boot = cfg.boot_source == TAB5_LAUNCH_BOOT_HDD0;
-                if ((hdd_boot && !cfg.hdd0[0]) || (!hdd_boot && !cfg.floppy0[0])) {
-                    toast("Cannot boot yet", hdd_boot ? "Select an .HDS image for HDD 0." : "Select FLOPPY 0.");
+                const bool fdd1_boot = cfg.boot_source == TAB5_LAUNCH_BOOT_FLOPPY1;
+                if ((hdd_boot && !cfg.hdd0[0]) || (fdd1_boot && !cfg.floppy1[0]) ||
+                    (!hdd_boot && !fdd1_boot && !cfg.floppy0[0])) {
+                    toast("Cannot boot yet", hdd_boot ? "Select an .HDS image for HDD 0." :
+                          (fdd1_boot ? "Select FLOPPY 1." : "Select FLOPPY 0."));
                     draw_setup(cfg);
                     break;
                 }
                 ESP_LOGI(TAG, "Media Setup BOOT: source=%s FDD0=%s FDD1=%s HDD0=%s",
-                         cfg.boot_source == TAB5_LAUNCH_BOOT_HDD0 ? "HDD0" : "FLOPPY0",
+                         hdd_boot ? "HDD0" : (fdd1_boot ? "FLOPPY1" : "FLOPPY0"),
                          cfg.floppy0[0] ? cfg.floppy0 : "<empty>",
                          cfg.floppy1[0] ? cfg.floppy1 : "<empty>",
                          cfg.hdd0[0] ? cfg.hdd0 : "<empty>");

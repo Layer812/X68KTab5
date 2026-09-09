@@ -42,6 +42,11 @@ enum {
 	MIDI_XG
 };
 
+#ifdef ESP_PLATFORM
+uint8_t MIDI_R127DelayPending = 0u;
+uint8_t MIDI_R127TimerActive = 0u;
+#endif
+
 static void *hOut = NULL;
 static int		MIDI_CTRL;
 static int		MIDI_POS;
@@ -62,6 +67,12 @@ static uint32_t		MIDI_GTimerMax = 0;
 static uint32_t		MIDI_MTimerMax = 0;
 static int32_t		MIDI_GTimerVal = 0;
 static int32_t		MIDI_MTimerVal = 0;
+#ifdef ESP_PLATFORM
+static inline __attribute__((always_inline)) void MIDI_R127SyncTimerActive(void)
+{
+    MIDI_R127TimerActive = (MIDI_Buffered != 0u || MIDI_MTimerMax != 0u || MIDI_GTimerMax != 0u) ? 1u : 0u;
+}
+#endif
 static uint8_t		MIDI_MODULE = MIDI_NOTUSED;
 
 #if defined(ESP_PLATFORM) && PX68K_TAB5_MIDI_TRACE
@@ -158,6 +169,12 @@ int MIDI_StateAction(StateMem *sm, int load, int data_only)
 	};
 
 	int ret = PX68KSS_StateAction(sm, load, data_only, StateRegs, "X68K_MIDI", false);
+#ifdef ESP_PLATFORM
+    if (load) {
+        MIDI_R127DelayPending = (DBufPtrW != DBufPtrR) ? 1u : 0u;
+        MIDI_R127SyncTimerActive();
+    }
+#endif
 
 	return ret;
 }
@@ -220,6 +237,9 @@ void FASTCALL MIDI_Timer(uint32_t clk)
 			}
 		}
 	}
+#ifdef ESP_PLATFORM
+	MIDI_R127SyncTimerActive();
+#endif
 }
 
 static void MIDI_SetModule(void)
@@ -240,6 +260,10 @@ void MIDI_Reset(void)
 {
 	memset(DelayBuf, 0, sizeof(DelayBuf));
 	DBufPtrW = DBufPtrR = 0;
+#ifdef ESP_PLATFORM
+    MIDI_R127DelayPending = 0u;
+    MIDI_R127SyncTimerActive();
+#endif
 
 	if (hOut)
 	{
@@ -275,6 +299,10 @@ void MIDI_Init(void)
 {
 	memset(DelayBuf, 0, sizeof(DelayBuf));
 	DBufPtrW = DBufPtrR = 0;
+#ifdef ESP_PLATFORM
+    MIDI_R127DelayPending = 0u;
+    MIDI_R127SyncTimerActive();
+#endif
 
 	MIDI_SetModule();
 	MIDI_RegHigh = 0;
@@ -535,22 +563,28 @@ static void AddDelayBuf(uint8_t msg)
 		DelayBuf[DBufPtrW].time = timeGetTime();
 		DelayBuf[DBufPtrW].msg  = msg;
 		DBufPtrW = newptr;
+#ifdef ESP_PLATFORM
+        MIDI_R127DelayPending = 1u;
+#endif
 	}
 }
 
 void MIDI_DelayOut(unsigned int delay)
 {
-	while ( DBufPtrW!=DBufPtrR )
+	while (DBufPtrW != DBufPtrR)
 	{
 		unsigned int t = timeGetTime();
-		if ( (t-DelayBuf[DBufPtrR].time)>=delay )
+		if ((t - DelayBuf[DBufPtrR].time) >= delay)
 		{
 			MIDI_Message(DelayBuf[DBufPtrR].msg);
-			DBufPtrR = (DBufPtrR+1)%MIDIDELAYBUF;
+			DBufPtrR = (DBufPtrR + 1) % MIDIDELAYBUF;
 		}
 		else
 			break;
 	}
+#ifdef ESP_PLATFORM
+    MIDI_R127DelayPending = (DBufPtrW != DBufPtrR) ? 1u : 0u;
+#endif
 }
 
 void FASTCALL MIDI_Write(uint32_t adr, uint8_t data)
@@ -655,6 +689,9 @@ void FASTCALL MIDI_Write(uint32_t adr, uint8_t data)
 			}
 			break;
 	}
+#ifdef ESP_PLATFORM
+	MIDI_R127SyncTimerActive();
+#endif
 }
 
 static int exstrcmp(char *str, char *cmp)

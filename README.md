@@ -11,184 +11,208 @@
   Developed by Layer812 &nbsp;|&nbsp; Based on PX68K &nbsp;|&nbsp; 68000 core: Musashi
 </p>
 
-**X68K Tab** は、M5Stack Tab5（ESP32-P4）で動作するポータブル X68000 エミュレータです。  
-PX68K / Musashi をベースに、ESP32-P4 の **2つのHP CPU + LP Core**、PSRAM、MIPI-DSI、USB Host、microSD、内蔵オーディオを使う構成へ再設計しています。
+## X68K Tab とは
 
-もともとは、昔の X68000 **PANIC** データを M5Stack Tab5 で再生したくなり、専用プレイヤー [**PanicPlayerTab5**](https://github.com/Layer812/PanicPlayerTab5) を作っていました。
+**X68K Tab** は、M5Stack Tab5（ESP32-P4）で動作するポータブル X68000 エミュレータです。
 
-PANIC を再生するために必要な X68000 互換環境を少しずつ実装していったのですが、問題がひとつありました。
+PX68K / Musashi をベースに、ESP32-P4 の 2つの HP CPU、LP Core、PSRAM、MIPI-DSI、USB Host、microSD、内蔵オーディオを活用する構成へ再設計しています。
 
-**肝心の PANIC データを１個しか持っていませんでした.....**
+もともとは、昔の X68000 **PANIC** データを M5Stack Tab5 で再生したくなり、専用プレイヤー [PanicPlayerTab5](https://github.com/Layer812/PanicPlayerTab5) を作っていました。
 
-というわけで(?)、**まだ見ぬ PANIC データのために** CPU、画面、音、I/O、メモリ転送をひたすら詰めていった結果……
+PANIC を再生するために必要な X68000 互換環境を少しずつ実装していったのですが、
 
-**CPU1・LP Core・CPU0 が非同期に協調して動く、マルチノード協調型の X68000 エミュレータができました。**
+**肝心の PANIC データを１個しか持っていませんでした.....**  
+というわけで(?)、まだ見ぬ PANIC データのために CPU、画面、音、I/O、メモリ転送を詰めていった結果、CPU1・LP Core・CPU0 が協調して動く X68000 エミュレータになりました。
 
 > [!IMPORTANT]
-> まだすべての X68000 ソフトが完全互換で動くわけではありません。表示・音・入力・USB機器・ディスクなどで問題を見つけたら、再現方法やログと一緒に **優しく教えてください**。Issue歓迎です。
+> すべての X68000 ソフトウェアの完全互換を保証するものではありません。  
+> 表示、音声、入力、USB機器、ディスクなどで問題を見つけたら、再現方法とシリアルログを添えて Issue で教えてください。
+
+---
+
+## Current Production
+
+現在の Production 版では、**68000 guest CPU を 12 MHz、X68000 peripheral time domain を exact 10 MHz** としています。
+
+### リリース方針
+
+このビルドを、X68K Tab の**現在の正式リリース版**とします。
+
+ここまでで基本機能・速度・音声・表示・入力・ストレージを一旦 Production としてまとめました。今後は大きく仕様を動かすことよりも、実際の X68000 ソフトウェアや周辺機器で見つかった**互換性問題、回帰、不具合の修正**を中心に進める予定です。
+
+もちろん、互換性や安定性のために必要な改善は引き続き行いますが、現在の 12 MHz / exact 10 MHz / no-wait 構成を基準点として扱います。
+
+| 項目 | Production 構成 |
+| --- | --- |
+| Guest CPU | **12 MHz** |
+| Peripheral domain | **exact 10 MHz** |
+| Guest RAM | **12 MiB** |
+| CPU1 | 68000 / guest device time を優先。host-side の都合で待たせない |
+| CPU0 | video / LCD / YM2151 / final audio mix / USB / storage / host UI |
+| Inter-core | no-wait / latest-wins を基本とする非同期パイプライン |
+| Graphics | sparse dirty update、必要箇所だけを current Front FB へ反映 |
+| Audio | guest-timed ADPCM + CPU0 YM2151 / final mix |
+| Storage | microSD / Flash / HostFS、XDF / DIM / HDS |
+| Input | USB Keyboard / Joypad / Mouse + Touch UI |
+| PANIC | PanicPlayer 統合、PANIC データ選択・起動に対応 |
+
+内部で使用した多数の計測ビルド名や A/B テスト名は、公開 README には掲載しません。
+
+### Turbo
+
+画面上の `TURBO` ボタンは3段階です。
+
+| 表示 | モード | Audio source rate | Video |
+| --- | --- | ---: | --- |
+| BLACK | NORMAL | 44.1 kHz | 通常 |
+| GREEN | TURBO | 22.05 kHz | adaptive 15 / 20 / 24 fps |
+| RED | RED TURBO | 11.025 kHz | stronger host-work shedding / MAX 24 fps |
+
+Turbo は **guest CPU clock を変更しません**。68000 は常に 12 MHz、peripheral domain は exact 10 MHz のままです。
 
 ---
 
 ## まず試す — M5Burner
 
-- [M5Burner 公式ページ](https://docs.m5stack.com/ja/uiflow/m5burner/intro)
-- [M5Stack ダウンロード](https://docs.m5stack.com/ja/download)
+- [M5Burner 公式ページ](https://docs.m5stack.com/en/uiflow/m5burner/intro)
+- [M5Stack ダウンロード](https://docs.m5stack.com/en/download)
 
 M5Burner の **Share Burn** で Share Code を入力してください。
 
 | バージョン | Share Code | 用途 |
-|---|---|---|
-| **Latest / Production** | `wUgYltOEbYF7mrBn` | **通常はこちらを推奨** |
-| Previous public build | `qUbdr77ZmhX8Esgo` | 直前の公開版・比較用 |
-| Older public build | `pfDbZl26Z3MsI3wP` | 旧版との比較・相性確認用 |
-| Older public build | `aFmGCMA3FSvzcW5H` | 旧版との比較・相性確認用 |
-| Legacy public build | `xX5zvurDW6xMacAK` | さらに古い公開版 |
+| --- | --- | --- |
+| **Latest / Production Release** | `KJL8QIk1H35dtT7O` | **今回の正式リリース版 / 通常はこちらを推奨** |
+| Previous public build | `wUgYltOEbYF7mrBn` | 直前の公開版・比較用 |
+| Older public build | `qUbdr77ZmhX8Esgo` | 比較・互換確認用 |
+| Older public build | `pfDbZl26Z3MsI3wP` | 比較・互換確認用 |
+| Older public build | `aFmGCMA3FSvzcW5H` | 比較・互換確認用 |
+| Legacy public build | `xX5zvurDW6xMacAK` | 旧公開イメージ |
 
-古い Share Code も残します。新しい版で相性問題が出たときや、以前の挙動と比較したいときに選べます。
-
-動作デモ:
-
-- [X68K Tab 動作デモ（X / @Layer812）](https://x.com/layer812/status/2089625598687891632)
+> 新しい M5Burner イメージを公開する場合は、付属の公開フォルダ作成スクリプトの第2引数に新しい Share Code を渡すと、日本語・英語 README の Latest 行を同時に更新できます。
 
 ---
 
 ## 必要なもの
 
-- **M5Stack Tab5** — [公式ドキュメント](https://docs.m5stack.com/ja/core/Tab5)
-- **microSD カード**
-- 利用権を持つ X68000 ソフトウェア / ディスクイメージ
+- [M5Stack Tab5](https://docs.m5stack.com/en/core/Tab5)
+- microSD カード
+- 正当に利用できる X68000 ソフトウェア / ディスクイメージ
   - FDD: `XDF`, `DIM`
   - HDD: `HDS`
 
-あると便利:
+### 入力機器
 
-- **[M5Stack Tab5用キーボード](https://www.switch-science.com/products/11257?srsltid=AfmBOoo04PDxT8gOg_ITsjEd6tO-oMFB7DE-c0gEf-J7O-1DS99WCCrx)**
+- [**M5Stack Tab5用キーボード**](https://www.switch-science.com/products/11257)
 - USB キーボード
 - USB Joypad / Gamepad
 - USB マウス
+- 画面上のタッチ UI / バーチャルキーボード / Joypad
 
-Tab5 のタッチ UI だけでも基本操作できます。
-
----
-
-## 使い方
-
-1. **M5Burner で X68K Tab を書き込みます。**  
-   上の Share Code `wUgYltOEbYF7mrBn` を **Share Burn** に入力し、Tab5 へ書き込んでください。
-
-2. **microSD カードへ X68000 のディスクイメージを入れます。**  
-   `XDF` / `DIM` はフロッピーディスク、`HDS` はハードディスクイメージとして利用できます。まずは microSD のルートディレクトリへ置くのが簡単です。
-
-3. **microSD を挿して Tab5 を起動します。**  
-   起動時のランチャーに、microSD から見つかった XDF / DIM / HDS が表示されます。
-
-4. **起動したいものを選びます。**
-   - XDF / DIM → FDD から起動
-   - HDS → HDD から起動
-   - Human68k を使いたい場合は、内蔵の Human68k Quick Boot も利用できます。
-
-5. **操作します。**
-   - タッチ UI
-   - [M5Stack Tab5用キーボード](https://www.switch-science.com/products/11257?srsltid=AfmBOoo04PDxT8gOg_ITsjEd6tO-oMFB7DE-c0gEf-J7O-1DS99WCCrx)
-   - USB キーボード
-   - USB Joypad / Gamepad
-   - USB マウス  
-
-   Tab5用キーボードを使う場合は、Tab5へ装着してから起動すると確実です。USB Joypad は X68000 の JOY1 として利用できます。
-
-6. **必要なら Turbo を使います。**  
-   通常モードは音声品質を優先した 44.1kHz 動作です。**Turbo** を有効にすると、X68000 の guest clock は 10MHz のまま、音声出力を 22.05kHz にして映像側へ処理余力を振り、物理表示は最大約30fpsを目標にします。
-
-PANIC Player も統合されており、`.PAN` データを選択して再生できます。
+外付け入力機器がなくても、タッチ UI から基本操作ができます。
 
 ---
 
-## Build 6.15 Production — 主な特徴
+## Display / MULTISCAN
 
-現在の Production 版で実際に使われている構成を中心にまとめています。
+X68K Tab は guest 側の CRTC 状態から **15 kHz / 24 kHz / 31 kHz 系モードを自動判定**し、Tab5 の 1280×720 LCD へ変換して表示します。
 
-| 領域 | Production 構成 |
-|---|---|
-| **68000** | Musashi + TCM / Internal SRAM dispatch cache + hot-path / inline fast path |
-| **CPU1** | 68000、割り込み、タイマ、DMAイベントなど **X68000 のゲスト時間軸**を優先。ホスト側の一時的な遅延と切り離して進行 |
-| **CPU0** | 画面合成、LCD、YM2151、最終音声mix、USB、SD / Flash / HostFS、入力、ホストUIなど最終出力側を担当 |
-| **LP Core** | Async Brokerとして通知 / ACK / dirty / workset / metadata を処理。**guest memoryへ直接アクセスさせない**構成 |
-| **CPU間通信** | no-wait / latest-wins を基本にした event journal / shadow / mailbox 型パイプライン |
-| **Graphics** | CPU0 compositor、GRP8 paired-page shared-scroll。PIE / XespV / PPA / DMA を描画・ブロック処理に活用 |
-| **LCD** | Managed Double-FB + dirty tile / partial update + `refresh_done` 同期 + latest-frame 優先 |
-| **Audio** | CPU1 の guest-timed ADPCM + CPU0 YM2151 / final mix。vgmM5系 backend、44.1kHz 合成ドメイン |
-| **Turbo** | guest clock 10MHzを維持しながら、22.05kHz音声出力と最大約30fpsの物理表示を目標に映像側へ処理余力を配分 |
-| **Storage** | microSD / Flash / HostFS、XDF / DIM / HDS、Human68k 起動 |
-| **Input** | [M5Stack Tab5用キーボード](https://www.switch-science.com/products/11257?srsltid=AfmBOoo04PDxT8gOg_ITsjEd6tO-oMFB7DE-c0gEf-J7O-1DS99WCCrx) / USB Keyboard / Joypad / Mouse + Touch UI |
-| **PANIC** | PanicPlayer を統合。Human68k 起動後の PANIC 再生に対応 |
+X68000 の走査周波数そのものを外部へ出力するものではありません。Tab5 の LCD は固定出力で、guest video mode を内部で変換します。
+
+---
+
+## Audio
+
+CPU1 は X68000 側の guest-timed audio event を進め、CPU0 が YM2151 波形生成、ADPCM との final mix、speaker 出力を担当します。
+
+host-side の一時的な表示負荷で guest timeline を止めないことを優先し、audio reserve が不足した場合は画面側の host work を抑える Audio Guard を使用します。
 
 ---
 
 ## ESP32-P4 マルチコア構成
 
 <p align="center">
-  <img src="./x68ktab_emulation_block_ja.png" alt="X68K Tab エミュレーションブロック構成" width="1100">
+  <img src="./x68ktab_emulation_block_ja.png" alt="X68K Tab ESP32-P4 multi-core architecture" width="1100">
 </p>
 
-X68K Tab では「全部を1つのエミュレーションループで処理する」のではなく、**ゲスト時間・非同期仲介・ホスト出力**を分けています。CPU1が publish した状態変化は Ordered Shadow / Event Journal を通り、LP Core は軽量な制御・通知、CPU0 は最終的な画面・音声・I/Oを担当します。
-
 - **HP CPU1 — Guest Time Domain**  
-  X68000側の時間を進めることを最優先。68000、LSI状態、割り込み、タイマ、guest-side DMA / ADPCM event などを処理します。ホスト処理の都合でguest timeを不用意に止めないことが設計上の中心です。
+  68000、割り込み、タイマ、guest-side DMA、CRTC、audio event など X68000 側の時間を優先して進めます。
 
 - **HP CPU0 — Host Processing**  
-  画面合成、LCD、FM、最終音声mix、USB、SD、HostFS、Tab5用キーボード、Touch UIなど、Tab5側の周辺処理と最終出力を引き受けます。
+  画面合成、LCD、YM2151、final audio mix、USB、SD / Flash / HostFS、Touch UI を担当します。
 
-- **LP Core — Async Broker**  
-  `Notify / ACK / dirty / workset / metadata` のような軽量メッセージを処理します。LP側からX68000の大きなguest memoryを直接読みに行かず、HP Core間の非同期協調を補助します。
+- **LP Core — Lightweight Broker**  
+  一部の軽量 notification / metadata / broker 処理を補助します。guest memory を直接大規模に走査する役割にはしません。
 
-重要なのは、**CPU0 や LP Core の都合で CPU1 の guest timeline を必要以上に止めないこと**です。
+中心となる原則は、**host-side の一時的な遅れを理由に CPU1 の guest timeline を不必要に止めないこと**です。
 
 ---
 
 ## PANIC Player
 
-X68K Tab は [PanicPlayerTab5](https://github.com/Layer812/PanicPlayerTab5) から生まれました。  
-現在も PANIC Player を統合しており、`.PAN` データを選択して再生できます。
+X68K Tab は [PanicPlayerTab5](https://github.com/Layer812/PanicPlayerTab5) から発展したプロジェクトです。PANIC Player 機能は現在も統合されています。
 
-昔の HDD、MO、CD-R、バックアップなどに PANIC データやファイル一覧が残っていたら、情報だけでも歓迎です。
+### PANICデータを探しています
+
+昔の X68000 メディアがお手元にありましたら、
+
+- `.PAN` ファイル
+- PANIC データ入りの LZH / ZIP
+- MO / HDD / CD-R のバックアップ
+- BBS のファイル一覧
+- README / DOC
+- 覚えているファイル名
+
+などの情報を歓迎します。
+
+著作権等の理由でデータそのものを共有できない場合は、**ファイル名やディレクトリ一覧だけでも大変助かります。**
 
 ---
 
-## CGROM / ROM / Human68k
+## ROM / CGROM / Human68k
 
-オリジナル X68000 の CGROM dump をそのまま再配布するのではなく、[`build_cgrom.py`](build_cgrom.py) を使い、**再配布可能なフォントから互換 CGROM データを生成する方式**を採用しています。  
-使用するフォント自身のライセンスに従ってください。
+本リポジトリには、SHARP X68000 のオリジナル ROM dump、Human68k のディスクイメージ、ユーザー所有の X68000 ソフトウェアを含めません。
 
-ゲーム、OS、ROM、ディスクイメージなどの権利は各権利者に帰属します。利用権を持つデータ、または適切な条件で公開されているデータをご利用ください。
+CGROM については、オリジナル CGROM dump を再配布するのではなく、`build_cgrom.py` を用意しています。使用するフォントや生成物については、それぞれのライセンス・権利条件に従ってください。
 
-ソースからビルドする場合は、必要な Human68k 関連ファイルを各自で適切な条件に従って用意してください。詳細は [`LICENSE_SHARP_X68000.txt`](LICENSE_SHARP_X68000.txt) を参照してください。
+Human68k 関連ファイルを必要とする場合も、適用される条件に従って各自で正当に用意してください。
+
+詳細:
+
+- `LICENSE_SHARP_X68000.txt`
+- `LICENSE_PANIC_X.txt`
+- `PANIC_V1.38_NOTICE.txt`
+- `THIRD_PARTY_NOTICES.md`
 
 ---
 
-## ソースからビルド
+## Source Build
 
-現在の開発は ESP-IDF / M5Unified を中心に行っています。  
-Production firmware は ESP32-P4 向けに最適化されているため、まず M5Burner 版での利用をおすすめします。
+開発・実機確認は ESP32-P4 / M5Stack Tab5 を中心に行っています。
 
-リポジトリのビルド設定・必要ファイルは今後変わる可能性があります。ソースをビルドする場合は、リポジトリ内の設定とコメントを参照してください。
+現在の Production 基準:
+
+- ESP-IDF 5.5.x 系
+- ESP32-P4 360 MHz
+- PSRAM 32 MiB / 200 MHz
+- Flash QIO / 80 MHz
+- M5Unified / M5GFX
+- Musashi
+- PX68K
+
+ソースツリーには PlatformIO / ESP-IDF 用の設定を含みます。ローカルに必要な ROM / OS / disk image 等はリポジトリへ追加しないでください。
 
 ---
 
 ## Credits / License
 
-X68K Tab は多くの先人の仕事の上に成り立っています。ありがとうございます。
+X68K Tab は、多くのエミュレータ、ハードウェア研究、OSS の成果の上に成り立っています。
 
-- [PX68K](https://github.com/hissorii/px68k)
-- [Musashi](https://github.com/kstenerud/Musashi)
-- [vgmM5](https://github.com/Layer812/vgmM5)
-- [M5Stack](https://docs.m5stack.com/ja/core/Tab5)
+- PX68K
+- Musashi
+- vgmM5
+- M5Stack / M5Unified / M5GFX
 - Espressif ESP32-P4 / ESP-IDF
 
-ライセンスと第三者コードの詳細:
+各ライセンス・third-party notice はリポジトリ内の文書を確認してください。
 
-- [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)
-- [`LICENSE_SHARP_X68000.txt`](LICENSE_SHARP_X68000.txt)
-- [`LICENSE_PANIC_X.txt`](LICENSE_PANIC_X.txt)
-- [`PANIC_V1.38_NOTICE.txt`](PANIC_V1.38_NOTICE.txt)
-
-**X68K Tab は個人による非公式プロジェクトであり、SHARP、M5Stack その他の各社による公式製品・承認プロジェクトではありません。**
+X68K Tab は個人による非公式プロジェクトです。SHARP、M5Stack その他各権利者の公式・公認・スポンサー製品ではありません。

@@ -3,11 +3,6 @@
 #include <stddef.h>
 #include <string.h>
 
-/* App-side LP broker ABI. Kept as a narrow extern to avoid a component
- * dependency cycle; publication is a single observational RTC-RAM store. */
-extern void tab5_lp_broker_video_frontier_publish(uint32_t kind, uint64_t seq);
-enum { FLOW_LP_GUEST=0u, FLOW_LP_COMPOSE=1u, FLOW_LP_SCREEN=2u, FLOW_LP_VISIBLE=3u };
-
 #ifdef ESP_PLATFORM
 #include "esp_heap_caps.h"
 #endif
@@ -27,42 +22,16 @@ static uint32_t s_cpu1_height;
 static flow_source_meta_t s_cpu1_meta[TAB5_VIDEO_FLOW_FB_LINES];
 static volatile uint32_t s_dirty_bits[(TAB5_VIDEO_FLOW_MAX_LINES + 31u) / 32u];
 static volatile uint64_t s_guest_frontier;
-static volatile uint64_t s_compose_frontier;
-static volatile uint64_t s_screen_commit_frontier;
-static volatile uint64_t s_visible_frontier;
-static volatile uint64_t s_cpu1_exact_commits;
-static volatile uint64_t s_cpu0_final_commits;
-static volatile uint64_t s_dirty_posts;
-static volatile uint64_t s_snapshot_races;
-static volatile uint64_t s_stale_skips;
-static volatile uint64_t s_requeues;
 static volatile uint32_t s_dirty_lines;
-static volatile uint32_t s_dirty_max;
 static int s_ready;
-static volatile uint64_t s_lp_guest_mirror;
-static volatile uint64_t s_lp_compose_mirror;
-
-static inline void flow_lp_mirror_batched(volatile uint64_t *last, uint32_t kind,
-                                          uint64_t seq, uint64_t quantum)
-{
-    uint64_t old = __atomic_load_n(last, __ATOMIC_RELAXED);
-    if (seq - old < quantum) return;
-    if (__atomic_compare_exchange_n(last, &old, seq, 0,
-                                    __ATOMIC_RELAXED, __ATOMIC_RELAXED))
-        tab5_lp_broker_video_frontier_publish(kind, seq);
-}
 
 static inline void flow_mark_dirty(uint32_t y)
 {
     const uint32_t wi = y >> 5;
     const uint32_t bit = 1u << (y & 31u);
     const uint32_t old = __atomic_fetch_or(&s_dirty_bits[wi], bit, __ATOMIC_RELEASE);
-    __atomic_add_fetch(&s_dirty_posts, 1u, __ATOMIC_RELAXED);
     if (!(old & bit)) {
         const uint32_t n = __atomic_add_fetch(&s_dirty_lines, 1u, __ATOMIC_RELAXED);
-        uint32_t m = __atomic_load_n(&s_dirty_max, __ATOMIC_RELAXED);
-        while (n > m && !__atomic_compare_exchange_n(&s_dirty_max, &m, n, 0,
-                                                      __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
         /* Only the empty->nonempty transition needs a scheduler kick.  This
          * bounds CPU1 cross-core RTOS traffic while all further lines remain
          * visible through the atomic dirty bitset. */
@@ -99,7 +68,6 @@ uint64_t tab5_video_flow_cpu1_begin(uint32_t y)
     uint64_t seq = __atomic_add_fetch(&s_guest_frontier, 1u, __ATOMIC_RELAXED);
     if (!seq)
         seq = __atomic_add_fetch(&s_guest_frontier, 1u, __ATOMIC_RELAXED);
-    flow_lp_mirror_batched(&s_lp_guest_mirror, FLOW_LP_GUEST, seq, 64u);
     if (y < TAB5_VIDEO_FLOW_FB_LINES) {
         uint32_t g = __atomic_load_n(&s_cpu1_meta[y].write_guard, __ATOMIC_RELAXED);
         if (g & 1u) ++g;
@@ -136,28 +104,18 @@ void tab5_video_flow_cpu1_commit(uint32_t y, uint32_t width,
     uint32_t g = __atomic_load_n(&m->write_guard, __ATOMIC_RELAXED);
     if (!(g & 1u)) ++g;
     __atomic_store_n(&m->write_guard, g + 1u, __ATOMIC_RELEASE);
-    __atomic_add_fetch(&s_cpu1_exact_commits, 1u, __ATOMIC_RELAXED);
-    /* Final pixels already exist on CPU1, so the renderer/compose frontier is
-     * complete at this sequence even though Screen/LCD remain downstream. */
-    uint64_t cf = __atomic_load_n(&s_compose_frontier, __ATOMIC_RELAXED);
-    while (render_seq > cf && !__atomic_compare_exchange_n(&s_compose_frontier, &cf,
-                                                            render_seq, 0,
-                                                            __ATOMIC_RELEASE,
-                                                            __ATOMIC_RELAXED)) {}
-    flow_lp_mirror_batched(&s_lp_compose_mirror, FLOW_LP_COMPOSE, render_seq, 64u);
     flow_mark_dirty(y);
 }
 
+/* R140F1R2 ABI sync.  This production video_flow generation intentionally
+ * owns only CPU1 authoritative publication. CPU0 final-compositor results are
+ * already transferred through Screen Manager's bounded result slots, so this
+ * hook is a zero-cost semantic compatibility point rather than new telemetry. */
 void tab5_video_flow_cpu0_complete(uint64_t render_seq)
 {
-    uint64_t cf = __atomic_load_n(&s_compose_frontier, __ATOMIC_RELAXED);
-    while (render_seq > cf && !__atomic_compare_exchange_n(&s_compose_frontier, &cf,
-                                                            render_seq, 0,
-                                                            __ATOMIC_RELEASE,
-                                                            __ATOMIC_RELAXED)) {}
-    flow_lp_mirror_batched(&s_lp_compose_mirror, FLOW_LP_COMPOSE, render_seq, 64u);
-    __atomic_add_fetch(&s_cpu0_final_commits, 1u, __ATOMIC_RELAXED);
+    (void)render_seq;
 }
+
 
 uint64_t tab5_video_flow_cpu1_line_seq(uint32_t y)
 {
@@ -188,7 +146,6 @@ void tab5_video_flow_requeue_line(uint32_t y)
 {
     if (y >= TAB5_VIDEO_FLOW_MAX_LINES)
         return;
-    __atomic_add_fetch(&s_requeues, 1u, __ATOMIC_RELAXED);
     flow_mark_dirty(y);
 }
 
@@ -236,7 +193,6 @@ int tab5_video_flow_snapshot_latest(uint32_t y,
                              s_cpu1_fb + (size_t)y * s_cpu1_pitch,
                              y, dst, dst_capacity_pixels, meta,
                              TAB5_VIDEO_FLOW_SOURCE_CPU1);
-        if (rc == 0) __atomic_add_fetch(&s_snapshot_races, 1u, __ATOMIC_RELAXED);
         return rc;
     }
     return -1;
@@ -247,37 +203,7 @@ uint64_t tab5_video_flow_guest_frontier(void)
     return __atomic_load_n(&s_guest_frontier, __ATOMIC_ACQUIRE);
 }
 
-void tab5_video_flow_set_screen_commit_frontier(uint64_t seq)
+uint32_t tab5_video_flow_dirty_lines(void)
 {
-    uint64_t cur = __atomic_load_n(&s_screen_commit_frontier, __ATOMIC_RELAXED);
-    while (seq > cur && !__atomic_compare_exchange_n(&s_screen_commit_frontier, &cur,
-                                                      seq, 0, __ATOMIC_RELEASE,
-                                                      __ATOMIC_RELAXED)) {}
-    tab5_lp_broker_video_frontier_publish(FLOW_LP_SCREEN, seq);
-}
-
-void tab5_video_flow_set_visible_frontier(uint64_t seq)
-{
-    uint64_t cur = __atomic_load_n(&s_visible_frontier, __ATOMIC_RELAXED);
-    while (seq > cur && !__atomic_compare_exchange_n(&s_visible_frontier, &cur,
-                                                      seq, 0, __ATOMIC_RELEASE,
-                                                      __ATOMIC_RELAXED)) {}
-    tab5_lp_broker_video_frontier_publish(FLOW_LP_VISIBLE, seq);
-}
-
-void tab5_video_flow_get_stats(tab5_video_flow_stats_t *out)
-{
-    if (!out) return;
-    out->guest_frontier = __atomic_load_n(&s_guest_frontier, __ATOMIC_ACQUIRE);
-    out->compose_frontier = __atomic_load_n(&s_compose_frontier, __ATOMIC_ACQUIRE);
-    out->screen_commit_frontier = __atomic_load_n(&s_screen_commit_frontier, __ATOMIC_ACQUIRE);
-    out->visible_frontier = __atomic_load_n(&s_visible_frontier, __ATOMIC_ACQUIRE);
-    out->cpu1_exact_commits = __atomic_load_n(&s_cpu1_exact_commits, __ATOMIC_RELAXED);
-    out->cpu0_final_commits = __atomic_load_n(&s_cpu0_final_commits, __ATOMIC_RELAXED);
-    out->dirty_posts = __atomic_load_n(&s_dirty_posts, __ATOMIC_RELAXED);
-    out->snapshot_races = __atomic_load_n(&s_snapshot_races, __ATOMIC_RELAXED);
-    out->stale_skips = __atomic_load_n(&s_stale_skips, __ATOMIC_RELAXED);
-    out->requeues = __atomic_load_n(&s_requeues, __ATOMIC_RELAXED);
-    out->dirty_lines = __atomic_load_n(&s_dirty_lines, __ATOMIC_RELAXED);
-    out->dirty_max = __atomic_load_n(&s_dirty_max, __ATOMIC_RELAXED);
+    return __atomic_load_n(&s_dirty_lines, __ATOMIC_ACQUIRE);
 }

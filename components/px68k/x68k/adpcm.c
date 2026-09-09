@@ -11,6 +11,7 @@
 #include "prop.h"
 #include "pia.h"
 #include "adpcm.h"
+#include "adpcm_cpu0.h"
 #include "dmac.h"
 
 #ifdef ESP_PLATFORM
@@ -26,6 +27,8 @@
 #define PX68K_ADTABLE DRAM_ATTR
 #define PX68K_ADBUF DRAM_ATTR
 #define PX68K_ADIRAM IRAM_ATTR
+/* R140P4S3: legacy helper retained for fallback path; absolute timeline is authoritative when active. */
+extern void DSound_FlushADPCMPending(void);
 #else
 #define PX68K_ADHOT
 #define PX68K_ADTABLE
@@ -100,6 +103,7 @@ static PX68K_ADTABLE int dif_table[49*16];
 static PX68K_ADBUF int16_t ADPCM_BufR[ADPCM_BufSize];
 static PX68K_ADBUF int16_t ADPCM_BufL[ADPCM_BufSize];
 
+
 static PX68K_ADHOT int32_t  ADPCM_WrPtr = 0;
 static PX68K_ADHOT int32_t  ADPCM_RdPtr = 0;
 static PX68K_ADHOT uint32_t ADPCM_SampleRate = ADPCM_SAMPLE_RATE_X12;
@@ -136,7 +140,13 @@ uint32_t ADPCM_Tab5BufferOverflows(void)
 #endif
 }
 static PX68K_ADHOT uint8_t ADPCM_Clock = 0;
+#ifdef ESP_PLATFORM
+PX68K_ADHOT int ADPCM_R127_PreCounter = 0;
+PX68K_ADHOT uint16_t ADPCM_R127_PreStepCurrent = 3906u;
+#define ADPCM_PreCounter ADPCM_R127_PreCounter
+#else
 static PX68K_ADHOT int ADPCM_PreCounter = 0;
+#endif
 static PX68K_ADHOT int ADPCM_DifBuf = 0;
 
 static PX68K_ADHOT int ADPCM_Pan = 0x00;
@@ -197,6 +207,9 @@ int ADPCM_StateAction(StateMem *sm, int load, int data_only)
 	};
 
 	int ret = PX68KSS_StateAction(sm, load, data_only, StateRegs, "X68K_ADPC", false);
+#ifdef ESP_PLATFORM
+    if (load) ADPCM_R127_PreStepCurrent = ADPCM_PreStep[ADPCM_Clock & 7u];
+#endif
 
 	return ret;
 }
@@ -227,20 +240,30 @@ static void ADPCM_InitTable(void)
 	}
 }
 
-void PX68K_ADIRAM FASTCALL ADPCM_PreUpdate(uint32_t clock)
+void PX68K_ADIRAM FASTCALL ADPCM_PreUpdateR127Due(void)
 {
 	const uint8_t ci = (uint8_t)(ADPCM_Clock & 7u);
-	ADPCM_PreCounter += (int)(ADPCM_PreStep[ci] * clock);
-	while ( ADPCM_PreCounter>=10000000L )
-   {
+	while (ADPCM_PreCounter >= 10000000L)
+    {
 		ADPCM_DifBuf -= (int)ADPCM_DifStep[ci];
-		if ( ADPCM_DifBuf<=0 )
-      {
+		if (ADPCM_DifBuf <= 0)
+        {
 			ADPCM_DifBuf = 0;
 			if (!DMA_Exec3ADPCMFast()) DMA_Exec(3);
 		}
 		ADPCM_PreCounter -= 10000000L;
 	}
+}
+
+void PX68K_ADIRAM FASTCALL ADPCM_PreUpdate(uint32_t clock)
+{
+#ifdef ESP_PLATFORM
+    ADPCM_PreCounter += (int)(ADPCM_R127_PreStepCurrent * clock);
+#else
+	const uint8_t ci = (uint8_t)(ADPCM_Clock & 7u);
+    ADPCM_PreCounter += (int)(ADPCM_PreStep[ci] * clock);
+#endif
+    if (ADPCM_PreCounter >= 10000000L) ADPCM_PreUpdateR127Due();
 }
 
 void ADPCM_Update(int16_t *buffer, size_t length, uint8_t *pbsp, uint8_t *pbep)
@@ -414,6 +437,59 @@ static INLINE void adpcm598c_store_sample(int tmp)
 #endif
 }
 
+
+#ifdef ESP_PLATFORM
+/* R57E107X_CPU0_ADPCM_COMMAND_ENGINE
+ * CPU1 no longer computes MSM6258 sample values.  Keep only the historical
+ * ADPCM ring occupancy shadow because DMA3 pacing is guest-visible.  This is
+ * the proven h13 timing split, now feeding the HP-CPU0 command renderer. */
+static INLINE void adpcm_cpu0_timing_write_one(void)
+{
+    int nr = 0;
+    while (ADPCM_SampleRate > ADPCM_Count)
+    {
+        if (ADPCM_Playing) ++nr;
+        ADPCM_Count += ADPCM_ClockRate;
+    }
+    ADPCM_Count -= ADPCM_SampleRate;
+    if (nr > 0)
+    {
+        ADPCM_WrPtr += nr;
+        while (ADPCM_WrPtr >= ADPCM_BufSize) ADPCM_WrPtr -= ADPCM_BufSize;
+    }
+}
+
+void ADPCM_CPU0_TimingConsume(size_t length)
+{
+    while (length)
+    {
+        int avail = ADPCM_WrPtr - ADPCM_RdPtr;
+        if (avail < 0) avail += ADPCM_BufSize;
+        if (avail > 0)
+        {
+            size_t n = length;
+            if (n > (size_t)avail) n = (size_t)avail;
+            ADPCM_RdPtr += (int32_t)n;
+            while (ADPCM_RdPtr >= ADPCM_BufSize) ADPCM_RdPtr -= ADPCM_BufSize;
+            length -= n;
+            continue;
+        }
+        if (!(DMA[3].CCR & 0x40))
+        {
+            const int32_t before = ADPCM_WrPtr;
+            DMA_Exec(3);
+            if (ADPCM_WrPtr != before) continue;
+        }
+        /* Match legacy ADPCM_Update: when empty, hold the previous sample. */
+        break;
+    }
+    ADPCM_DifBuf = ADPCM_WrPtr - ADPCM_RdPtr;
+    if (ADPCM_DifBuf < 0) ADPCM_DifBuf += ADPCM_BufSize;
+}
+#else
+void ADPCM_CPU0_TimingConsume(size_t length) { (void)length; }
+#endif
+
 static INLINE void ADPCM_WriteOne(uint8_t val)
 {
     ADPCM_Out += dif_table[(ADPCM_Step << 4) + val];
@@ -462,6 +538,20 @@ static INLINE void ADPCM_WriteOne(uint8_t val)
     }
 }
 
+/* R140P4S3 absolute semantic timeline.
+ * Every audible MSM6258 mutation, INCLUDING each data byte, is stamped with
+ * CPU1's authoritative absolute guest sample tick.  CPU0 advances FM+ADPCM
+ * together to that tick before applying the event.  The public CPU0 command
+ * engine remains available as a fallback when the timeline is not active. */
+#ifdef ESP_PLATFORM
+extern int DSound_AbsTimelineActive(void);
+extern int DSound_AbsTimelineADPCMControl(uint8_t data);
+extern int DSound_AbsTimelineADPCMData(uint8_t data);
+extern int DSound_AbsTimelineADPCMPan(uint8_t data);
+extern int DSound_AbsTimelineADPCMClock(uint8_t data);
+extern int DSound_AbsTimelineADPCMVolume(uint8_t data);
+#endif
+
 void PX68K_ADIRAM FASTCALL ADPCM_Write(uint32_t adr, uint8_t data)
 {
 	if ( adr==0xe92001 )
@@ -486,10 +576,29 @@ void PX68K_ADIRAM FASTCALL ADPCM_Write(uint32_t adr, uint8_t data)
       ++s_debug_adpcm_data_writes;
 		if ( ADPCM_Playing )
       {
-         ADPCM_WriteOne((uint8_t)(data & 15));
-         ADPCM_WriteOne((uint8_t)((data >> 4) & 15));
+         #ifdef ESP_PLATFORM
+         if (ADPCM_CPU0_Active())
+         {
+            adpcm_cpu0_timing_write_one();
+            adpcm_cpu0_timing_write_one();
+            if (!DSound_AbsTimelineActive()) ADPCM_CPU0_Data(data);
+            else (void)DSound_AbsTimelineADPCMData(data);
+         }
+         else
+#endif
+         {
+            ADPCM_WriteOne((uint8_t)(data & 15));
+            ADPCM_WriteOne((uint8_t)((data >> 4) & 15));
+         }
       }
 	}
+#ifdef ESP_PLATFORM
+   if (adr == 0xe92001 && ADPCM_CPU0_Active())
+   {
+      if (!DSound_AbsTimelineActive()) ADPCM_CPU0_Control(data);
+      else (void)DSound_AbsTimelineADPCMControl(data);
+   }
+#endif
 }
 
 uint8_t FASTCALL ADPCM_Read(uint32_t adr)
@@ -504,6 +613,9 @@ void ADPCM_SetVolume(uint8_t vol)
 	if ( vol>16 ) vol=16;
 
 	ADPCM_VolumeShift = (int)ADPCM_VolumeTable[vol];
+#ifdef ESP_PLATFORM
+   if (ADPCM_CPU0_Active()) { if (!DSound_AbsTimelineActive()) ADPCM_CPU0_SetVolume(vol); else (void)DSound_AbsTimelineADPCMVolume(vol); }
+#endif
 }
 
 void ADPCM_SetPan(int n)
@@ -513,8 +625,14 @@ void ADPCM_SetPan(int n)
 		ADPCM_Count     = 0;
 		ADPCM_Clock     = (ADPCM_Clock&4)|((n>>2)&3);
 		ADPCM_ClockRate = ADPCM_Clocks[ADPCM_Clock];
+#ifdef ESP_PLATFORM
+        ADPCM_R127_PreStepCurrent = ADPCM_PreStep[ADPCM_Clock & 7u];
+#endif
 	}
 	ADPCM_Pan = n;
+#ifdef ESP_PLATFORM
+   if (ADPCM_CPU0_Active()) { if (!DSound_AbsTimelineActive()) ADPCM_CPU0_SetPan((uint8_t)n); else (void)DSound_AbsTimelineADPCMPan((uint8_t)n); }
+#endif
 }
 
 void ADPCM_SetClock(int n)
@@ -524,7 +642,13 @@ void ADPCM_SetClock(int n)
 		ADPCM_Count     = 0;
 		ADPCM_Clock     = n | ((ADPCM_Pan>>2)&3);
 		ADPCM_ClockRate = ADPCM_Clocks[ADPCM_Clock];
+#ifdef ESP_PLATFORM
+        ADPCM_R127_PreStepCurrent = ADPCM_PreStep[ADPCM_Clock & 7u];
+#endif
 	}
+#ifdef ESP_PLATFORM
+   if (ADPCM_CPU0_Active()) { if (!DSound_AbsTimelineActive()) ADPCM_CPU0_SetClock((uint8_t)n); else (void)DSound_AbsTimelineADPCMClock((uint8_t)n); }
+#endif
 }
 
 void ADPCM_Init(void)
@@ -553,5 +677,23 @@ void ADPCM_Init(void)
            (unsigned)(ADPCM_BufSize * 2u * sizeof(int16_t)),
            (unsigned)ADPCM_BufSize,
            (unsigned)((ADPCM_BufSize * 1000u) / 44100u));
+#endif
+#ifdef ESP_PLATFORM
+   /* CPU0 owns waveform generation only. CPU1 retains DMA/IRQ/register time. */
+   if (ADPCM_CPU0_Init())
+   {
+      if (!DSound_AbsTimelineActive())
+      {
+         ADPCM_CPU0_SetPan((uint8_t)ADPCM_Pan);
+         ADPCM_CPU0_SetClock((uint8_t)(ADPCM_Clock & 4u));
+         ADPCM_CPU0_SetVolume((uint8_t)Config.PCM_VOL);
+      }
+      else
+      {
+         (void)DSound_AbsTimelineADPCMPan((uint8_t)ADPCM_Pan);
+         (void)DSound_AbsTimelineADPCMClock((uint8_t)(ADPCM_Clock & 4u));
+         (void)DSound_AbsTimelineADPCMVolume((uint8_t)Config.PCM_VOL);
+      }
+   }
 #endif
 }

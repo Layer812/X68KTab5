@@ -1,0 +1,30 @@
+#ifndef _PX68K_ADPCM_CPU0_H
+#define _PX68K_ADPCM_CPU0_H
+
+#include <stdint.h>
+#include <stddef.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* R57E107X: CPU1 is the sole producer of ordered guest-timed commands.
+ * CPU0 is the sole MSM6258 decoder/PCM renderer and final-audio consumer. */
+int ADPCM_CPU0_Init(void);
+int ADPCM_CPU0_Active(void);
+void ADPCM_CPU0_Reset(void);
+void ADPCM_CPU0_Control(uint8_t data);
+void ADPCM_CPU0_Data(uint8_t data);
+void ADPCM_CPU0_SetPan(uint8_t pan);
+void ADPCM_CPU0_SetClock(uint8_t clock_bit);
+void ADPCM_CPU0_SetVolume(uint8_t vol);
+int ADPCM_CPU0_Render(uint32_t frames, int lpf);
+uint32_t ADPCM_CPU0_FramesAvail(void);
+int ADPCM_CPU0_ReadFrames(int16_t *dst, int frames);
+uint32_t ADPCM_CPU0_CommandDrops(void);
+void ADPCM_CPU0_TimingConsume(size_t length);
+
+#ifdef __cplusplus
+}
+#endif
+#endif
