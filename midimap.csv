@@ -1,0 +1,268 @@
+# SC55 -> SAM2695 Production V5 full built-in equivalent
+# GS2SAM_PROFILE,1
+meta,name,SC55
+meta,source,Roland SC55 / SC-55mkII GS
+meta,target,SAM2695
+meta,status,Production V6 explicit 92-variation + 128-program MT-32-bank remap + family fallback map
+config,rhythm_volume_percent,100
+config,pass_unknown_sysex,1
+config,pass_malformed_sysex,1
+config,capital_tone_fallback,1
+config,drum_fallback,1
+config,drum_retarget,1
+config,emulate_shared_drum_maps,1
+config,emulate_drum_rx,1
+config,emulate_key_range,1
+# tone,src_msb,src_lsb,src_pc,dst_bank,dst_pc,vib_rate,vib_depth,vib_delay,cutoff,resonance,attack,decay,release,label
+tone,127,*,1,127,1,,,,,,,,,MT32 001 Acou Piano 1 -> Piano 1 [semantic]
+tone,127,*,2,127,2,,,,,,,,,MT32 002 Acou Piano 2 -> Piano 2 [semantic]
+tone,127,*,3,127,3,,,,,,,,,MT32 003 Acou Piano 3 -> Piano 3 [semantic]
+tone,127,*,4,127,5,,,,,,,,,MT32 004 Elec Piano 1 -> E.Piano1 [semantic]
+tone,127,*,5,127,6,,,,,,,,,MT32 005 Elec Piano 2 -> E.Piano2 [semantic]
+tone,127,*,6,127,5,,,,,,,,,MT32 006 Elec Piano 3 -> E.Piano1 [fallback]
+tone,127,*,7,127,6,,,,,,,,,MT32 007 Elec Piano 4 -> E.Piano2 [fallback]
+tone,127,*,8,127,8,,,,,,,,,MT32 008 Honkytonk -> Honky-Tonk [exact]
+tone,127,*,9,127,9,,,,,,,,,MT32 009 Elec Org 1 -> Organ 1 [semantic]
+tone,127,*,10,127,10,,,,,,,,,MT32 010 Elec Org 2 -> Organ 2 [semantic]
+tone,127,*,11,127,11,,,,,,,,,MT32 011 Elec Org 3 -> Organ 3 [semantic]
+tone,127,*,12,127,11,,,,,,,,,MT32 012 Elec Org 4 -> Organ 3 [fallback]
+tone,127,*,13,127,14,,,,,,,,,MT32 013 Pipe Org 1 -> Church Org. [semantic]
+tone,127,*,14,127,13,,,,,,,,,MT32 014 Pipe Org 2 -> Church Org. 2 [semantic]
+tone,127,*,15,127,14,,,,,,,,,MT32 015 Pipe Org 3 -> Church Org. [semantic]
+tone,127,*,16,127,16,,,,,,,,,MT32 016 Accordion -> Accordion Fr. [semantic]
+tone,127,*,17,127,17,,,,,,,,,MT32 017 Harpsi 1 -> Harpsichord [semantic]
+tone,127,*,18,127,18,,,,,,,,,MT32 018 Harpsi 2 -> Coupled Hps. [semantic]
+tone,127,*,19,127,19,,,,,,,,,MT32 019 Harpsi 3 -> Coupled Hps. [semantic]
+tone,127,*,20,127,20,,,,,,,,,MT32 020 Clavi 1 -> Clav. [semantic]
+tone,127,*,21,127,21,,,,,,,,,MT32 021 Clavi 2 -> Clav. [semantic]
+tone,127,*,22,127,22,,,,,,,,,MT32 022 Clavi 3 -> Clav. [semantic]
+tone,127,*,23,127,23,,,,,,,,,MT32 023 Celesta 1 -> Celesta [semantic]
+tone,127,*,24,127,24,,,,,,,,,MT32 024 Celesta 2 -> Celesta [semantic]
+tone,127,*,25,127,25,,,,,,,,,MT32 025 Syn Brass 1 -> Synth Brass1 [exact]
+tone,127,*,26,127,26,,,,,,,,,MT32 026 Syn Brass 2 -> Synth Brass2 [exact]
+tone,127,*,27,127,27,,,,,,,,,MT32 027 Syn Brass 3 -> Synth Brass3 [exact]
+tone,127,*,28,127,28,,,,,,,,,MT32 028 Syn Brass 4 -> Synth Brass4 [exact]
+tone,127,*,29,127,29,,,,,,,,,MT32 029 Syn Bass 1 -> Synth Bass1 [exact]
+tone,127,*,30,127,30,,,,,,,,,MT32 030 Syn Bass 2 -> Synth Bass2 [exact]
+tone,127,*,31,127,31,,,,,,,,,MT32 031 Syn Bass 3 -> Synth Bass3 [exact]
+tone,127,*,32,127,32,,,,,,,,,MT32 032 Syn Bass 4 -> Synth Bass4 [exact]
+tone,127,*,33,127,33,,,,,,,,,MT32 033 Fantasy -> Fantasia [exact]
+tone,127,*,34,127,44,,,,,,,,,MT32 034 Harmo Pan -> Pan Flute [semantic]
+tone,127,*,35,127,35,,,,,,,,,MT32 035 Chorale -> Choir Aahs [semantic]
+tone,127,*,36,127,36,,,,,,,,,MT32 036 Glasses -> Bowed Glass [semantic]
+tone,127,*,37,127,37,,,,,,,,,MT32 037 Soundtrack -> Soundtrack [exact]
+tone,127,*,38,127,38,,,,,,,,,MT32 038 Atmosphere -> Atmosphere [exact]
+tone,127,*,39,127,41,,,,,,,,,MT32 039 Warm Bell -> Tinkle Bell [semantic]
+tone,127,*,40,0,54,,,,,,,,,MT32 040 Funny Vox -> GM Voice Oohs [semantic]
+tone,127,*,41,127,47,,,,,,,,,MT32 041 Echo Bell -> Tubular Bells [semantic]
+tone,127,*,42,127,42,,,,,,,,,MT32 042 Ice Rain -> Ice Rain [exact]
+tone,127,*,43,127,43,,,,,,,,,MT32 043 Oboe 2001 -> Oboe [semantic]
+tone,127,*,44,127,44,,,,,,,,,MT32 044 Echo Pan -> Pan Flute [semantic]
+tone,127,*,45,127,45,,,,,,,,,MT32 045 Doctor Solo -> Saw Wave [semantic]
+tone,127,*,46,127,46,,,,,,,,,MT32 046 School Daze -> Charang [fallback]
+tone,127,*,47,127,47,,,,,,,,,MT32 047 Bellsinger -> Tubular Bells [semantic]
+tone,127,*,48,127,48,,,,,,,,,MT32 048 Square Wave -> Square Wave [exact]
+tone,127,*,49,127,49,,,,,,,,,MT32 049 Str Sect 1 -> Strings [semantic]
+tone,127,*,50,127,50,,,,,,,,,MT32 050 Str Sect 2 -> Tremolo Str. [semantic]
+tone,127,*,51,127,51,,,,,,,,,MT32 051 Str Sect 3 -> Slow Strings [semantic]
+tone,127,*,52,127,52,,,,,,,,,MT32 052 Pizzicato -> Pizzicato Str. [exact]
+tone,127,*,53,127,53,,,,,,,,,MT32 053 Violin 1 -> Violin [semantic]
+tone,127,*,54,127,53,,,,,,,,,MT32 054 Violin 2 -> Violin [semantic]
+tone,127,*,55,127,55,,,,,,,,,MT32 055 Cello 1 -> Cello [semantic]
+tone,127,*,56,127,55,,,,,,,,,MT32 056 Cello 2 -> Cello [semantic]
+tone,127,*,57,127,57,,,,,,,,,MT32 057 Contrabass -> Contrabass [exact]
+tone,127,*,58,127,58,,,,,,,,,MT32 058 Harp 1 -> Harp [semantic]
+tone,127,*,59,127,58,,,,,,,,,MT32 059 Harp 2 -> Harp [semantic]
+tone,127,*,60,127,60,,,,,,,,,MT32 060 Guitar 1 -> Nylon-str. Gt [semantic]
+tone,127,*,61,127,61,,,,,,,,,MT32 061 Guitar 2 -> Steel-Str. Gt [semantic]
+tone,127,*,62,127,62,,,,,,,,,MT32 062 Elec Gtr 1 -> Chorus Gt. [semantic]
+tone,127,*,63,127,63,,,,,,,,,MT32 063 Elec Gtr 2 -> Funk Gt. [semantic]
+tone,127,*,64,127,64,,,,,,,,,MT32 064 Sitar -> Sitar [exact]
+tone,127,*,65,127,65,,,,,,,,,MT32 065 Acou Bass 1 -> Acoustic Bs. [semantic]
+tone,127,*,66,127,65,,,,,,,,,MT32 066 Acou Bass 2 -> Acoustic Bs. [semantic]
+tone,127,*,67,127,66,,,,,,,,,MT32 067 Elec Bass 1 -> Fingered Bs. [semantic]
+tone,127,*,68,127,67,,,,,,,,,MT32 068 Elec Bass 2 -> Picked Bs. [semantic]
+tone,127,*,69,127,69,,,,,,,,,MT32 069 Slap Bass 1 -> Slap Bs. 1 [exact]
+tone,127,*,70,127,70,,,,,,,,,MT32 070 Slap Bass 2 -> Slap Bs. 2 [exact]
+tone,127,*,71,127,68,,,,,,,,,MT32 071 Fretless 1 -> Fretless Bs. [semantic]
+tone,127,*,72,127,71,,,,,,,,,MT32 072 Fretless 2 -> Fretless Bs. [semantic]
+tone,127,*,73,127,73,,,,,,,,,MT32 073 Flute 1 -> Flute [semantic]
+tone,127,*,74,127,74,,,,,,,,,MT32 074 Flute 2 -> Flute [semantic]
+tone,127,*,75,127,75,,,,,,,,,MT32 075 Piccolo 1 -> Piccolo [semantic]
+tone,127,*,76,127,76,,,,,,,,,MT32 076 Piccolo 2 -> Piccolo [semantic]
+tone,127,*,77,127,77,,,,,,,,,MT32 077 Recorder -> Recorder [exact]
+tone,127,*,78,127,78,,,,,,,,,MT32 078 Pan Pipes -> Pan Flute [semantic]
+tone,127,*,79,127,79,,,,,,,,,MT32 079 Sax 1 -> Soprano Sax [semantic]
+tone,127,*,80,127,80,,,,,,,,,MT32 080 Sax 2 -> Alto Sax [semantic]
+tone,127,*,81,127,81,,,,,,,,,MT32 081 Sax 3 -> Tenor Sax [semantic]
+tone,127,*,82,127,82,,,,,,,,,MT32 082 Sax 4 -> Baritone Sax [semantic]
+tone,127,*,83,127,83,,,,,,,,,MT32 083 Clarinet 1 -> Clarinet [semantic]
+tone,127,*,84,127,84,,,,,,,,,MT32 084 Clarinet 2 -> Clarinet [semantic]
+tone,127,*,85,127,85,,,,,,,,,MT32 085 Oboe -> Oboe [exact]
+tone,127,*,86,127,86,,,,,,,,,MT32 086 Engl Horn -> English Horn [semantic]
+tone,127,*,87,127,87,,,,,,,,,MT32 087 Bassoon -> Bassoon [exact]
+tone,127,*,88,127,88,,,,,,,,,MT32 088 Harmonica -> Harmonica [exact]
+tone,127,*,89,127,89,,,,,,,,,MT32 089 Trumpet 1 -> Trumpet [semantic]
+tone,127,*,90,127,89,,,,,,,,,MT32 090 Trumpet 2 -> Trumpet [semantic]
+tone,127,*,91,127,91,,,,,,,,,MT32 091 Trombone 1 -> Trombone [semantic]
+tone,127,*,92,127,92,,,,,,,,,MT32 092 Trombone 2 -> Trombone [semantic]
+tone,127,*,93,127,93,,,,,,,,,MT32 093 Fr Horn 1 -> French Horn [semantic]
+tone,127,*,94,127,94,,,,,,,,,MT32 094 Fr Horn 2 -> French Horn [semantic]
+tone,127,*,95,127,95,,,,,,,,,MT32 095 Tuba -> Tuba [exact]
+tone,127,*,96,127,96,,,,,,,,,MT32 096 Brs Sect 1 -> Brass [semantic]
+tone,127,*,97,127,97,,,,,,,,,MT32 097 Brs Sect 2 -> Brass 2 [semantic]
+tone,127,*,98,127,98,,,,,,,,,MT32 098 Vibe 1 -> Vibraphone [semantic]
+tone,127,*,99,127,99,,,,,,,,,MT32 099 Vibe 2 -> Vibraphone [semantic]
+tone,127,*,100,127,100,,,,,,,,,MT32 100 Syn Mallet -> Kalimba [semantic]
+tone,127,*,101,127,101,,,,,,,,,MT32 101 Windbell -> Tinkle Bell [semantic]
+tone,127,*,102,127,102,,,,,,,,,MT32 102 Glock -> Glockenspiel [semantic]
+tone,127,*,103,127,103,,,,,,,,,MT32 103 Tube Bell -> Tubular-Bell [semantic]
+tone,127,*,104,127,104,,,,,,,,,MT32 104 Xylophone -> Xylophone [exact]
+tone,127,*,105,127,105,,,,,,,,,MT32 105 Marimba -> Marimba [exact]
+tone,127,*,106,127,106,,,,,,,,,MT32 106 Koto -> Koto [exact]
+tone,127,*,107,127,107,,,,,,,,,MT32 107 Sho -> Taisho Koto [semantic]
+tone,127,*,108,127,108,,,,,,,,,MT32 108 Shakuhachi -> Shakuhachi [exact]
+tone,127,*,109,127,109,,,,,,,,,MT32 109 Whistle 1 -> Whistle [semantic]
+tone,127,*,110,127,109,,,,,,,,,MT32 110 Whistle 2 -> Whistle [semantic]
+tone,127,*,111,127,111,,,,,,,,,MT32 111 Bottleblow -> Bottle Blow [semantic]
+tone,127,*,112,127,112,,,,,,,,,MT32 112 Breathpipe -> Pan Flute [semantic]
+tone,127,*,113,127,113,,,,,,,,,MT32 113 Timpani -> Timpani [exact]
+tone,127,*,114,127,114,,,,,,,,,MT32 114 Melodic Tom -> Melo Tom [semantic]
+tone,127,*,115,127,116,,,,,,,,,MT32 115 Deep Snare -> Synth Drum [semantic]
+tone,127,*,116,127,116,,,,,,,,,MT32 116 Elec Perc 1 -> Synth Drum [semantic]
+tone,127,*,117,127,117,,,,,,,,,MT32 117 Elec Perc 2 -> Synth Drum [semantic]
+tone,127,*,118,127,118,,,,,,,,,MT32 118 Taiko -> Taiko [exact]
+tone,127,*,119,127,119,,,,,,,,,MT32 119 Taiko Rim -> Taiko [semantic]
+tone,127,*,120,127,120,,,,,,,,,MT32 120 Cymbal -> Reverse Cym. [semantic]
+tone,127,*,121,127,121,,,,,,,,,MT32 121 Castanets -> Castanets [exact]
+tone,127,*,122,127,122,,,,,,,,,MT32 122 Triangle -> Tinkle Bell [fallback]
+tone,127,*,123,127,123,,,,,,,,,MT32 123 Orche Hit -> Orchestra Hit [semantic]
+tone,127,*,124,127,124,,,,,,,,,MT32 124 Telephone -> Telephone [exact]
+tone,127,*,125,127,125,,,,,,,,,MT32 125 Bird Tweet -> Bird [semantic]
+tone,127,*,126,127,123,,,,,,,,,MT32 126 One Note Jam -> Orchestra Hit [fallback]
+tone,127,*,127,127,101,,,,,,,,,MT32 127 Water Bell -> Tinkle Bell [semantic]
+tone,127,*,128,127,128,,,,,,,,,MT32 128 Jungle Tune -> Ice Rain [fallback]
+tone,8,*,1,0,1,,,,,,,,,Piano 1w -> GM capital same PC
+tone,16,*,1,0,1,,,,,,,,,Piano 1d -> GM capital same PC
+tone,8,*,2,0,2,,,,,,,,,Piano 2w -> GM capital same PC
+tone,8,*,3,0,3,,,,,,,,,Piano 3w -> GM capital same PC
+tone,8,*,4,0,4,,,,,,,,,Honky-tonk w -> GM capital same PC
+tone,8,*,5,127,4,,,,,,,,,Detuned EP 1 -> Detuned EP 1
+tone,16,*,5,0,5,,,,,,,,,E. Piano 1v -> GM capital same PC
+tone,24,*,5,0,5,,,,,,,,,60's E. Piano -> GM capital same PC
+tone,8,*,6,127,7,,,,,,,,,Detuned EP 2 -> Detuned EP 2
+tone,16,*,6,0,6,,,,,,,,,E. Piano 2v -> GM capital same PC
+tone,8,*,7,127,18,,,,,,,,,Coupled Hps. -> Coupled Hps.
+tone,16,*,7,0,7,,,,,,,,,Harpsi.w -> GM capital same PC
+tone,24,*,7,0,7,,,,,,,,,Harpsi.o -> GM capital same PC
+tone,8,*,12,0,12,,,,,,,,,Vib.w -> GM capital same PC
+tone,8,*,13,0,13,,,,,,,,,Marimba w -> GM capital same PC
+tone,8,*,15,0,15,,,,,,,,,Church Bell -> GM capital same PC
+tone,9,*,15,0,15,,,,,,,,,Carillon -> GM capital same PC
+tone,8,*,17,127,12,,,,,,,,,Detuned Or. 1 -> Detuned Or. 1
+tone,16,*,17,0,17,,,,,,,,,60's Organ 1 -> GM capital same PC
+tone,32,*,17,0,17,,,,,,,,,Organ 4 -> GM capital same PC
+tone,8,*,18,0,18,,,,,,,,,Detuned Or. 2 -> GM capital same PC
+tone,32,*,18,0,18,,,,,,,,,Organ 5 -> GM capital same PC
+tone,8,*,20,127,13,,,,,,,,,Church Org.2 -> Church Org. 2
+tone,16,*,20,0,20,,,,,,,,,Church Org.3 -> GM capital same PC
+tone,8,*,22,0,22,,,,,,,,,Accordion It -> GM capital same PC
+tone,8,*,25,0,25,,,,,,,,,Ukulele -> GM capital same PC
+tone,16,*,25,0,25,,,,,,,,,Nylon Gt.o -> GM capital same PC
+tone,32,*,25,0,25,,,,,,,,,Nylon Gt.2 -> GM capital same PC
+tone,8,*,26,0,26,,,,,,,,,12-str. Gt. -> GM capital same PC
+tone,16,*,26,0,26,,,,,,,,,Mandolin -> GM capital same PC
+tone,8,*,27,0,27,,,,,,,,,Hawaiian Gt. -> GM capital same PC
+tone,8,*,28,127,62,,,,,,,,,Chorus Gt. -> Chorus Gt.
+tone,8,*,29,127,63,,,,,,,,,Funk Gt. -> Funk Gt.
+tone,16,*,29,0,29,,,,,,,,,Funk Gt.2 -> GM capital same PC
+tone,8,*,31,0,31,,,,,,,,,Feedback Gt. -> GM capital same PC
+tone,8,*,32,0,32,,,,,,,,,Gt. Feedback -> GM capital same PC
+tone,1,*,39,127,29,,,,,,,,,Synth Bass 101 -> MT-32 Synth Bass1
+tone,8,*,39,127,31,,,,,,,,,Synth Bass 3 -> Synth Bass 3
+tone,8,*,40,127,32,,,,,,,,,Synth Bass 4 -> Synth Bass 4
+tone,16,*,40,127,30,,,,,,,,,Rubber Bass -> MT-32 Synth Bass2
+tone,8,*,41,0,41,,,,,,,,,Slow Violin -> GM capital same PC
+tone,8,*,49,0,49,,,,,,,,,Orchestra -> GM capital same PC
+tone,8,*,51,0,51,,,,,,,,,Syn. Strings3 -> GM capital same PC
+tone,32,*,53,127,35,,,,,,,,,Choir Aahs 2 -> MT-32 Choir Aahs
+tone,1,*,58,127,92,,,,,,,,,Trombone 2 -> MT-32 Trombone #2
+tone,1,*,61,127,93,,,,,,,,,Fr. Horn -> French Horn
+tone,8,*,62,127,97,,,,,,,,,Brass 2 -> Brass 2
+tone,8,*,63,127,27,,,,,,,,,Synth Brass3 -> Synth Brass3
+tone,16,*,63,127,25,,,,,,,,,AnalogBrass1 -> MT-32 Synth Brass1
+tone,8,*,64,127,28,,,,,,,,,Synth Brass4 -> Synth Brass4
+tone,16,*,64,127,26,,,,,,,,,AnalogBrass2 -> MT-32 Synth Brass2
+tone,1,*,81,127,48,,,,,,,,,Square -> Square Wave
+tone,8,*,81,0,81,,,,,,,,,Sine Wave -> GM capital same PC
+tone,1,*,82,127,45,,,,,,,,,Saw -> Saw Wave
+tone,8,*,82,127,45,,,,,,,,,Doctor Solo -> MT-32 Saw Wave
+tone,8,*,108,127,107,,,,,,,,,Taisho Koto -> Taisho Koto
+tone,8,*,116,127,121,,,,,,,,,Castanets -> Castanets
+tone,8,*,117,0,117,,,,,,,,,Concert BD -> GM capital same PC
+tone,8,*,118,127,115,,,,,,,,,Melo Tom 2 -> MT-32 Melo Tom
+tone,8,*,119,0,119,,,,,,,,,808 Tom -> GM capital same PC
+tone,1,*,121,0,121,,,,,,,,,Gt. Cut Noise -> GM capital same PC
+tone,2,*,121,0,121,,,,,,,,,String Slap -> GM capital same PC
+tone,1,*,122,0,122,,,,,,,,,Fl. Key Click -> GM capital same PC
+tone,1,*,123,0,97,,,,,,,,,Rain -> FX 1 (rain)
+tone,2,*,123,0,123,,,,,,,,,Thunder -> GM capital same PC
+tone,3,*,123,0,123,,,,,,,,,Wind -> GM capital same PC
+tone,4,*,123,0,123,,,,,,,,,Stream -> GM capital same PC
+tone,5,*,123,0,123,,,,,,,,,Bubble -> GM capital same PC
+tone,1,*,124,0,124,,,,,,,,,Dog -> GM capital same PC
+tone,2,*,124,0,124,,,,,,,,,Horse-Gallop -> GM capital same PC
+tone,1,*,125,0,125,,,,,,,,,Telephone 2 -> GM capital same PC
+tone,2,*,125,0,125,,,,,,,,,Door Creaking -> GM capital same PC
+tone,3,*,125,0,125,,,,,,,,,Door -> GM capital same PC
+tone,4,*,125,0,125,,,,,,,,,Scratch -> GM capital same PC
+tone,5,*,125,0,125,,,,,,,,,Windchime -> GM capital same PC
+tone,1,*,126,0,126,,,,,,,,,Car-Engine -> GM capital same PC
+tone,2,*,126,0,126,,,,,,,,,Car-Stop -> GM capital same PC
+tone,3,*,126,0,126,,,,,,,,,Car-Pass -> GM capital same PC
+tone,4,*,126,0,126,,,,,,,,,Car-Crash -> GM capital same PC
+tone,5,*,126,0,126,,,,,,,,,Siren -> GM capital same PC
+tone,6,*,126,0,126,,,,,,,,,Train -> GM capital same PC
+tone,7,*,126,0,126,,,,,,,,,Jetplane -> GM capital same PC
+tone,8,*,126,0,126,,,,,,,,,Starship -> GM capital same PC
+tone,9,*,126,0,126,,,,,,,,,Burst Noise -> GM capital same PC
+tone,1,*,127,0,127,,,,,,,,,Laughing -> GM capital same PC
+tone,2,*,127,0,127,,,,,,,,,Screaming -> GM capital same PC
+tone,3,*,127,0,127,,,,,,,,,Punch -> GM capital same PC
+tone,4,*,127,0,127,,,,,,,,,Heart Beat -> GM capital same PC
+tone,5,*,127,0,127,,,,,,,,,Footsteps -> GM capital same PC
+tone,1,*,128,0,128,,,,,,,,,Machine Gun -> GM capital same PC
+tone,2,*,128,0,128,,,,,,,,,Lasergun -> GM capital same PC
+tone,3,*,128,0,128,,,,,,,,,Explosion -> GM capital same PC
+# family,src_pc,dst_bank,dst_pc,label
+family,20,127,14,Church Organ family -> MT-32 Church Org.
+family,39,127,29,Synth Bass 1 family -> MT-32 Synth Bass1
+family,40,127,30,Synth Bass 2 family -> MT-32 Synth Bass2
+family,53,127,35,Choir Aahs family -> MT-32 Choir Aahs
+family,58,127,92,Trombone family -> MT-32 Trombone #2
+family,61,127,93,French Horn family -> MT-32 French Horn
+family,62,127,97,Brass Section family -> MT-32 Brass 2
+family,63,127,25,Synth Brass 1 family -> MT-32 Synth Brass1
+family,64,127,26,Synth Brass 2 family -> MT-32 Synth Brass2
+family,81,127,48,Lead 1 family -> MT-32 Square Wave
+family,82,127,45,Lead 2 family -> MT-32 Saw Wave
+family,118,127,115,Melodic Tom family -> MT-32 Melo Tom
+# drumkit,src_pc,dst_pc,flags,label
+drumkit,1,1,0,STANDARD -> STANDARD
+drumkit,9,1,0,ROOM -> STANDARD
+drumkit,17,17,0,POWER -> POWER
+drumkit,25,17,0,ELECTRONIC -> POWER
+drumkit,26,1,0,TR-808 -> STANDARD
+drumkit,33,1,0,JAZZ -> STANDARD
+drumkit,41,41,0,BRUSH -> BRUSH
+drumkit,49,49,0,ORCHESTRA -> ORCHESTRA
+drumkit,57,128,drop_unmapped,SFX -> CM-64/32 partial
+drumkit,128,128,0,CM-64/32 -> CM-64/32 partial
+# drumnote,src_pc,src_note,dst_note,label
+drumnote,25,38,40,Elec SD -> Snare Drum 2
+drumnote,25,40,38,Gated SD -> Gated Snare
+drumnote,57,58,82,Applause -> Applauses
+drumnote,57,70,94,Helicopter -> Helicopter
+drumnote,57,72,96,Gun Shot -> Gun Shot
+drumnote,57,78,102,Birds -> Birds
+drumnote,57,82,106,Seashore -> SeaShore
