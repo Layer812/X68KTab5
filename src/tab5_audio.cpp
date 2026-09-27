@@ -5,6 +5,9 @@
  */
 #include "tab5_audio.h"
 
+/* RP_SAM2695_VOLBTN_R1: desired-state request only; UART stays on CPU0 MIDI worker. */
+extern "C" void rp_midi_uart_adjust_master_volume(int direction);
+
 
 #include <M5Unified.h>
 #include "esp_heap_caps.h"
@@ -606,6 +609,10 @@ extern "C" void tab5_audio_get_stats(tab5_audio_stats_t *out)
 
 extern "C" int tab5_audio_step_volume(int direction)
 {
+    /* RP_SAM2695_VOLBTN_R1: host desired-state update only; UART remains CPU0-owned. */
+    if (direction != 0)
+        rp_midi_uart_adjust_master_volume(direction);
+
     static const uint8_t kLevels[] = { 0, 16, 33, 64, 96, 128, 160, 192, 224, 255 };
     int current = (int)M5.Speaker.getVolume();
     int target = current;

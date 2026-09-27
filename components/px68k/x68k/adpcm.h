@@ -7,6 +7,14 @@ void FASTCALL ADPCM_PreUpdate(uint32_t clock);
 #ifdef ESP_PLATFORM
 extern int ADPCM_R127_PreCounter;
 extern uint16_t ADPCM_R127_PreStepCurrent;
+/* X68KTAB_R1A20_EVENT_DEADLINE_CORE: completed-scanline clocks are
+ * accumulated until the exact legacy ADPCM pre-update threshold can be
+ * crossed.  The visible/DMA semantics stay at the same scanline boundary;
+ * only the per-line multiply/threshold work is retired. */
+extern volatile uint32_t g_x68p4_adpcm_lazy_pending;
+extern volatile uint32_t g_x68p4_adpcm_lazy_deadline;
+void FASTCALL ADPCM_R1A20Materialize(void);
+void ADPCM_R1A20AuditGet(uint32_t out[6]);
 void FASTCALL ADPCM_PreUpdateR127Due(void);
 #endif
 void ADPCM_Update(int16_t *buffer, size_t length, uint8_t *pbsp, uint8_t *pbep);

@@ -63,7 +63,7 @@ extern int m68k_tab5_x68p4_machine_run_scanline(
     uint32_t line, uint32_t total_lines, int cpu_cycles,
     unsigned int midi_delay, int *periph_cycles_out);
 extern void m68k_tab5_x68p4_machine_finish_scanline(
-    int periph_cycles, int key_int_period, int mouse_int_period);
+    int periph_cycles, int key_int_period);
 extern void m68k_tab5_x68p4_machine_frame_end(void);
 #endif
 
@@ -337,22 +337,71 @@ static void extract_directory(char *buf, const char *path, size_t size)
 /* BEGIN MIDI INTERFACE */
 #include "x68k/midi.h"
 #include "libretro/mmsystem.h"
+
+#ifdef ESP_PLATFORM
+/* RP_SAM2695_PATCH_V1: non-blocking RetroP4 UART MIDI sink. */
+extern bool rp_midi_uart_ready(void);
+extern void *rp_midi_uart_handle(void);
+extern bool rp_midi_uart_submit_byte(uint8_t byte);
+#endif
 static int libretro_supports_midi_output = 0;
 static struct retro_midi_interface midi_cb = { 0 };
 static bool libretro_supports_option_categories = 0;
 
 void midi_out_short_msg(size_t msg)
 {
+#ifdef ESP_PLATFORM
+   if (rp_midi_uart_ready())
+   {
+      const uint8_t status = (uint8_t)(msg & 0xffu);
+      size_t n = 1;
+
+      if (status >= 0x80u && status < 0xf0u)
+         n = (((status & 0xf0u) == 0xc0u) ||
+              ((status & 0xf0u) == 0xd0u)) ? 2u : 3u;
+      else
+      {
+         switch (status)
+         {
+            case 0xf1:
+            case 0xf3:
+               n = 2;
+               break;
+            case 0xf2:
+               n = 3;
+               break;
+            default:
+               n = 1;
+               break;
+         }
+      }
+
+      for (size_t i = 0; i < n; ++i)
+         (void)rp_midi_uart_submit_byte(
+             (uint8_t)((msg >> (8u * i)) & 0xffu));
+      return;
+   }
+#endif
+
    if (libretro_supports_midi_output && midi_cb.output_enabled())
    {
-      midi_cb.write(msg         & 0xFF, 0); /* status byte */
-      midi_cb.write((msg >> 8)  & 0xFF, 0); /* note no. */
-      midi_cb.write((msg >> 16) & 0xFF, 0); /* velocity */
+      midi_cb.write(msg         & 0xFF, 0);
+      midi_cb.write((msg >> 8)  & 0xFF, 0);
+      midi_cb.write((msg >> 16) & 0xFF, 0);
    }
 }
 
 void midi_out_long_msg(uint8_t *s, size_t len)
 {
+#ifdef ESP_PLATFORM
+   if (rp_midi_uart_ready())
+   {
+      for (size_t i = 0; i < len; ++i)
+         (void)rp_midi_uart_submit_byte(s[i]);
+      return;
+   }
+#endif
+
    if (libretro_supports_midi_output && midi_cb.output_enabled())
    {
       int i;
@@ -363,6 +412,14 @@ void midi_out_long_msg(uint8_t *s, size_t len)
 
 int midi_out_open(void **phmo)
 {
+#ifdef ESP_PLATFORM
+   if (rp_midi_uart_ready())
+   {
+      *phmo = rp_midi_uart_handle();
+      return 0;
+   }
+#endif
+
    if (libretro_supports_midi_output && midi_cb.output_enabled())
    {
       *phmo = &midi_cb;
@@ -2424,7 +2481,7 @@ static inline __attribute__((always_inline)) int tab5_r57e70a_slice_request(
 static void WinX68k_Exec(void)
 {
    int clk_total, clkdiv, usedclk, hsync, clk_next, clk_count, clk_line=0;
-   int KeyIntCnt = 0, MouseIntCnt = 0;
+   int KeyIntCnt = 0;
    uint32_t t_start = timeGetTime(), t_end;
 
    if(!(cpu_readmem24_dword(0xed0008) == Config.ram_size))
@@ -2616,12 +2673,8 @@ static void WinX68k_Exec(void)
             KeyIntCnt = 0;
             Keyboard_Int();
          }
-         MouseIntCnt++;
-         if (MouseIntCnt > (VLINE_TOTAL / 8))
-         {
-            MouseIntCnt = 0;
-            SCC_IntCheck();
-         }
+         /* X68KTAB_R1A14_SCC_EVENT_DRIVEN:
+          * RX IRQ is raised by SCC state transitions, not scanline polling. */
          DSound_Send0(clk_line);
 
          vline++;
@@ -3063,7 +3116,12 @@ int WinX68k_StandaloneInit(void)
      * even when the Tab5 has no external MIDI sink; midi_out_* already
      * degrades safely to a null output while FIFO/status/timers continue. */
     Config.MIDI_SW = 1;
-    Config.MIDI_Type = 0; /* LA/MT-32-compatible default; hardware presence matters here. */
+    #ifdef ESP_PLATFORM
+    /* SAM2695 UART backend uses General MIDI reset semantics. */
+    Config.MIDI_Type = rp_midi_uart_ready() ? 1 : 0;
+    #else
+    Config.MIDI_Type = 0;
+    #endif
 
     /* Match the hardware one-time init section in PX68K pmain(). */
     Keyboard_Init();
@@ -3261,7 +3319,6 @@ int WinX68k_ExecVideoProbeFrame(void)
     const int line_clk_base = clk_total / total_lines;
     const int line_clk_rem = clk_total % total_lines;
     const int key_int_period = total_lines / 4;
-    const int mouse_int_period = total_lines / 8;
     int line_clk_error = 0;
     ICount = clk_total;
 
@@ -3298,8 +3355,7 @@ int WinX68k_ExecVideoProbeFrame(void)
         }
 
         m68k_tab5_x68p4_machine_finish_scanline(clk_line,
-                                                  key_int_period,
-                                                  mouse_int_period);
+                                                  key_int_period);
         DSound_Send0(clk_line);
     }
 

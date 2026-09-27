@@ -13,7 +13,6 @@
 typedef enum
 {
     TAB5_VIDEO_ACTION_NONE = 0,
-    TAB5_VIDEO_ACTION_PANIC_RANDOM,
     TAB5_VIDEO_ACTION_MOUNT_FDD0,
     TAB5_VIDEO_ACTION_MOUNT_FDD1,
     TAB5_VIDEO_ACTION_EJECT_FDD0,
@@ -38,8 +37,6 @@ void tab5_video_init(void);
 /* Enable the reference game-screen chrome in the 160px side bars. */
 void tab5_video_set_game_controls_enabled(int enabled);
 
-/* Enable PanicPlayer's direct packed-GVRAM compatibility presenter. */
-void tab5_video_set_panic_compat_enabled(int enabled);
 
 /* CPU1 consumes high-level touch actions produced by CPU0. */
 int tab5_video_poll_action(tab5_video_action_t *out);

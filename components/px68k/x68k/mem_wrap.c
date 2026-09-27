@@ -100,6 +100,29 @@ PX68K_MEMHOT uint32_t BusErrFlag = 0;
 PX68K_MEMHOT uint32_t BusErrHandling = 0;
 static PX68K_MEMHOT uint32_t BusErrAdr = 0;
 
+/* X68KTAB_R1A17_SYSTEM_COST_AUDIT: byte-dispatch counts for MMIO pages only.
+ * RAM/GVRAM/TVRAM accesses are intentionally not incremented here so the audit
+ * does not add a counter write to the hottest ordinary-memory path. */
+#define R1A17_MMIO_FIRST 0x40u
+#define R1A17_MMIO_LAST  0x68u
+#define R1A17_MMIO_SLOTS (R1A17_MMIO_LAST - R1A17_MMIO_FIRST + 1u)
+static PX68K_MEMHOT volatile uint32_t s_r1a17_mmio_r[R1A17_MMIO_SLOTS];
+static PX68K_MEMHOT volatile uint32_t s_r1a17_mmio_w[R1A17_MMIO_SLOTS];
+static inline __attribute__((always_inline)) void r1a17_mmio_note_r(unsigned slot)
+{
+    (void)slot;
+}
+static inline __attribute__((always_inline)) void r1a17_mmio_note_w(unsigned slot)
+{
+    (void)slot;
+}
+
+void MemWrap_R1A17AuditGet(uint32_t out_r[R1A17_MMIO_SLOTS], uint32_t out_w[R1A17_MMIO_SLOTS])
+{
+    if (out_r) for (unsigned i=0;i<R1A17_MMIO_SLOTS;++i) out_r[i]=0u;
+    if (out_w) for (unsigned i=0;i<R1A17_MMIO_SLOTS;++i) out_w[i]=0u;
+}
+
 /* forward declarations */
 static void wm_opm(uint32_t addr, uint8_t val);
 static void wm_adpcm(uint32_t addr, uint8_t val);
@@ -221,6 +244,7 @@ static void wm_cnt(uint32_t addr, uint8_t val)
          * generic function-pointer table.  Keep uncommon devices on the
          * original table rather than growing another generic decoder. */
         const unsigned slot = (unsigned)((addr >> 13) & 0xffu);
+        r1a17_mmio_note_w(slot);
         if (__builtin_expect(slot == 0x48u, 0)) { wm_opm(addr, val); return; }
         if (__builtin_expect(slot == 0x44u, 0)) { MFP_Write(addr, val); return; }
         if (__builtin_expect(slot == 0x42u, 0)) { DMA_Write(addr, val); return; }
@@ -272,6 +296,7 @@ static uint8_t rm_main(uint32_t addr)
     /* R140P1: MDX/XVI16 hot MMIO pages go directly to the same authoritative
      * device handlers.  Optional/uncommon pages retain the original table. */
     const unsigned slot = (unsigned)((addr >> 13) & 0xffu);
+    r1a17_mmio_note_r(slot);
     if (__builtin_expect(slot == 0x44u, 0)) return MFP_Read(addr);
     if (__builtin_expect(slot == 0x48u, 0)) return rm_opm(addr);
     if (__builtin_expect(slot == 0x42u, 0)) return DMA_Read(addr);

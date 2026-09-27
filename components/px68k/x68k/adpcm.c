@@ -144,6 +144,33 @@ static PX68K_ADHOT uint8_t ADPCM_Clock = 0;
 PX68K_ADHOT int ADPCM_R127_PreCounter = 0;
 PX68K_ADHOT uint16_t ADPCM_R127_PreStepCurrent = 3906u;
 #define ADPCM_PreCounter ADPCM_R127_PreCounter
+
+/* X68KTAB_R1A20_EVENT_DEADLINE_CORE
+ *
+ * The historical ESP fast path did one multiply+add+compare on every
+ * scanline, then called ADPCM_PreUpdateR127Due() only when the 10,000,000
+ * numerator threshold was reached.  Preserve that exact completed-scanline
+ * visibility but reserve the next crossing in 10 MHz guest cycles. */
+PX68K_ADHOT volatile uint32_t g_x68p4_adpcm_lazy_pending = 0u;
+PX68K_ADHOT volatile uint32_t g_x68p4_adpcm_lazy_deadline = 1u;
+static volatile uint32_t s_r1a20_adpcm_materialize;
+static volatile uint32_t s_r1a20_adpcm_deadline_hits;
+static volatile uint32_t s_r1a20_adpcm_clock_flush;
+static volatile uint32_t s_r1a20_adpcm_due_loops;
+
+static inline uint32_t ADPCM_R1A20NextDeadline(void)
+{
+    const uint32_t step = (uint32_t)ADPCM_R127_PreStepCurrent;
+    const int c = ADPCM_PreCounter;
+    if (!step || c >= 10000000L) return 1u;
+    const uint32_t remain = 10000000u - (uint32_t)c;
+    return (remain + step - 1u) / step;
+}
+
+static inline void ADPCM_R1A20Rearm(void)
+{
+    g_x68p4_adpcm_lazy_deadline = ADPCM_R1A20NextDeadline();
+}
 #else
 static PX68K_ADHOT int ADPCM_PreCounter = 0;
 #endif
@@ -175,6 +202,10 @@ int ADPCM_Tab5SpmStateOk(void)
 
 int ADPCM_StateAction(StateMem *sm, int load, int data_only)
 {
+#ifdef ESP_PLATFORM
+    if (!load) ADPCM_R1A20Materialize();
+    else g_x68p4_adpcm_lazy_pending = 0u;
+#endif
 	SFORMAT StateRegs[] = 
 	{
 		/* TODO: Some of the vars might not be necessary */
@@ -208,7 +239,10 @@ int ADPCM_StateAction(StateMem *sm, int load, int data_only)
 
 	int ret = PX68KSS_StateAction(sm, load, data_only, StateRegs, "X68K_ADPC", false);
 #ifdef ESP_PLATFORM
-    if (load) ADPCM_R127_PreStepCurrent = ADPCM_PreStep[ADPCM_Clock & 7u];
+    if (load) {
+        ADPCM_R127_PreStepCurrent = ADPCM_PreStep[ADPCM_Clock & 7u];
+        ADPCM_R1A20Rearm();
+    }
 #endif
 
 	return ret;
@@ -245,6 +279,9 @@ void PX68K_ADIRAM FASTCALL ADPCM_PreUpdateR127Due(void)
 	const uint8_t ci = (uint8_t)(ADPCM_Clock & 7u);
 	while (ADPCM_PreCounter >= 10000000L)
     {
+#ifdef ESP_PLATFORM
+        (void)0;
+#endif
 		ADPCM_DifBuf -= (int)ADPCM_DifStep[ci];
 		if (ADPCM_DifBuf <= 0)
         {
@@ -255,15 +292,44 @@ void PX68K_ADIRAM FASTCALL ADPCM_PreUpdateR127Due(void)
 	}
 }
 
+#ifdef ESP_PLATFORM
+void PX68K_ADIRAM FASTCALL ADPCM_R1A20Materialize(void)
+{
+    const uint32_t clk = g_x68p4_adpcm_lazy_pending;
+    g_x68p4_adpcm_lazy_pending = 0u;
+    if (!clk) { ADPCM_R1A20Rearm(); return; }
+
+    (void)0;
+    ADPCM_PreCounter += (int)((uint32_t)ADPCM_R127_PreStepCurrent * clk);
+    if (ADPCM_PreCounter >= 10000000L) {
+        (void)0;
+        ADPCM_PreUpdateR127Due();
+    }
+    ADPCM_R1A20Rearm();
+}
+
+void ADPCM_R1A20AuditGet(uint32_t out[6])
+{
+    if (!out) return;
+    for (unsigned i=0;i<6u;++i) out[i]=0u;
+}
+#endif
+
 void PX68K_ADIRAM FASTCALL ADPCM_PreUpdate(uint32_t clock)
 {
 #ifdef ESP_PLATFORM
+    /* Compatibility path: if a legacy executor calls direct PreUpdate while
+     * completed standalone lines are pending, preserve ordering first. */
+    if (g_x68p4_adpcm_lazy_pending) ADPCM_R1A20Materialize();
     ADPCM_PreCounter += (int)(ADPCM_R127_PreStepCurrent * clock);
 #else
 	const uint8_t ci = (uint8_t)(ADPCM_Clock & 7u);
     ADPCM_PreCounter += (int)(ADPCM_PreStep[ci] * clock);
 #endif
     if (ADPCM_PreCounter >= 10000000L) ADPCM_PreUpdateR127Due();
+#ifdef ESP_PLATFORM
+    ADPCM_R1A20Rearm();
+#endif
 }
 
 void ADPCM_Update(int16_t *buffer, size_t length, uint8_t *pbsp, uint8_t *pbep)
@@ -622,11 +688,15 @@ void ADPCM_SetPan(int n)
 {
 	if ( (ADPCM_Pan&0x0c)!=(n&0x0c) )
    {
+#ifdef ESP_PLATFORM
+        if (g_x68p4_adpcm_lazy_pending) { (void)0; ADPCM_R1A20Materialize(); }
+#endif
 		ADPCM_Count     = 0;
 		ADPCM_Clock     = (ADPCM_Clock&4)|((n>>2)&3);
 		ADPCM_ClockRate = ADPCM_Clocks[ADPCM_Clock];
 #ifdef ESP_PLATFORM
         ADPCM_R127_PreStepCurrent = ADPCM_PreStep[ADPCM_Clock & 7u];
+        ADPCM_R1A20Rearm();
 #endif
 	}
 	ADPCM_Pan = n;
@@ -639,11 +709,15 @@ void ADPCM_SetClock(int n)
 {
 	if ( (ADPCM_Clock&4)!=n )
    {
+#ifdef ESP_PLATFORM
+        if (g_x68p4_adpcm_lazy_pending) { (void)0; ADPCM_R1A20Materialize(); }
+#endif
 		ADPCM_Count     = 0;
 		ADPCM_Clock     = n | ((ADPCM_Pan>>2)&3);
 		ADPCM_ClockRate = ADPCM_Clocks[ADPCM_Clock];
 #ifdef ESP_PLATFORM
         ADPCM_R127_PreStepCurrent = ADPCM_PreStep[ADPCM_Clock & 7u];
+        ADPCM_R1A20Rearm();
 #endif
 	}
 #ifdef ESP_PLATFORM
@@ -661,6 +735,11 @@ void ADPCM_Init(void)
 	ADPCM_SampleRate = ADPCM_SAMPLE_RATE_X12;
 	ADPCM_PreCounter = 0;
 #ifdef ESP_PLATFORM
+    g_x68p4_adpcm_lazy_pending = 0u;
+    s_r1a20_adpcm_materialize = 0u;
+    s_r1a20_adpcm_deadline_hits = 0u;
+    s_r1a20_adpcm_clock_flush = 0u;
+    s_r1a20_adpcm_due_loops = 0u;
     s_adpcm_buf_highwater = 0;
     s_adpcm_buf_overflows = 0;
 #endif
@@ -671,6 +750,9 @@ void ADPCM_Init(void)
 	OldL = OldR = 0;
 
 	ADPCM_SetPan(0x0b);
+#ifdef ESP_PLATFORM
+    ADPCM_R1A20Rearm();
+#endif
 	ADPCM_InitTable();
 #ifdef ESP_PLATFORM
     printf("PX68K_ADSRAM_R24: Core1 ADPCM decode staging INTERNAL bytes=%u frames=%u (~%ums) highwater=0 overflow=0; R23 measured max=24, capacity reduced 4096->256\n",

@@ -16,9 +16,7 @@ void HostFS_StrategyTrap(void);
 void HostFS_InterruptTrap(void);
 uint32_t HostFS_DebugCalls(void);
 int HostFS_DebugDrive(void);
-/* Build 6.12q: successful opens of staged PANIC bootstrap files. */
-uint32_t HostFS_DebugPanicBatchOpens(void);
-uint32_t HostFS_DebugPanicPlayerOpens(void);
-uint32_t HostFS_DebugPanicPanOpens(void);
+/* X68KTAB_R1A15_HOSTFS_FASTPATH diagnostics, observation only. */
+void HostFS_R1A15GetStats(uint32_t out[9]);
 
 #endif

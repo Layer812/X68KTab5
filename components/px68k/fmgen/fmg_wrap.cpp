@@ -117,6 +117,11 @@ static MyOPM* opm = NULL;
 #endif
 
 #ifdef ESP_PLATFORM
+
+/* R1A18 lazy control-plane horizon.  Defined before FastOPMControl because
+ * NextObservable10MHz() uses it. */
+#define R1A18_OPM_LAZY_MAX_CYCLES 0x3ffff000u
+
 /*
  * Build 5.39 / ESP32-P4:
  * The CPU1 guest task no longer carries a complete FMGEN OPM synthesizer.  Waveform/EG/LFO
@@ -130,6 +135,8 @@ static MyOPM* opm = NULL;
  *   Timer B period = ( 256 - TB) * 256 us
  * The old FMGEN Count() while-loops are reduced to constant-time modulo math.
  */
+extern "C" void rp_midi_diag_event(uint8_t kind, uint32_t value);
+/* RP_MIDI_SCHED_DIAG_V1I */
 struct FastOPMControl
 {
     int32_t cur_reg;
@@ -185,8 +192,9 @@ struct FastOPMControl
         {
             status |= bits;
 #if PX68K_TAB5_R57E63_AUDIO_AUDIT
-            if (bits & 2u) ++audit_tb_irq_sets;
+            if (bits & 2u) (void)0;
 #endif
+            (void)0;
             ::MFP_Int(12);
         }
     }
@@ -194,9 +202,10 @@ struct FastOPMControl
     void ResetStatus(uint8_t bits)
     {
 #if PX68K_TAB5_R57E63_AUDIO_AUDIT
-        if ((bits & 2u) && (status & 2u)) ++audit_tb_status_clears;
+        if ((bits & 2u) && (status & 2u)) (void)0;
 #endif
         status &= (uint8_t)~bits;
+        (void)0;
         /* MyOPM::Intr(false) was intentionally a no-op as well. */
     }
 
@@ -205,14 +214,16 @@ struct FastOPMControl
         regta[addr & 1u] = data;
         const uint32_t ta = ((uint32_t)regta[0] << 2) | ((uint32_t)regta[1] & 3u);
         timera_us = (1024u - ta) * 16u;
+        (void)0;
     }
 
     void SetTimerB(uint8_t data)
     {
         regtb = data;
         timerb_us = (256u - (uint32_t)data) * 256u;
+        (void)0;
 #if PX68K_TAB5_R57E63_AUDIO_AUDIT
-        ++audit_tb_writes;
+        (void)0;
 #endif
     }
 
@@ -220,13 +231,14 @@ struct FastOPMControl
     {
         const uint8_t changed = regtc ^ data;
 #if PX68K_TAB5_R57E63_AUDIO_AUDIT
-        ++audit_tc_writes;
+        (void)0;
         if (changed & 0x02u) {
-            if (data & 0x02u) ++audit_tb_starts;
-            else ++audit_tb_stops;
+            if (data & 0x02u) (void)0;
+            else (void)0;
         }
 #endif
         regtc = data;
+        (void)0;
         if (data & 0x10u) ResetStatus(1u);
         if (data & 0x20u) ResetStatus(2u);
         if (changed & 0x01u) timera_count_us = (data & 0x01u) ? timera_us : 0u;
@@ -253,8 +265,10 @@ struct FastOPMControl
         bool b_expired = false;
         timera_count_us = AdvanceCounter(timera_count_us, timera_us, us, &a_expired);
         timerb_count_us = AdvanceCounter(timerb_count_us, timerb_us, us, &b_expired);
+        if (a_expired) rp_midi_diag_event(14, timera_us);
+        if (b_expired) rp_midi_diag_event(15, timerb_us);
 #if PX68K_TAB5_R57E63_AUDIO_AUDIT
-        if (b_expired) ++audit_tb_expires;
+        if (b_expired) (void)0;
 #endif
         /* FMGEN OPM::TimerA() performs CSM key-off/key-on on all 8 channels.
          * 5.40 preserves that rare side effect with one sparse queue event,
@@ -267,13 +281,44 @@ struct FastOPMControl
     void CountGuest10MHz(uint32_t clocks)
     {
 #if PX68K_TAB5_R57E63_AUDIO_AUDIT
-        audit_guest_clocks += (uint64_t)clocks;
-        ++audit_timer_calls;
+        (void)0;
+        (void)0;
 #endif
         subus_10mhz += clocks;
         const uint32_t us = subus_10mhz / 10u;
         subus_10mhz %= 10u;
         if (us) CountUs(us);
+    }
+
+    uint32_t NextObservable10MHz() const
+    {
+        uint32_t best = R1A18_OPM_LAZY_MAX_CYCLES;
+
+        /* Timer A must wake CPU1 only when an overflow can become visible:
+         * status/IRQ enabled and not already latched, or CSM is active. */
+        const bool a_visible =
+            ((regtc & 0x01u) != 0u) &&
+            (((regtc & 0x80u) != 0u) ||
+             (((regtc & 0x04u) != 0u) && ((status & 0x01u) == 0u)));
+        if (a_visible && timera_count_us)
+        {
+            uint32_t d = timera_count_us * 10u;
+            d = (d > subus_10mhz) ? (d - subus_10mhz) : 1u;
+            if (d < best) best = d;
+        }
+
+        /* Timer B has no CSM side effect. Once status is already latched,
+         * further wraps are not guest-visible until software clears it. */
+        const bool b_visible =
+            ((regtc & 0x02u) != 0u) && ((regtc & 0x08u) != 0u) &&
+            ((status & 0x02u) == 0u);
+        if (b_visible && timerb_count_us)
+        {
+            uint32_t d = timerb_count_us * 10u;
+            d = (d > subus_10mhz) ? (d - subus_10mhz) : 1u;
+            if (d < best) best = d;
+        }
+        return best;
     }
 
     void WriteIO(uint32_t adr, uint8_t data)
@@ -285,6 +330,8 @@ struct FastOPMControl
         }
 
         const uint8_t reg = (uint8_t)cur_reg;
+        if (reg == 0x08u && (data & 0x78u))
+            (void)0;
         if (reg == 0x1bu)
         {
             ::ADPCM_SetClock((data >> 5) & 4);
@@ -330,6 +377,27 @@ static TCM_DRAM_ATTR int s_fast_opm_ready = 0;
 static DRAM_ATTR FastOPMControl s_fast_opm;
 static DRAM_ATTR int s_fast_opm_ready = 0;
 #endif
+
+/* X68KTAB_R1A18_VGMM5_OPM_LINEPOLL_RETIRE
+ * vgmM5 waveform synthesis is already 44.1-kHz/sample driven on CPU0.
+ * CPU1 keeps only guest-visible YM2151 Timer A/B status/IRQ semantics.
+ * Do not run that control-plane timer once per scanline: accumulate elapsed
+ * 10-MHz guest clocks and materialize only at the next observable timer
+ * event, OPM MMIO observation/change, or a very rare overflow-safety fence.
+ * CPU1 remains the sole writer; CPU0 never touches these lazy-clock fields. */
+extern "C" {
+DRAM_ATTR volatile uint32_t g_x68p4_opm_lazy_pending = 0u;
+DRAM_ATTR volatile uint32_t g_x68p4_opm_lazy_deadline = R1A18_OPM_LAZY_MAX_CYCLES;
+}
+static DRAM_ATTR volatile uint32_t s_r1a18_opm_materialize = 0u;
+static DRAM_ATTR volatile uint32_t s_r1a18_opm_deadline_hits = 0u;
+static DRAM_ATTR volatile uint32_t s_r1a18_opm_mmio_flush = 0u;
+static DRAM_ATTR volatile uint32_t s_r1a18_opm_safety_flush = 0u;
+/* R1A17 counters remain the public audit surface; in R1A18 these count actual
+ * materializations instead of every scanline entry. */
+static DRAM_ATTR volatile uint32_t s_r1a17_opm_timer_calls = 0u;
+static DRAM_ATTR volatile uint32_t s_r1a17_opm_timer_active_calls = 0u;
+
 #endif
 
 /*
@@ -826,11 +894,68 @@ static int async_opm_init(int clock)
 }
 #endif /* ESP_PLATFORM */
 
+#ifdef ESP_PLATFORM
+static inline void r1a18_opm_rearm_deadline(void)
+{
+    uint32_t d = R1A18_OPM_LAZY_MAX_CYCLES;
+    if (s_fast_opm_ready) d = s_fast_opm.NextObservable10MHz();
+    if (!d || d > R1A18_OPM_LAZY_MAX_CYCLES) d = R1A18_OPM_LAZY_MAX_CYCLES;
+    g_x68p4_opm_lazy_deadline = d;
+}
+
+static inline void r1a18_opm_advance_exact(uint32_t step)
+{
+    (void)0;
+    if (s_fast_opm_ready && (s_fast_opm.regtc & 0x03u))
+        (void)0;
+    if (s_fast_opm_ready) s_fast_opm.CountGuest10MHz(step);
+    if (!s_audio_async_enabled && opm) opm->Count2(step);
+}
+
+extern "C" void FASTCALL OPM_R1A18Materialize(void)
+{
+    const uint32_t pending = g_x68p4_opm_lazy_pending;
+    const uint32_t deadline = g_x68p4_opm_lazy_deadline;
+    if (pending)
+    {
+        g_x68p4_opm_lazy_pending = 0u;
+        (void)0;
+        if (pending >= deadline)
+        {
+            if (deadline == R1A18_OPM_LAZY_MAX_CYCLES)
+                (void)0;
+            else
+                (void)0;
+        }
+        r1a18_opm_advance_exact(pending);
+    }
+    r1a18_opm_rearm_deadline();
+}
+
+extern "C" void OPM_R1A18AuditGet(uint32_t out[6])
+{
+    if (!out) return;
+    for (unsigned i=0;i<6u;++i) out[i]=0u;
+}
+#endif
+
 int OPM_StateAction(StateMem *sm, int load, int data_only)
 {
 #ifdef ESP_PLATFORM
+    /* Saving must serialize the exact current timer phase.  Loading must NOT
+     * materialize the pre-load state first, because that could emit a stale
+     * IRQ/CSM edge immediately before the saved state overwrites it. */
+    if (!load)
+        OPM_R1A18Materialize();
+    else
+        g_x68p4_opm_lazy_pending = 0u;
     if (s_fast_opm_ready)
-        return s_fast_opm.StateAction(sm, load, data_only);
+    {
+        const int ret = s_fast_opm.StateAction(sm, load, data_only);
+        g_x68p4_opm_lazy_pending = 0u;
+        r1a18_opm_rearm_deadline();
+        return ret;
+    }
     return 1;
 #else
     if (opm)
@@ -853,7 +978,9 @@ int OPM_Init(int clock)
         printf("PX68K_OPMCTL: R23 FATAL CPU0 YM2151 Internal-only backend unavailable; FM PSRAM/default-heap fallback forbidden\n");
         return 0;
     }
-    printf("PX68K_OPMCTL: Build 6.15h17R23 CPU1 SPM timer/status + CPU0 Internal-only YM2151 backend active; FM PSRAM bytes=0\n");
+    g_x68p4_opm_lazy_pending = 0u;
+    r1a18_opm_rearm_deadline();
+    printf("PX68K_OPMCTL: R1A18 vgmM5 44.1k waveform + lazy guest Timer A/B control plane; scanline OPM_Timer retired\n");
     return 1;
 #else
     opm = new MyOPM();
@@ -874,6 +1001,8 @@ void OPM_Cleanup(void)
     g_x68p4_opm_async_ready = 0;
     s_audio_async_enabled = 0;
     s_fast_opm_ready = 0;
+    g_x68p4_opm_lazy_pending = 0u;
+    g_x68p4_opm_lazy_deadline = R1A18_OPM_LAZY_MAX_CYCLES;
     /* R23 ESP path never constructs legacy MyOPM. */
     opm = NULL;
 #else
@@ -887,6 +1016,8 @@ void OPM_Reset(void)
 #ifdef ESP_PLATFORM
     s_fast_opm.Reset();
     s_fast_opm_ready = 1;
+    g_x68p4_opm_lazy_pending = 0u;
+    r1a18_opm_rearm_deadline();
     if (opm) opm->Reset();
     if (s_audio_async_enabled)
     {
@@ -902,6 +1033,8 @@ void OPM_Reset(void)
 uint8_t FASTCALL OPM_Read(void)
 {
 #ifdef ESP_PLATFORM
+    if (g_x68p4_opm_lazy_pending) (void)0;
+    OPM_R1A18Materialize();
     return s_fast_opm_ready ? s_fast_opm.status : 0;
 #else
     if (opm) return opm->ReadStatus();
@@ -920,6 +1053,11 @@ static uint32_t s_debug_opm_keyons = 0;
 
 extern "C" uint32_t OPM_DebugDataWriteCount(void) { return s_debug_opm_data_writes; }
 extern "C" uint32_t OPM_DebugKeyOnCount(void) { return s_debug_opm_keyons; }
+extern "C" void OPM_R1A17AuditGet(uint32_t out[3])
+{
+    if (!out) return;
+    out[0]=out[1]=out[2]=0u;
+}
 
 extern "C" void OPM_R57E63TimerAuditGet(
     uint64_t *guest_clocks, uint32_t *timer_calls,
@@ -965,7 +1103,18 @@ void FASTCALL OPM_WriteTimed(uint32_t adr, uint8_t data, uint32_t frames)
 {
 #ifdef ESP_PLATFORM
     if (s_fast_opm_ready)
+    {
+        /* Data-port writes can alter timer period/control/status. Advance the
+         * old control state to this existing line-granularity boundary first.
+         * Address-latch writes are timer-neutral and stay fast. */
+        if (adr & 1u)
+        {
+            if (g_x68p4_opm_lazy_pending) (void)0;
+            OPM_R1A18Materialize();
+        }
         s_fast_opm.WriteIO(adr, data);
+        if (adr & 1u) r1a18_opm_rearm_deadline();
+    }
     if (s_audio_async_enabled)
     {
         if ((adr & 1) == 0)
@@ -1015,10 +1164,10 @@ void OPM_Update(int16_t *buffer, int length, uint8_t *pbsp, uint8_t *pbep)
 void FASTCALL OPM_Timer(uint32_t step)
 {
 #ifdef ESP_PLATFORM
-    if (s_fast_opm_ready)
-        s_fast_opm.CountGuest10MHz(step);
-    if (!s_audio_async_enabled && opm)
-        opm->Count2(step);
+    /* Compatibility entry point: exact timer math is retained, but the R1A18
+     * Machine Kernel no longer calls this once per scanline. */
+    r1a18_opm_advance_exact(step);
+    r1a18_opm_rearm_deadline();
 #else
     if (opm) opm->Count2(step);
 #endif

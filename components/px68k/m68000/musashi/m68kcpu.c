@@ -76,6 +76,16 @@ extern void m68ki_build_opcode_table(void);
 #include "../../fmgen/fmg_wrap.h"
 #include "../../libretro/keyboard.h"
 
+/* X68KTAB_R1A18_VGMM5_OPM_LINEPOLL_RETIRE: CPU1 owns both fields.
+ * One add+compare replaces the old full OPM_Timer() call on every scanline. */
+extern volatile uint32_t g_x68p4_opm_lazy_pending;
+extern volatile uint32_t g_x68p4_opm_lazy_deadline;
+extern void FASTCALL OPM_R1A18Materialize(void);
+
+/* X68KTAB_R1A20_EVENT_DEADLINE_CORE: scanline hot path only accumulates
+ * exact 10-MHz clocks for MIDI and ADPCM. Full work is materialized at the
+ * same legacy-visible boundary when its next deadline is crossed. */
+
 /* R57E138A: X68P4 processor cutover.  Runtime RV32 generation, generic JIT
  * discovery and the small/sparse Trace134-137 entry paths are retired.  The
  * hot executor consumes predecoded X68P4Op pages from fixed Internal SRAM. */
@@ -1472,7 +1482,22 @@ extern int ClkUsed;
 
 
 static DRAM_ATTR int s_x68p4_machine_key_int_cnt = 0;
-static DRAM_ATTR int s_x68p4_machine_mouse_int_cnt = 0;
+
+/* X68KTAB_R1A17_SYSTEM_COST_AUDIT
+ * Observation only. 32-bit cumulative counters let CPU0 sample the Machine
+ * Kernel without locks and without changing guest-visible scheduling. */
+enum {
+    R1A17_A_LINES, R1A17_A_SLICES, R1A17_A_CHOOSE_NONE, R1A17_A_CHOOSE_MFP,
+    R1A17_A_CHOOSE_RTC, R1A17_A_CHOOSE_DMA, R1A17_A_CHOOSE_POLL,
+    R1A17_A_MFP_ACTIVE, R1A17_A_RTC_OPEN, R1A17_A_DMA_ACTIVE,
+    R1A17_A_HSYNC_CALL, R1A17_A_HSYNC_ENABLED, R1A17_A_TIMERA_CHECK,
+    R1A17_A_TIMERA_ACTIVE, R1A17_A_ONEPASS_LINE, R1A17_A_ADPCM_DUE,
+    R1A17_A_OPM_LINE, R1A17_A_MIDI_LINE, R1A17_A_KEY_SERVICE,
+    R1A17_A_FDD_FRAME, R1A17_A_DMA0_ACTIVE, R1A17_A_DMA1_ACTIVE,
+    R1A17_A_DMA2_ACTIVE, R1A17_A_RASTER_IRQ, R1A17_A_VBLANK_IRQ,
+    R1A17_A_COUNT
+};
+static DRAM_ATTR volatile uint32_t s_r1a17_a[R1A17_A_COUNT];
 
 /* Convert a peripheral-clock deadline into the smallest positive guest-CPU
  * request whose existing ClkUsed conversion reaches that deadline.  This is
@@ -1506,17 +1531,18 @@ x68p4_j2_choose_request_p12(int remaining)
         ((unsigned)ClkUsed + (unsigned)(remaining - 1) * 10u) / 12u;
     const int no_early_deadline = (int)early_periph + 1;
     int best_periph = no_early_deadline;
+    unsigned r1a17_reason = 0u;
 
     /* MFP's exact next IRQ deadline is maintained as a shadow at guest state
      * changes / true crossings.  The common choose path is one load+compare. */
     int d = MFP_R140MK1DeadlineMin(best_periph);
-    if (d < best_periph) best_periph = d;
+    if (d < best_periph) { best_periph = d; r1a17_reason = 1u; }
 
     /* RTC can only preempt when MFP IRQ15 is enabled, unmasked and not already
      * in service.  That gate is cached with the same MFP interrupt state. */
     if (__builtin_expect(MFP_R140MK1IRQ15Open != 0u, 0)) {
         d = RTC_R140J2NextIRQDeadline(best_periph);
-        if (d < best_periph) best_periph = d;
+        if (d < best_periph) { best_periph = d; r1a17_reason = 2u; }
     }
 
     /* 68450 readiness is callback/device driven rather than represented by a
@@ -1525,16 +1551,24 @@ x68p4_j2_choose_request_p12(int remaining)
     if (__builtin_expect(((DMA[0].CSR | DMA[1].CSR | DMA[2].CSR) & 0x08u) != 0u, 0) &&
         X68P4_J2_DMA_SAFE_PERIPH < best_periph) {
         best_periph = X68P4_J2_DMA_SAFE_PERIPH;
+        r1a17_reason = 3u;
     }
 
     /* Timer/interrupt register polling keeps the exact J2 200-clock guard. */
     if (__builtin_expect(MFP_R140J2PollGuard != 0u, 0) &&
         X68P4_J2_DMA_SAFE_PERIPH < best_periph) {
         best_periph = X68P4_J2_DMA_SAFE_PERIPH;
+        r1a17_reason = 4u;
     }
 
-    if (__builtin_expect(best_periph == no_early_deadline, 1))
+    if (__builtin_expect(best_periph == no_early_deadline, 1)) {
+        (void)0;
         return remaining;
+    }
+    if (r1a17_reason == 1u) (void)0;
+    else if (r1a17_reason == 2u) (void)0;
+    else if (r1a17_reason == 3u) (void)0;
+    else if (r1a17_reason == 4u) (void)0;
 
     const int deadline_cpu = x68p4_j2_cpu_until_periph_p12(best_periph);
     return (deadline_cpu < remaining) ? deadline_cpu : remaining;
@@ -1546,26 +1580,40 @@ int m68k_tab5_x68p4_machine_run_scanline(
 {
     int clk_line = 0;
     int total_executed = 0;
+    (void)0;
+    (void)0;
+    if (MFP[MFP_IERA] & 0x80u) (void)0;
     MFP_Int(0);
     if ((line >= CRTC_VSTART) && (line < CRTC_VEND))
         VLINE = ((line - CRTC_VSTART) * CRTC_VStep) / 2u;
     else
         VLINE = (uint32_t)-1;
 
-    if (!(MFP[MFP_AER] & 0x40u) && (line == CRTC_IntLine))
+    if (!(MFP[MFP_AER] & 0x40u) && (line == CRTC_IntLine)) {
+        (void)0;
         MFP_Int(1);
+    }
     if (MFP[MFP_AER] & 0x10u) {
-        if (line == CRTC_VSTART) MFP_Int(9);
+        if (line == CRTC_VSTART) { (void)0; MFP_Int(9); }
     } else {
         if (CRTC_VEND >= total_lines) {
-            if ((long)line == (long)(CRTC_VEND - total_lines)) MFP_Int(9);
+            if ((long)line == (long)(CRTC_VEND - total_lines)) { (void)0; MFP_Int(9); }
         } else if ((long)line == (long)(total_lines - 1u)) {
+            (void)0;
             MFP_Int(9);
         }
     }
 
     int remaining = cpu_cycles;
     while (remaining > 0) {
+        (void)0;
+        if (MFP_TimerActiveMask != 0u) (void)0;
+        if (MFP_R140MK1IRQ15Open != 0u) (void)0;
+        if (((DMA[0].CSR | DMA[1].CSR | DMA[2].CSR) & 0x08u) != 0u)
+            (void)0;
+        if (DMA[0].CSR & 0x08u) (void)0;
+        if (DMA[1].CSR & 0x08u) (void)0;
+        if (DMA[2].CSR & 0x08u) (void)0;
         const int request = x68p4_j2_choose_request_p12(remaining);
         int executed = m68k_execute(request);
         if (executed <= 0) executed = request;
@@ -1602,39 +1650,73 @@ int m68k_tab5_x68p4_machine_run_scanline(
      * boundary that is already known to be boot-sensitive. */
     if (__builtin_expect(MIDI_R127DelayPending != 0u, 0))
         MIDI_DelayOut(midi_delay);
+    (void)0;
+    if ((MFP[MFP_TACR] & 15u) == 8u) (void)0;
     MFP_TimerA();
-    if ((MFP[MFP_AER] & 0x40u) && (line == CRTC_IntLine))
+    if ((MFP[MFP_AER] & 0x40u) && (line == CRTC_IntLine)) {
+        (void)0;
         MFP_Int(1);
+    }
 
     *periph_cycles_out = clk_line;
     return total_executed;
 }
 
 void m68k_tab5_x68p4_machine_finish_scanline(int periph_cycles,
-                                              int key_int_period,
-                                              int mouse_int_period)
+                                              int key_int_period)
 {
 
-    ADPCM_R127_PreCounter += (int)(ADPCM_R127_PreStepCurrent * (uint32_t)periph_cycles);
-    if (__builtin_expect(ADPCM_R127_PreCounter >= 10000000L, 0))
-        ADPCM_PreUpdateR127Due();
-    OPM_Timer((uint32_t)periph_cycles);
-    if (__builtin_expect(MIDI_R127TimerActive != 0u, 0))
-        MIDI_Timer((uint32_t)periph_cycles);
+#ifdef ESP_PLATFORM
+    /* Production MIDI phase-pacing timestamp source.  Preserve the exact
+     * 10 MHz peripheral-cycle axis without restoring OnePass tracing. */
+    MIDI_OnePassAdvanceGuestCycles((uint32_t)periph_cycles, (uint32_t)REG_PC);
+#endif
+    {
+        const uint32_t p = g_x68p4_adpcm_lazy_pending + (uint32_t)periph_cycles;
+        g_x68p4_adpcm_lazy_pending = p;
+        if (__builtin_expect(p >= g_x68p4_adpcm_lazy_deadline, 0)) {
+            (void)0;
+            ADPCM_R1A20Materialize();
+        }
+    }
+    (void)0;
+    {
+        /* R1A18: vgmM5 waveform time is sample-driven on CPU0.  CPU1 needs
+         * only the guest-visible YM2151 timer control plane. Accumulate the
+         * exact same 10-MHz line clocks and materialize only at a deadline or
+         * MMIO boundary. No guest cycle is refunded or rescaled. */
+        const uint32_t p = g_x68p4_opm_lazy_pending + (uint32_t)periph_cycles;
+        g_x68p4_opm_lazy_pending = p;
+        if (__builtin_expect(p >= g_x68p4_opm_lazy_deadline, 0))
+            OPM_R1A18Materialize();
+    }
+    if (__builtin_expect(MIDI_R127TimerActive != 0u, 0)) {
+        (void)0;
+        const uint32_t p = g_x68p4_midi_lazy_pending + (uint32_t)periph_cycles;
+        g_x68p4_midi_lazy_pending = p;
+        if (__builtin_expect(p >= g_x68p4_midi_lazy_deadline, 0))
+            MIDI_R1A20MaterializeDeadline();
+    }
 
     if (++s_x68p4_machine_key_int_cnt > key_int_period) {
         s_x68p4_machine_key_int_cnt = 0;
+        (void)0;
         Keyboard_Int();
     }
-    if (++s_x68p4_machine_mouse_int_cnt > mouse_int_period) {
-        s_x68p4_machine_mouse_int_cnt = 0;
-        SCC_IntCheck();
-    }
+    /* X68KTAB_R1A14_SCC_EVENT_DRIVEN:
+     * no periodic SCC poll; scc.c raises IRQ5 only on RX-visible state changes. */
 }
 
 void m68k_tab5_x68p4_machine_frame_end(void)
 {
+    (void)0;
     FDD_SetFDInt();
+}
+
+void m68k_tab5_r1a17_system_audit_get(uint32_t out[R1A17_A_COUNT])
+{
+    if (!out) return;
+    for (unsigned i = 0; i < R1A17_A_COUNT; ++i) out[i] = 0u;
 }
 
 /* ABI-compatible zero-stat stubs: production has no runtime accounting. */

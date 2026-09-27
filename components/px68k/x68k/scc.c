@@ -65,6 +65,10 @@ static uint32_t FASTCALL SCC_Int(uint8_t irq)
    return (uint32_t)(-1);
 }
 
+/* X68KTAB_R1A14_SCC_EVENT_DRIVEN
+ * SCC RX IRQ eligibility changes only when a mouse packet is created,
+ * WR1/WR9 changes, or a receive byte is consumed.  Scheduler polling is
+ * therefore unnecessary: those state transitions call this helper directly. */
 void SCC_IntCheck(void)
 {
 	if ( (SCC_DatNum) && ((SCC_RegsB[1]&0x18)==0x10) && (SCC_RegsB[9]&0x08) )
@@ -102,7 +106,9 @@ void FASTCALL SCC_Write(uint32_t adr, uint8_t data)
 	{
 		if (SCC_RegSetB)
 		{
-			if (SCC_RegNumB == 5)
+            const uint8_t written_reg = SCC_RegNumB;
+            int rx_irq_state_changed = 0;
+			if (written_reg == 5)
 			{
 				if ( (!(SCC_RegsB[5]&2))&&(data&2)&&(SCC_RegsB[3]&1)
                   &&(!SCC_DatNum) )	
@@ -113,13 +119,16 @@ void FASTCALL SCC_Write(uint32_t adr, uint8_t data)
 					SCC_Dat[2] = MouseSt;
 					SCC_Dat[1] = MouseX;
 					SCC_Dat[0] = MouseY;
+                    rx_irq_state_changed = 1;
 				}
 			}
-			else if (SCC_RegNumB == 2)
-            SCC_Vector = data;
+			else if (written_reg == 2)
+                SCC_Vector = data;
 			SCC_RegSetB = 0;
-			SCC_RegsB[SCC_RegNumB] = data;
+			SCC_RegsB[written_reg] = data;
 			SCC_RegNumB = 0;
+            if (rx_irq_state_changed || written_reg == 1 || written_reg == 9)
+                SCC_IntCheck();
 		}
 		else
 		{
@@ -149,6 +158,7 @@ void FASTCALL SCC_Write(uint32_t adr, uint8_t data)
                break;
             case 9:
                SCC_RegsB[9] = data;
+               SCC_IntCheck();
                break;
          }
       }
@@ -190,6 +200,9 @@ uint8_t FASTCALL SCC_Read(uint32_t adr)
 			SCC_DatNum--;
 			ret = SCC_Dat[SCC_DatNum];
 			SCC_DebugMouseReadCount++;
+            /* All-character RX mode needs a fresh IRQ for any remaining
+             * byte; first-character mode naturally stops once DatNum < 3. */
+            SCC_IntCheck();
 		}
 	}
 	else if ((adr&7) == 5)

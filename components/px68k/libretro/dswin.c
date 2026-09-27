@@ -115,6 +115,12 @@ static uint8_t pcmbuffer[PCMBUF_SIZE];
  * directly into the caller's destination, so no contiguous bounce buffer is
  * required on Tab5 or legacy frontends. */
 static int32_t snd_precounter = 0;
+#ifdef ESP_PLATFORM
+static DRAM_ATTR volatile uint32_t s_r1a17_send0_calls = 0;
+static DRAM_ATTR volatile uint32_t s_r1a17_send0_zero = 0;
+static DRAM_ATTR volatile uint32_t s_r1a17_send0_frames = 0;
+static DRAM_ATTR volatile uint32_t s_r1a17_flush_calls = 0;
+#endif
 
 /* P12R1 product source clock: fixed 44.1 kHz.  No runtime sample-rate
  * selector remains in the standalone product hot path. */
@@ -823,6 +829,9 @@ static void sound_send(int length)
 void DSound_Send0(int32_t clock)
 {
    int length = 0;
+#ifdef ESP_PLATFORM
+   (void)0;
+#endif
 
    snd_precounter += ((int32_t)DSound_GetHostSourceRate() * clock);
 
@@ -831,8 +840,10 @@ void DSound_Send0(int32_t clock)
       ++length;
       snd_precounter -= 10000000L;
    }
-
 #ifdef ESP_PLATFORM
+   if (length == 0) (void)0;
+   else (void)0;
+
    if (DSound_AbsTimelineActive())
    {
       s_abs_guest_audio_tick += (uint32_t)length;
@@ -950,6 +961,9 @@ void DSound_OPMWrite(uint32_t adr, uint8_t data)
 void DSound_FlushPending(void)
 {
 #ifdef ESP_PLATFORM
+   (void)0;
+#endif
+#ifdef ESP_PLATFORM
    if (DSound_AbsTimelineActive()) { (void)abs_tl_commit(); return; }
    if (TAB5_OPM_ASYNC_ENABLED())
    {
@@ -1011,6 +1025,16 @@ void audio_samples_discard(int discard)
 /* Build 5.98g12: CPU0-only final PCM consumer.  Unlike DSound_ReadFrames(),
  * this function NEVER flushes guest pending audio: flushing advances ADPCM/DMA
  * state and therefore belongs exclusively to CPU1's emulated time axis. */
+#ifdef ESP_PLATFORM
+void DSound_R1A17AuditGet(uint32_t out[4])
+{
+   if (out) out[0]=out[1]=out[2]=out[3]=0u;
+}
+#else
+void DSound_R1A17AuditGet(uint32_t out[4])
+{ if (out) out[0]=out[1]=out[2]=out[3]=0u; }
+#endif
+
 int DSound_HostFramesAvail(void)
 {
 #ifdef ESP_PLATFORM

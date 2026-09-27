@@ -44,6 +44,9 @@
 
 #include <stdio.h>
 #include <string.h>
+#ifdef ESP_PLATFORM
+#include "esp_heap_caps.h"
+#endif
 
 #ifndef PX68K_TAB5_DIAG_VERBOSE
 #define PX68K_TAB5_DIAG_VERBOSE 0
@@ -56,6 +59,9 @@ uint8_t SCSIIPL[0x2000];
 #define SCSI_INSTALL_DONE_TARGET   9u
 #define SCSI_BLOCK_SIZE 1024u
 #define SCSI_IO_CHUNK 4096u
+#define SCSI_CACHE_PAGE_SIZE 4096u
+#define SCSI_CACHE_PAGE_COUNT 128u
+#define SCSI_CACHE_BYTES (SCSI_CACHE_PAGE_SIZE * SCSI_CACHE_PAGE_COUNT)
 #define SCSI_IOCS_TRAP_ADDR      0x00e9f800u
 #define SCSI_INSTALL_TRAP_ADDR   0x00e9f802u
 #define SCSI_PART_TABLE_OFFSET   0x00000800u
@@ -74,6 +80,9 @@ typedef struct
     uint8_t mounted;
     uint8_t readonly;
     uint8_t started;
+    void *host_fp;
+    uint64_t host_pos;
+    uint8_t host_pos_valid;
 } SCSIImage;
 
 static SCSIImage s_images[SCSI_TARGETS];
@@ -87,6 +96,18 @@ static uint32_t s_installer_calls;
 static uint32_t s_init_calls;
 static uint32_t s_driver_installs;
 static uint32_t s_last_partition_count;
+
+typedef struct
+{
+    uint32_t page_index;
+    uint8_t target;
+    uint8_t valid;
+    uint16_t reserved;
+} SCSICacheTag;
+
+static uint8_t *s_cache_data;
+static SCSICacheTag *s_cache_tags;
+static uint8_t s_cache_init_attempted;
 
 /* Build 5.94b HDD-boot state.  SRAM exposes a transient read overlay for
  * $ED0018, so the one-shot HDD choice never mutates the persisted SWITCH.X
@@ -214,6 +235,154 @@ static uint32_t get_be32(const uint8_t *p)
  * This is deliberately a transport rule, not a guest/host synchronization
  * rule: CPU1 never waits for CPU0 and no Screen/renderer ownership changes.
  */
+static void scsi_cache_init(void)
+{
+    if (s_cache_init_attempted)
+        return;
+    s_cache_init_attempted = 1u;
+#ifdef ESP_PLATFORM
+    s_cache_data = (uint8_t *)heap_caps_malloc(SCSI_CACHE_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    s_cache_tags = (SCSICacheTag *)heap_caps_calloc(SCSI_CACHE_PAGE_COUNT, sizeof(SCSICacheTag),
+                                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+#else
+    s_cache_data = NULL;
+    s_cache_tags = NULL;
+#endif
+    if (s_cache_data && s_cache_tags)
+        printf("PX68K_HDSCACHE: PSRAM read cache ready bytes=%u pages=%u page=%u\n",
+               (unsigned)SCSI_CACHE_BYTES, (unsigned)SCSI_CACHE_PAGE_COUNT,
+               (unsigned)SCSI_CACHE_PAGE_SIZE);
+    else
+    {
+#ifdef ESP_PLATFORM
+        if (s_cache_data) heap_caps_free(s_cache_data);
+        if (s_cache_tags) heap_caps_free(s_cache_tags);
+#endif
+        s_cache_data = NULL;
+        s_cache_tags = NULL;
+        printf("PX68K_HDSCACHE: disabled (PSRAM allocation failed)\n");
+    }
+}
+
+static void scsi_close_host_handle(SCSIImage *img)
+{
+    if (!img)
+        return;
+    if (img->host_fp)
+        file_close(img->host_fp);
+    img->host_fp = NULL;
+    img->host_pos = 0;
+    img->host_pos_valid = 0u;
+}
+
+static int scsi_ensure_host_handle(SCSIImage *img)
+{
+    if (!img)
+        return 0;
+    if (img->host_fp)
+        return 1;
+    img->host_fp = file_open(img->path);
+    if (!img->host_fp)
+        return 0;
+    img->host_pos = 0;
+    img->host_pos_valid = 0u;
+    return 1;
+}
+
+static int scsi_host_read_at(SCSIImage *img, uint64_t offset, uint8_t *dst, size_t length)
+{
+    if (!img || !dst || length == 0 || offset > 0x7fffffffull)
+        return 0;
+    if (!scsi_ensure_host_handle(img))
+        return 0;
+
+    if (!img->host_pos_valid || img->host_pos != offset)
+    {
+        if (file_seek(img->host_fp, (long)offset, FSEEK_SET) != (size_t)offset)
+        {
+            scsi_close_host_handle(img);
+            return 0;
+        }
+        img->host_pos = offset;
+        img->host_pos_valid = 1u;
+    }
+
+    if (file_lread(img->host_fp, dst, length) != length)
+    {
+        scsi_close_host_handle(img);
+        return 0;
+    }
+    img->host_pos += (uint64_t)length;
+    return 1;
+}
+
+static void scsi_cache_invalidate_range(int target, uint64_t offset, size_t length)
+{
+    if (!s_cache_tags || length == 0)
+        return;
+    const uint64_t first = offset / SCSI_CACHE_PAGE_SIZE;
+    const uint64_t last = (offset + length - 1u) / SCSI_CACHE_PAGE_SIZE;
+    for (uint64_t page = first; page <= last; ++page)
+    {
+        const unsigned slot = (unsigned)(page % SCSI_CACHE_PAGE_COUNT);
+        if (s_cache_tags[slot].valid && s_cache_tags[slot].target == (uint8_t)target &&
+            s_cache_tags[slot].page_index == (uint32_t)page)
+            s_cache_tags[slot].valid = 0u;
+    }
+}
+
+static void scsi_cache_invalidate_target(int target)
+{
+    if (!s_cache_tags || target < 0 || target >= SCSI_TARGETS)
+        return;
+    for (unsigned i = 0; i < SCSI_CACHE_PAGE_COUNT; ++i)
+        if (s_cache_tags[i].valid && s_cache_tags[i].target == (uint8_t)target)
+            s_cache_tags[i].valid = 0u;
+}
+
+
+static int scsi_cache_get_page(int target, uint32_t page_index, const uint8_t **page_out)
+{
+    if (!page_out || target < 0 || target >= SCSI_TARGETS)
+        return 0;
+    SCSIImage *img = &s_images[target];
+    const uint64_t offset = (uint64_t)page_index * SCSI_CACHE_PAGE_SIZE;
+    if (offset >= img->bytes)
+        return 0;
+
+    scsi_cache_init();
+    if (!s_cache_data || !s_cache_tags)
+        return 0;
+
+    const unsigned slot = page_index % SCSI_CACHE_PAGE_COUNT;
+    SCSICacheTag *tag = &s_cache_tags[slot];
+    uint8_t *page = s_cache_data + (size_t)slot * SCSI_CACHE_PAGE_SIZE;
+    if (tag->valid && tag->target == (uint8_t)target && tag->page_index == page_index)
+    {
+        *page_out = page;
+        return 1;
+    }
+
+    size_t bytes = SCSI_CACHE_PAGE_SIZE;
+    if (offset + bytes > img->bytes)
+        bytes = (size_t)(img->bytes - offset);
+    if (!scsi_host_read_at(img, offset, s_io_buf, bytes))
+        return 0;
+    memcpy(page, s_io_buf, bytes);
+    if (bytes < SCSI_CACHE_PAGE_SIZE)
+        memset(page + bytes, 0, SCSI_CACHE_PAGE_SIZE - bytes);
+    tag->page_index = page_index;
+    tag->target = (uint8_t)target;
+    tag->valid = 1u;
+    *page_out = page;
+    return 1;
+}
+
+/*
+ * Production HDD fast path: keep the HDS host handle open and cache 4 KiB
+ * pages in PSRAM.  SDMMC still reads only into the known DMA-safe internal
+ * s_io_buf; PSRAM is filled by memcpy after the transfer.
+ */
 static int scsi_image_read_at(int target, uint32_t offset, uint8_t *dst, size_t length)
 {
     if (!scsi_target_ready(target) || !dst || length == 0)
@@ -223,45 +392,64 @@ static int scsi_image_read_at(int target, uint32_t offset, uint8_t *dst, size_t 
     if ((uint64_t)offset + (uint64_t)length > img->bytes)
         return 0;
 
-    void *fp = file_open(img->path);
-    if (!fp)
-        return 0;
-
-    if (file_seek(fp, (long)offset, FSEEK_SET) != (size_t)offset)
+    scsi_cache_init();
+    if (!s_cache_data || !s_cache_tags)
     {
-        file_close(fp);
-        return 0;
+        size_t done = 0;
+        while (done < length)
+        {
+            size_t chunk = length - done;
+            if (chunk > sizeof(s_io_buf))
+                chunk = sizeof(s_io_buf);
+            if (!scsi_host_read_at(img, (uint64_t)offset + done, s_io_buf, chunk))
+                return 0;
+            memmove(dst + done, s_io_buf, chunk);
+            done += chunk;
+        }
+        return 1;
     }
 
+    /*
+     * R1A2 correctness rule:
+     * s_io_buf is both the only SDMMC-DMA-safe staging buffer and, for several
+     * SCSI callers, the final destination.  A cache miss on a later 4 KiB page
+     * must never overwrite bytes already assembled in s_io_buf.
+     *
+     * Pass 1: make every required page resident in PSRAM.
+     * Pass 2: copy from PSRAM cache to the caller.
+     */
     size_t done = 0;
     while (done < length)
     {
-        size_t chunk = length - done;
-        if (chunk > sizeof(s_io_buf))
-            chunk = sizeof(s_io_buf);
+        const uint64_t absolute = (uint64_t)offset + done;
+        const uint32_t page_index = (uint32_t)(absolute / SCSI_CACHE_PAGE_SIZE);
+        const size_t in_page = (size_t)(absolute % SCSI_CACHE_PAGE_SIZE);
+        size_t chunk = SCSI_CACHE_PAGE_SIZE - in_page;
+        if (chunk > length - done)
+            chunk = length - done;
 
-        /* Direct read is safe only for our known ordinary-DRAM staging area. */
-        if (dst == s_io_buf && done == 0 && chunk == length)
-        {
-            if (file_lread(fp, s_io_buf, chunk) != chunk)
-            {
-                file_close(fp);
-                return 0;
-            }
-        }
-        else
-        {
-            if (file_lread(fp, s_io_buf, chunk) != chunk)
-            {
-                file_close(fp);
-                return 0;
-            }
-            memcpy(dst + done, s_io_buf, chunk);
-        }
+        const uint8_t *page = NULL;
+        if (!scsi_cache_get_page(target, page_index, &page))
+            return 0;
         done += chunk;
     }
 
-    file_close(fp);
+    done = 0;
+    while (done < length)
+    {
+        const uint64_t absolute = (uint64_t)offset + done;
+        const uint32_t page_index = (uint32_t)(absolute / SCSI_CACHE_PAGE_SIZE);
+        const size_t in_page = (size_t)(absolute % SCSI_CACHE_PAGE_SIZE);
+        size_t chunk = SCSI_CACHE_PAGE_SIZE - in_page;
+        if (chunk > length - done)
+            chunk = length - done;
+
+        const uint8_t *page = NULL;
+        if (!scsi_cache_get_page(target, page_index, &page))
+            return 0;
+        memcpy(dst + done, page + in_page, chunk);
+        done += chunk;
+    }
     return 1;
 }
 
@@ -516,58 +704,50 @@ static int scsi_rw_blocks(int target, int write_to_disk,
 {
     if (!scsi_target_ready(target))
     {
-        scsi_set_sense(target, 0x02); /* not ready */
+        scsi_set_sense(target, 0x02);
         return -1;
     }
 
     SCSIImage *img = &s_images[target];
-
     if (requested_block_size != SCSI_BLOCK_SIZE || count == 0)
     {
-        scsi_set_sense(target, 0x05); /* illegal request */
+        scsi_set_sense(target, 0x05);
         return -2;
     }
-
     if (lba >= img->blocks || count > img->blocks - lba)
     {
         scsi_set_sense(target, 0x05);
         return -2;
     }
-
     if (write_to_disk && img->readonly)
     {
-        scsi_set_sense(target, 0x07); /* data protect */
-        return -1;
-    }
-
-    void *fp = file_open(img->path);
-    if (!fp)
-    {
-        scsi_set_sense(target, 0x02);
+        scsi_set_sense(target, 0x07);
         return -1;
     }
 
     const uint64_t byte_offset = (uint64_t)lba * SCSI_BLOCK_SIZE;
-    if (byte_offset > 0x7fffffffull ||
-        file_seek(fp, (long)byte_offset, FSEEK_SET) != (size_t)byte_offset)
-    {
-        file_close(fp);
-        scsi_set_sense(target, 0x03); /* medium error */
-        return -1;
-    }
-
     uint32_t blocks_left = count;
     uint32_t addr = guest_addr;
+    uint64_t io_offset = byte_offset;
 
-    while (blocks_left)
+    if (write_to_disk)
     {
-        uint32_t chunk_blocks = blocks_left;
-        if (chunk_blocks > SCSI_IO_CHUNK / SCSI_BLOCK_SIZE)
-            chunk_blocks = SCSI_IO_CHUNK / SCSI_BLOCK_SIZE;
-        const size_t chunk_bytes = (size_t)chunk_blocks * SCSI_BLOCK_SIZE;
-
-        if (write_to_disk)
+        /* Write-through policy: never leave stdio/FatFS buffered writes open. */
+        scsi_close_host_handle(img);
+        void *fp = file_open(img->path);
+        if (!fp || byte_offset > 0x7fffffffull ||
+            file_seek(fp, (long)byte_offset, FSEEK_SET) != (size_t)byte_offset)
         {
+            if (fp) file_close(fp);
+            scsi_set_sense(target, 0x03);
+            return -1;
+        }
+        while (blocks_left)
+        {
+            uint32_t chunk_blocks = blocks_left;
+            if (chunk_blocks > SCSI_IO_CHUNK / SCSI_BLOCK_SIZE)
+                chunk_blocks = SCSI_IO_CHUNK / SCSI_BLOCK_SIZE;
+            const size_t chunk_bytes = (size_t)chunk_blocks * SCSI_BLOCK_SIZE;
             if (!guest_read_bytes(addr, s_io_buf, chunk_bytes) ||
                 file_lwrite(fp, s_io_buf, chunk_bytes) != chunk_bytes)
             {
@@ -575,42 +755,44 @@ static int scsi_rw_blocks(int target, int write_to_disk,
                 scsi_set_sense(target, 0x03);
                 return -1;
             }
+            scsi_cache_invalidate_range(target, io_offset, chunk_bytes);
+            addr += (uint32_t)chunk_bytes;
+            io_offset += chunk_bytes;
+            blocks_left -= chunk_blocks;
         }
-        else
+        file_close(fp);
+        ++s_writes;
+    }
+    else
+    {
+        while (blocks_left)
         {
-            if (file_lread(fp, s_io_buf, chunk_bytes) != chunk_bytes ||
+            uint32_t chunk_blocks = blocks_left;
+            if (chunk_blocks > SCSI_IO_CHUNK / SCSI_BLOCK_SIZE)
+                chunk_blocks = SCSI_IO_CHUNK / SCSI_BLOCK_SIZE;
+            const size_t chunk_bytes = (size_t)chunk_blocks * SCSI_BLOCK_SIZE;
+            if (!scsi_image_read_at(target, (uint32_t)io_offset, s_io_buf, chunk_bytes) ||
                 !guest_write_bytes(addr, s_io_buf, chunk_bytes))
             {
-                file_close(fp);
                 scsi_set_sense(target, 0x03);
                 return -1;
             }
+            addr += (uint32_t)chunk_bytes;
+            io_offset += chunk_bytes;
+            blocks_left -= chunk_blocks;
         }
-
-        addr += (uint32_t)chunk_bytes;
-        blocks_left -= chunk_blocks;
+        ++s_reads;
     }
 
-    file_close(fp);
     scsi_set_sense(target, 0);
-
-    if (write_to_disk)
-        ++s_writes;
-    else
-        ++s_reads;
-
     if (PX68K_TAB5_DIAG_VERBOSE && (write_to_disk ? s_writes : s_reads) <= 12u)
     {
         printf("PX68K_SCSI: %s #%lu target=%d lba=%lu blocks=%lu bytes=%lu path=%s\n",
                write_to_disk ? "WRITE" : "READ",
-               (unsigned long)(write_to_disk ? s_writes : s_reads),
-               target,
-               (unsigned long)lba,
-               (unsigned long)count,
-               (unsigned long)(count * SCSI_BLOCK_SIZE),
-               img->path);
+               (unsigned long)(write_to_disk ? s_writes : s_reads), target,
+               (unsigned long)lba, (unsigned long)count,
+               (unsigned long)(count * SCSI_BLOCK_SIZE), img->path);
     }
-
     return 0;
 }
 
@@ -619,15 +801,31 @@ int SCSI_MountImage(int target, const char *path, int readonly)
     if (target < 0 || target >= SCSI_TARGETS || !path || !path[0])
         return 0;
 
+    /*
+     * Keep the accepted R1A20 attachment semantics:
+     * open -> seek END to obtain size -> close.
+     *
+     * R1 changed mount semantics by retaining this first handle and requiring
+     * an additional seek(0) before the image was considered attached.
+     * R1A2 restores the original mount contract.  The persistent read handle
+     * is opened lazily only when the first actual HDS read occurs.
+     */
     void *fp = file_open(path);
     if (!fp)
+    {
+        printf("PX68K_HDSFAST: mount open failed target=%d path=%s\n", target, path);
         return 0;
+    }
 
     const size_t size = file_seek(fp, 0, FSEEK_END);
     file_close(fp);
 
     if (size == (size_t)-1 || size < SCSI_BLOCK_SIZE)
+    {
+        printf("PX68K_HDSFAST: mount size failed target=%d size=%lu path=%s\n",
+               target, (unsigned long)size, path);
         return 0;
+    }
 
     static uint8_t s_dma_bounce_proof_logged;
     if (!s_dma_bounce_proof_logged)
@@ -638,6 +836,8 @@ int SCSI_MountImage(int target, const char *path, int readonly)
     }
 
     SCSIImage *img = &s_images[target];
+    scsi_close_host_handle(img);
+    scsi_cache_invalidate_target(target);
     memset(img, 0, sizeof(*img));
     snprintf(img->path, sizeof(img->path), "%s", path);
     img->bytes = (uint64_t)size;
@@ -646,6 +846,14 @@ int SCSI_MountImage(int target, const char *path, int readonly)
     img->started = 1u;
     img->mounted = img->blocks != 0;
     s_last_sense[target] = 0;
+
+    if (img->mounted)
+    {
+        scsi_cache_init();
+        printf("PX68K_HDSFAST: mount OK target=%d blocks=%lu bytes=%llu ro=%d path=%s\n",
+               target, (unsigned long)img->blocks,
+               (unsigned long long)img->bytes, img->readonly, img->path);
+    }
 
     if (PX68K_TAB5_DIAG_VERBOSE)
         printf("PX68K_SCSI: mount target=%d blocks=%lu block_size=%u bytes=%llu ro=%d path=%s\n",
@@ -663,6 +871,8 @@ void SCSI_UnmountImage(int target)
 {
     if (target < 0 || target >= SCSI_TARGETS)
         return;
+    scsi_close_host_handle(&s_images[target]);
+    scsi_cache_invalidate_target(target);
     memset(&s_images[target], 0, sizeof(s_images[target]));
     s_last_sense[target] = 0;
 }
@@ -686,21 +896,9 @@ int SCSI_ProbeLayout(int target, uint32_t *partition_count)
 
 int SCSI_ProbeFirstBlock(int target, uint32_t *hash_out)
 {
-    if (!scsi_target_ready(target))
+    if (!scsi_target_ready(target) ||
+        !scsi_image_read_at(target, 0, s_io_buf, SCSI_BLOCK_SIZE))
         return 0;
-
-    SCSIImage *img = &s_images[target];
-    void *fp = file_open(img->path);
-    if (!fp)
-        return 0;
-
-    if (file_seek(fp, 0, FSEEK_SET) != 0 ||
-        file_lread(fp, s_io_buf, SCSI_BLOCK_SIZE) != SCSI_BLOCK_SIZE)
-    {
-        file_close(fp);
-        return 0;
-    }
-    file_close(fp);
 
     uint32_t hash = 2166136261u;
     for (uint32_t i = 0; i < SCSI_BLOCK_SIZE; ++i)

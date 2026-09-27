@@ -15,13 +15,6 @@ int tab5_dynarec_arena_is_executable(void);
 int tab5_dynarec_arena_probe_ok(void);
 int tab5_dynarec_arena_sync(void *addr, unsigned int bytes);
 
-/* R140N1: separate fixed 32 KiB writable/executable IRAM arena.
- * This never aliases or shrinks the 64 KiB X68P4 predecode data cache. */
-int tab5_native140n1_probe(void);
-void *tab5_native140n1_base(void);
-size_t tab5_native140n1_bytes(void);
-int tab5_native140n1_probe_ok(void);
-int tab5_native140n1_sync(void *addr, unsigned int bytes);
 
 #ifdef __cplusplus
 }

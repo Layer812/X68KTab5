@@ -4,7 +4,6 @@
  * Layer8 Aug/17/2026
  */
 #include "tab5_launcher.h"
-#include "tab5_panic.h"
 #include "tab5_media_ui.h"
 #include "tab5_branding.h"
 
@@ -130,17 +129,13 @@ static void draw_main_menu(size_t media_count)
 {
     M5.Display.fillScreen(TFT_BLACK);
 
-    /* Build 6.12c: the launcher has no separate PANIC shortcut button.
-     * PANIC PLAYER remains the single native filer entry; the running-game
-     * left-side PANIC button is intentionally unchanged. */
+    /* Production launcher: media setup + Human68k quick boot. */
     draw_centered(X68K_TAB_APP_NAME, 28, 4, TFT_WHITE);
     draw_centered(X68K_TAB_SUBTITLE, 80, 2, 0x9CD3);
     const int x = 80, w = M5.Display.width() - 160;
     draw_card(x, 138, w, 142, "1. X68000 MEDIA SETUP",
               media_count ? "Configure FDD0 / FDD1 / HDD0, then boot" : "No media found on SD", media_count != 0);
     draw_card(x, 300, w, 142, "2. HUMAN68K QUICK BOOT", "FLASH Human302 + SD HostFS", true);
-    draw_card(x, 462, w, 142, "3. PANIC PLAYER",
-              "Browse all .PAN files on SD and play one", true);
     M5.Display.setTextSize(1);
     M5.Display.setTextColor(0x630C, TFT_BLACK);
     M5.Display.setCursor(50, 676);
@@ -236,14 +231,6 @@ static void choose_default_floppy1(const MediaList &list, const char *human_path
     dst[0] = '\0';
 }
 
-static void configure_panic_boot(tab5_launcher_config_t &cfg, const char *pan_path)
-{
-    std::memset(&cfg, 0, sizeof(cfg));
-    std::snprintf(cfg.floppy0, sizeof(cfg.floppy0), "%s", TAB5_FLASH_HUMAN_PATH);
-    std::snprintf(cfg.panic_path, sizeof(cfg.panic_path), "%s", pan_path ? pan_path : "");
-    cfg.boot_source = TAB5_LAUNCH_BOOT_FLOPPY0;
-    cfg.mode = TAB5_LAUNCH_MODE_PANIC;
-}
 
 static bool setup_screen(const MediaList &list, tab5_launcher_config_t &cfg)
 {
@@ -326,7 +313,6 @@ extern "C" int tab5_launcher_run(const char *human_path, tab5_launcher_config_t 
     if (!human_path) human_path = "";
     std::memset(out_config, 0, sizeof(*out_config));
     out_config->boot_source = TAB5_LAUNCH_BOOT_FLOPPY0;
-    out_config->mode = TAB5_LAUNCH_MODE_PX68K;
 
     MediaList list;
     list.items = static_cast<MediaEntry *>(heap_caps_calloc(kMaxMedia, sizeof(MediaEntry), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
@@ -354,8 +340,6 @@ extern "C" int tab5_launcher_run(const char *human_path, tab5_launcher_config_t 
             if (inside(x, y, 80, 138, M5.Display.width() - 160, 142)) {
                 if (!list.count) { toast("No X68000 media found", "Copy .XDF/.DIM/.HDS files to /sdcard."); redraw = true; continue; }
                 if (setup_screen(list, *out_config)) {
-                    out_config->mode = TAB5_LAUNCH_MODE_PX68K;
-                    out_config->panic_path[0] = '\0';
                     std::free(list.items);
                     M5.Display.fillScreen(TFT_BLACK);
                     return 1;
@@ -368,24 +352,11 @@ extern "C" int tab5_launcher_run(const char *human_path, tab5_launcher_config_t 
                 std::snprintf(out_config->floppy0, sizeof(out_config->floppy0), "%s", TAB5_FLASH_HUMAN_PATH);
                 out_config->floppy1[0] = '\0';
                 out_config->boot_source = TAB5_LAUNCH_BOOT_FLOPPY0;
-                out_config->mode = TAB5_LAUNCH_MODE_PX68K;
                 ESP_LOGI(TAG, "Launcher Flash Human68k quick boot: FDD0=%s FDD1=%s", out_config->floppy0,
                          out_config->floppy1[0] ? out_config->floppy1 : "<empty>");
                 std::free(list.items);
                 M5.Display.fillScreen(TFT_BLACK);
                 return 1;
-            }
-            if (inside(x, y, 80, 462, M5.Display.width() - 160, 142)) {
-                char pan[TAB5_LAUNCHER_PATH_MAX];
-                if (tab5_panic_select_file(pan, sizeof(pan))) {
-                    configure_panic_boot(*out_config, pan);
-                    ESP_LOGI(TAG, "PANIC filer selection: %s", out_config->panic_path);
-                    std::free(list.items);
-                    M5.Display.fillScreen(TFT_BLACK);
-                    return 1;
-                }
-                redraw = true;
-                continue;
             }
         }
     }

@@ -137,6 +137,16 @@ static DRAM_ATTR uint32_t s_mfp_fallback_calls = 0;
 /* R26: R25 measured the steady-state exact timer tuple.  Production keeps
  * only hit/fallback counters; no per-call trace bookkeeping remains. */
 static DRAM_ATTR uint8_t s_mfp_exact_bc_logged = 0;
+/* R1A7 boundary oracle. CPU1 only mutates these monotonic counters. */
+static DRAM_ATTR uint32_t s_r1a7_tc_underflows;
+static DRAM_ATTR uint32_t s_r1a7_tc_requests;
+static DRAM_ATTR uint32_t s_r1a7_tc_asserts;
+static DRAM_ATTR uint32_t s_r1a7_tc_iack45;
+static DRAM_ATTR uint32_t s_r1a7_tc_pending_coalesced;
+static DRAM_ATTR uint32_t s_r1a7_tc_masked;
+static DRAM_ATTR uint32_t s_r1a7_tc_inservice;
+static DRAM_ATTR uint32_t s_r1a7_tc_disabled;
+static DRAM_ATTR uint32_t s_r1a7_mfp_iack_total;
 #endif
 
 static inline void mfp_refresh_timer_cache(void)
@@ -276,6 +286,10 @@ uint32_t FASTCALL MFP_IntCallback(uint8_t irq)
          log_cb(RETRO_LOG_ERROR, "[PX68K] Error: MFP Int w/o Request. Default Vector(-1) has been returned.\n");
       return (uint32_t)-1;
    }
+#ifdef ESP_PLATFORM
+   (void)0;
+   if (offset == 1 && flag == 0x20u) (void)0;
+#endif
 
    MFP[MFP_IPRA+offset] &= (~flag);
    if (MFP[MFP_VR]&8) {
@@ -323,14 +337,14 @@ void MFP_Int(int irq)
 	const int original_irq = irq;
 	uint8_t flag = 0x80;
 	if (original_irq == 3)
-		++s_dbg_kbd_irq_calls;
+		(void)0;
 	if (irq<8)
 	{
 		flag >>= irq;
 		if (MFP[MFP_IERA]&flag)
 		{
 			if (original_irq == 3)
-				++s_dbg_kbd_irq_enabled;
+				(void)0;
 			MFP[MFP_IPRA] |= flag;
 			if ((MFP[MFP_IMRA]&flag)&&(!(MFP[MFP_ISRA]&flag)))
 			{
@@ -339,21 +353,37 @@ void MFP_Int(int irq)
 		}
 		else if (original_irq == 3)
 		{
-			++s_dbg_kbd_irq_disabled;
+			(void)0;
 		}
 	}
 	else
 	{
 		irq -= 8;
 		flag >>= irq;
+#ifdef ESP_PLATFORM
+        if (original_irq == 10) (void)0;
+#endif
 		if (MFP[MFP_IERB]&flag)
 		{
+#ifdef ESP_PLATFORM
+            if (original_irq == 10 && (MFP[MFP_IPRB] & flag)) (void)0;
+#endif
 			MFP[MFP_IPRB] |= flag;
 			if ((MFP[MFP_IMRB]&flag)&&(!(MFP[MFP_ISRB]&flag)))
 			{
+#ifdef ESP_PLATFORM
+                if (original_irq == 10) (void)0;
+#endif
 				IRQH_Int(6, &MFP_IntCallback);
 			}
+#ifdef ESP_PLATFORM
+            else if (original_irq == 10 && !(MFP[MFP_IMRB] & flag)) (void)0;
+            else if (original_irq == 10 && (MFP[MFP_ISRB] & flag)) (void)0;
+#endif
 		}
+#ifdef ESP_PLATFORM
+        else if (original_irq == 10) (void)0;
+#endif
 	}
 }
 
@@ -375,6 +405,17 @@ void MFP_Init(void)
 	s_dbg_kbd_irq_enabled = 0;
 	s_dbg_kbd_irq_disabled = 0;
 	s_dbg_last_udr = 0;
+#ifdef ESP_PLATFORM
+   s_r1a7_tc_underflows = 0u;
+   s_r1a7_tc_requests = 0u;
+   s_r1a7_tc_asserts = 0u;
+   s_r1a7_tc_iack45 = 0u;
+   s_r1a7_tc_pending_coalesced = 0u;
+   s_r1a7_tc_masked = 0u;
+   s_r1a7_tc_inservice = 0u;
+   s_r1a7_tc_disabled = 0u;
+   s_r1a7_mfp_iack_total = 0u;
+#endif
 	MFP_R140J2PollGuard = 0u;
    s_mfp_r140mfp1_timerb_lazy_clocks = 0u;
 	for (i=0; i<4; i++)
@@ -424,12 +465,12 @@ uint8_t FASTCALL MFP_Read(uint32_t adr)
          case MFP_GPIP:
             return GetGPIP();
          case MFP_UDR:
-               ++s_dbg_udr_reads;
+               (void)0;
                s_dbg_last_udr = LastKey;
                KeyIntFlag = 0;
                return LastKey;
          case MFP_RSR:
-               ++s_dbg_rsr_reads;
+               (void)0;
                if (KeyBufRP != KeyBufWP)
                   return MFP[reg] & 0x7f;
                return MFP[reg] | 0x80;
@@ -449,12 +490,20 @@ uint8_t FASTCALL MFP_Read(uint32_t adr)
    return 0xff;
 }
 
-uint32_t MFP_DebugUDRReads(void)             { return s_dbg_udr_reads; }
-uint32_t MFP_DebugRSRReads(void)             { return s_dbg_rsr_reads; }
-uint32_t MFP_DebugKeyboardIRQCalls(void)     { return s_dbg_kbd_irq_calls; }
-uint32_t MFP_DebugKeyboardIRQEnabled(void)   { return s_dbg_kbd_irq_enabled; }
-uint32_t MFP_DebugKeyboardIRQDisabled(void)  { return s_dbg_kbd_irq_disabled; }
-uint8_t  MFP_DebugLastUDR(void)              { return s_dbg_last_udr; }
+uint32_t MFP_DebugUDRReads(void)             { return 0u; }
+uint32_t MFP_DebugRSRReads(void)             { return 0u; }
+uint32_t MFP_DebugKeyboardIRQCalls(void)             { return 0u; }
+uint32_t MFP_DebugKeyboardIRQEnabled(void)             { return 0u; }
+uint32_t MFP_DebugKeyboardIRQDisabled(void)             { return 0u; }
+uint8_t  MFP_DebugLastUDR(void)             { return 0u; }
+
+#ifdef ESP_PLATFORM
+void MFP_R1A7DiagSnapshot(uint32_t out[16])
+{
+   if (!out) return;
+   for (unsigned i=0;i<16u;++i) out[i]=0u;
+}
+#endif
 
 void FASTCALL MFP_Write(uint32_t adr, uint8_t data)
 {
@@ -537,6 +586,16 @@ void FASTCALL MFP_Write(uint32_t adr, uint8_t data)
  *
  * A register value of zero means 256 decrements until the next underflow,
  * matching uint8_t wraparound in the original loop. */
+static inline uint32_t mfp_r1a7_underflow_count(uint8_t cur, uint8_t reload, uint32_t decs)
+{
+   if (!decs) return 0u;
+   const uint32_t until = cur ? (uint32_t)cur : 256u;
+   if (decs < until) return 0u;
+   decs -= until;
+   const uint32_t period = reload ? (uint32_t)reload : 256u;
+   return 1u + (decs / period);
+}
+
 static inline uint8_t mfp_timer_advance_fast(uint8_t cur, uint8_t reload,
                                               uint32_t decs, int *fired)
 {
@@ -609,11 +668,33 @@ static inline __attribute__((always_inline)) void mfp_r71_timerb_irq(void)
 
 static inline __attribute__((always_inline)) void mfp_r71_timerc_irq(void)
 {
-   const uint8_t flag = 0x20u; /* IRQ10 -> IERB/IPRB/IMRB/ISRB bit5 */
+   const uint8_t flag = 0x20u; /* IRQ10 -> vector $45 with VR=$40 */
+#ifdef ESP_PLATFORM
+   (void)0;
+#endif
    if (MFP[MFP_IERB] & flag) {
+#ifdef ESP_PLATFORM
+      if (MFP[MFP_IPRB] & flag) (void)0;
+#endif
       MFP[MFP_IPRB] |= flag;
-      if ((MFP[MFP_IMRB] & flag) && !(MFP[MFP_ISRB] & flag))
+      if (!(MFP[MFP_IMRB] & flag)) {
+#ifdef ESP_PLATFORM
+         (void)0;
+#endif
+      } else if (MFP[MFP_ISRB] & flag) {
+#ifdef ESP_PLATFORM
+         (void)0;
+#endif
+      } else {
+#ifdef ESP_PLATFORM
+         (void)0;
+#endif
          IRQH_Int(6, &MFP_IntCallback);
+      }
+   } else {
+#ifdef ESP_PLATFORM
+      (void)0;
+#endif
    }
 }
 
@@ -621,12 +702,9 @@ void PX68K_DEVIRAM __attribute__((hot,optimize("O3"))) FASTCALL MFP_TimerR71Exac
 {
 #ifdef ESP_PLATFORM
 #if PX68K_TAB5_R57E63_AUDIO_AUDIT || !PX68K_TAB5_R43_QUIET_RUNTIME
-   ++s_mfp_exact_bc_calls;
+   (void)0;
 #endif
-   if (__builtin_expect(!s_mfp_exact_bc_logged, 0)) {
-      s_mfp_exact_bc_logged = 1u;
-      printf("PX68K_MFP_R57E71: cached exact B/C hot path ACTIVE B=/10 reload=13 C=/500 reload=200; fixed IRQ decode\n");
-   }
+   (void)s_mfp_exact_bc_logged;
 
    /* MFP1 common path: IRQ7 disabled means Timer B underflows cannot latch
     * IPRA or invoke IRQH.  One scalar add replaces per-slice /10, reload-13
@@ -661,6 +739,9 @@ void PX68K_DEVIRAM __attribute__((hot,optimize("O3"))) FASTCALL MFP_TimerR71Exac
    if (accum >= 500) {
       const uint32_t decs = (uint32_t)accum / 500u;
       Timer_Tick[2] = accum - (int32_t)(decs * 500u);
+#ifdef ESP_PLATFORM
+      (void)0;
+#endif
       int fired = 0;
       MFP[MFP_TCDR] = mfp_timer_advance_fast(MFP[MFP_TCDR], 200u, decs, &fired);
       if (fired) mfp_r71_timerc_irq();
@@ -684,7 +765,7 @@ void PX68K_DEVIRAM FASTCALL MFP_TimerSlow(int32_t clock)
       MFP_TimerR71ExactBC(clock);
       return;
    }
-   ++s_mfp_fallback_calls;
+   (void)0;
 #endif
 
    for (int chan = 0; chan < 4; ++chan)
@@ -704,6 +785,10 @@ void PX68K_DEVIRAM FASTCALL MFP_TimerSlow(int32_t clock)
       const uint32_t decs = mfp_prescale_quotient((uint32_t)accum, prescale_sel);
       Timer_Tick[chan] = accum - (int32_t)(decs * (uint32_t)t);
 
+#ifdef ESP_PLATFORM
+      if (chan == 2)
+         (void)0;
+#endif
       int fired = 0;
       MFP[MFP_TADR + chan] = mfp_timer_advance_fast(
          MFP[MFP_TADR + chan], Timer_Reload[chan], decs, &fired);
@@ -760,11 +845,6 @@ void PX68K_DEVIRAM FASTCALL MFP_TimerASlow(void)
 
 void MFP_Tab5TimerFastStats(uint32_t *exact_bc, uint32_t *fallback)
 {
-#ifdef ESP_PLATFORM
-   if (exact_bc) *exact_bc = s_mfp_exact_bc_calls;
-   if (fallback) *fallback = s_mfp_fallback_calls;
-#else
-   if (exact_bc) *exact_bc = 0;
-   if (fallback) *fallback = 0;
-#endif
+   if (exact_bc) *exact_bc = 0u;
+   if (fallback) *fallback = 0u;
 }

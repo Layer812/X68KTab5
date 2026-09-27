@@ -100,12 +100,13 @@ idf_component_register(
         esp_psram
         esp_hw_support
         esp_partition
+        esp_timer
 
     LDFRAGMENTS
         "px68k_ext_ram.lf"
 
     WHOLE_ARCHIVE
-    PRIV_REQUIRES\n        esp_timer\n\n)
+)
 if(NOT CONFIG_SPIRAM)
     message(FATAL_ERROR
         "PX68K: CONFIG_SPIRAM is OFF - PSRAM is required")

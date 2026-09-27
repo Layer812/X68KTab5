@@ -1244,8 +1244,7 @@ int m68k_tab5_x68p4_machine_run_scanline(
     uint32_t line, uint32_t total_lines, int cpu_cycles,
     unsigned int midi_delay, int *periph_cycles_out);
 void m68k_tab5_x68p4_machine_finish_scanline(int periph_cycles,
-                                               int key_int_period,
-                                               int mouse_int_period);
+                                               int key_int_period);
 void m68k_tab5_x68p4_machine_frame_end(void);
 void m68k_tab5_x68p4_machine_stats(uint64_t *lines, uint64_t *slices,
                                     uint64_t *periph_cycles);

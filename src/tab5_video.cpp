@@ -9,7 +9,6 @@
 
 #include "tab5_guest_input.h"
 #include "tab5_lp_broker.h"
-#include "tab5_panic.h"
 #include "tab5_audio.h"
 #include "tab5_launcher.h"
 #include "tab5_media_ui.h"
@@ -134,7 +133,6 @@ extern "C" void tab5_video_set_turbo_fps_r128(uint32_t fps)
 }
 
 static bool s_host_ui_exclusive = false;
-static bool s_panic_compat_enabled = false;
 
 /*
  * Build 5.45 video split
@@ -455,10 +453,6 @@ static void *s_dsi_panel = nullptr;
 static uint32_t s_dsi_stride_pixels = 0;
 static bool s_dsi_double_live = false;
 #endif
-static constexpr uint32_t kPanicCompatPitch = 512;
-static constexpr uint32_t kPanicCompatHeight = 512;
-static uint16_t *s_panic_compat_frame = nullptr;
-
 /* Build 6.15h17-r4: DoubleFB already owns a full 1280x720 Back buffer in
  * PSRAM, so do not keep the old 960x720 aspect cache beside it.  Allocate the
  * legacy cache only if the DBFB path becomes unavailable at runtime.  PANIC's
@@ -497,25 +491,6 @@ static bool ensure_aspect_frame_allocated(void)
     return true;
 }
 
-static bool ensure_panic_compat_frame_allocated(void)
-{
-    if (s_panic_compat_frame) return true;
-    s_panic_compat_frame = static_cast<uint16_t *>(heap_caps_calloc(
-        (size_t)kPanicCompatPitch * (size_t)kPanicCompatHeight, sizeof(uint16_t),
-        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    if (!s_panic_compat_frame)
-    {
-        ESP_LOGW(TAG, "PANIC compatibility framebuffer unavailable; normal PX68K presenter retained");
-        return false;
-    }
-    ESP_LOGI(TAG, "PX68K_DBFB615H17R4: PANIC compatibility framebuffer lazy-allocated (%u bytes)",
-             (unsigned)(kPanicCompatPitch * kPanicCompatHeight * sizeof(uint16_t)));
-    return true;
-}
-static uint32_t s_panic_compat_last_w = 0;
-static uint32_t s_panic_compat_last_h = 0;
-static uint8_t s_panic_compat_last_mode = 0xff;
-static uint8_t s_panic_compat_last_enable = 0xff;
 /* Build 5.98g8: one destination-width scratch row lets CPU0 render a
  * generation-dirty line without destroying the last displayed copy.  A PIE
  * DIFF can then suppress the LCD transaction when the pixels are unchanged.
@@ -634,19 +609,17 @@ static void draw_game_controls_unlocked(void)
     M5.Display.drawFastVLine(159, 0, h, 0x3186);
     M5.Display.drawFastVLine(rx, 0, h, 0x3186);
 
-    /* Reference layout: PANIC / FILE above a low D-pad. */
-    draw_panel_button(31, 29, 98, 68, "PANIC", 0x7800, 0xF800, 2);
-    M5.Display.fillRoundRect(31, 118, 98, 68, 8, 0x1082);
-    M5.Display.drawRoundRect(31, 118, 98, 68, 8, 0x8410);
-    draw_folder_icon(61, 127, 0xDEFB);
+    /* Production left utility column: FILE / KEY / TURBO. */
+    M5.Display.fillRoundRect(31, 29, 98, 68, 8, 0x1082);
+    M5.Display.drawRoundRect(31, 29, 98, 68, 8, 0x8410);
+    draw_folder_icon(61, 38, 0xDEFB);
     M5.Display.setTextDatum(textdatum_t::middle_center);
     M5.Display.setTextSize(1);
     M5.Display.setTextColor(0xDEFB, 0x1082);
-    M5.Display.drawString("FILE", 80, 170);
+    M5.Display.drawString("FILE", 80, 81);
     M5.Display.setTextDatum(textdatum_t::top_left);
 
-    /* Build 6.12o: software keyboard launcher in the unused left-side slot. */
-    draw_panel_button(31, 207, 98, 68, "KEY", 0x1082, 0x8410, 2);
+    draw_panel_button(31, 118, 98, 68, "KEY", 0x1082, 0x8410, 2);
 
     /* P12R6A4: one TURBO button cycles BLACK -> GREEN -> RED. */
     const uint32_t turbo_mode = tab5_video_turbo_mode();
@@ -655,7 +628,7 @@ static void draw_game_controls_unlocked(void)
                                 (turbo_mode == 1u ? 0x03E0 : TFT_BLACK);
     const uint16_t turbo_edge = turbo_mode >= 2u ? 0xF800 :
                                 (turbo_mode == 1u ? 0x07E0 : 0x8410);
-    draw_panel_button(31, 296, 98, 58, "TURBO",
+    draw_panel_button(31, 207, 98, 58, "TURBO",
                       turbo_fill, turbo_edge, 2);
 
     /* MULTISCAN remains AUTO/status-only.  Relocate it below TURBO so mode
@@ -669,13 +642,13 @@ static void draw_game_controls_unlocked(void)
     M5.Display.setTextDatum(textdatum_t::middle_center);
     M5.Display.setTextSize(1);
     M5.Display.setTextColor(0x8410, TFT_BLACK);
-    M5.Display.drawString(scan_line, 80, 389);
+    M5.Display.drawString(scan_line, 80, 300);
     if (turbo) {
         char fps_line[20];
         std::snprintf(fps_line, sizeof(fps_line), "%ufps",
                       (unsigned)tab5_video_turbo_fps_r128());
         M5.Display.setTextColor(turbo_mode >= 2u ? 0xF800 : 0x07E0, TFT_BLACK);
-        M5.Display.drawString(fps_line, 80, 410);
+        M5.Display.drawString(fps_line, 80, 321);
     }
     M5.Display.setTextDatum(textdatum_t::top_left);
 
@@ -697,7 +670,6 @@ static void draw_game_controls_unlocked(void)
 }
 
 enum : uint32_t {
-    UTIL_PANIC = 1u << 0,
     UTIL_FILE  = 1u << 1,
     UTIL_VOLM     = 1u << 2,
     UTIL_VOLP     = 1u << 3,
@@ -717,10 +689,9 @@ static game_touch_map_t map_game_touch_point(int x, int y, int display_w)
     game_touch_map_t m = {};
     const int rx = display_w - 160;
 
-    if (point_in_rect(x,y,31,29,98,68)) m.util |= UTIL_PANIC;
-    if (point_in_rect(x,y,31,118,98,68)) m.util |= UTIL_FILE;
-    if (point_in_rect(x,y,31,207,98,68)) m.util |= UTIL_KEYBOARD;
-    if (point_in_rect(x,y,31,296,98,58)) m.util |= UTIL_TURBO;
+    if (point_in_rect(x,y,31,29,98,68)) m.util |= UTIL_FILE;
+    if (point_in_rect(x,y,31,118,98,68)) m.util |= UTIL_KEYBOARD;
+    if (point_in_rect(x,y,31,207,98,58)) m.util |= UTIL_TURBO;
     if (point_in_rect(x,y,53,520,54,54)) m.joy |= JOY_UP;
     if (point_in_rect(x,y,17,577,56,60)) m.joy |= JOY_LEFT;
     if (point_in_rect(x,y,87,577,56,60)) m.joy |= JOY_RIGHT;
@@ -930,6 +901,47 @@ static void softkbd_build_preview(char *out,size_t cap)
     }
 }
 
+/* X68KTAB_R1A11_SHIFT_FACE
+ * Display-only X68000/JIS Shift face.  Input scancodes/modifiers and the
+ * buffered SEND path are intentionally untouched. */
+static const char *softkbd_display_label(const soft_key_t &k)
+{
+    const char *p=k.label;
+    if (!p) return p;
+    if (!s_softkbd_shift) {
+        /* X68KTAB_R1A14_LOWER_UNSHIFT_FACE: display only.  The key table,
+         * scan code, modifiers and buffered SEND semantics stay unchanged. */
+        if (p[0] && !p[1] && std::isalpha((unsigned char)p[0])) {
+            static char lower_face[2];
+            lower_face[0]=(char)std::tolower((unsigned char)p[0]);
+            lower_face[1]='\0';
+            return lower_face;
+        }
+        return p;
+    }
+    if (!std::strcmp(p,"1"))  return "!";
+    if (!std::strcmp(p,"2"))  return "\"";
+    if (!std::strcmp(p,"3"))  return "#";
+    if (!std::strcmp(p,"4"))  return "$";
+    if (!std::strcmp(p,"5"))  return "%";
+    if (!std::strcmp(p,"6"))  return "&";
+    if (!std::strcmp(p,"7"))  return "'";
+    if (!std::strcmp(p,"8"))  return "(";
+    if (!std::strcmp(p,"9"))  return ")";
+    if (!std::strcmp(p,"-"))  return "=";
+    if (!std::strcmp(p,"^"))  return "~";
+    if (!std::strcmp(p,"\\")) return "|";
+    if (!std::strcmp(p,"@"))  return "`";
+    if (!std::strcmp(p,"["))  return "{";
+    if (!std::strcmp(p,";"))  return "+";
+    if (!std::strcmp(p,":"))  return "*";
+    if (!std::strcmp(p,"]"))  return "}";
+    if (!std::strcmp(p,","))  return "<";
+    if (!std::strcmp(p,"."))  return ">";
+    if (!std::strcmp(p,"/"))  return "?";
+    return p;
+}
+
 static void draw_soft_keyboard_unlocked(void)
 {
     /* Keep side controls visible; repaint only the central viewport. */
@@ -996,7 +1008,7 @@ static void draw_soft_keyboard_unlocked(void)
                 !std::strcmp(k.label,"RIGHT") || !std::strcmp(k.label,"RET+SEND");
             M5.Display.setTextSize((std::strlen(k.label)>=5 && !normal_size_long)?1:2);
             M5.Display.setTextColor(TFT_WHITE,fill);
-            M5.Display.drawString(k.label,x+w/2,y+h/2);
+            M5.Display.drawString(softkbd_display_label(k),x+w/2,y+h/2);
         }
     }
     M5.Display.setTextDatum(textdatum_t::top_left);
@@ -1683,21 +1695,6 @@ static uint16_t poll_game_controls(uint8_t sample_reason)
         tab5_touch_joy_publish(0);
         ESP_LOGI(TAG, "PX68K_TOUCH125: KEY ownership PENDING until release");
     }
-    if (rising & UTIL_PANIC) {
-        /* Build 6.12s: never reboot the ESP32-P4 for the in-game PANIC button.
-         * Select and stage the random PAN entirely on the host side, then pass
-         * the concrete path to CPU1. CPU1 will reset only the emulated X68000
-         * into Flash Human68k, preserving the already-running Tab5 audio host,
-         * ES8388 and all ESP-IDF peripheral state. */
-        char pan_path[TAB5_VIDEO_MEDIA_PATH_MAX] = {};
-        tab5_video_status("PANIC", "Preparing random PAN...");
-        if (tab5_panic_prepare_random_runtime(pan_path, sizeof(pan_path))) {
-            if (!queue_ui_action(TAB5_VIDEO_ACTION_PANIC_RANDOM, pan_path))
-                ESP_LOGW(TAG, "In-game PANIC: action queue full after staging %s", pan_path);
-        } else {
-            ESP_LOGW(TAG, "In-game PANIC: no usable user .PAN file found");
-        }
-    }
     if (rising & UTIL_FILE) {
         /* Same ownership rule as KEY: scan/open only after the opening press is
          * physically released, so geometry/DBFB transitions cannot overlap it. */
@@ -1708,209 +1705,6 @@ static uint16_t poll_game_controls(uint8_t sample_reason)
         ESP_LOGI(TAG, "PX68K_TOUCH125: FILE ownership PENDING until release");
     }
     return joy;
-}
-
-/*
- * PANIC compatibility renderer
- * ----------------------------
- * The original standalone PanicPlayer used a direct reconstruction of the
- * X68000 packed 512-KiB GVRAM.  PANIC data such as PELSIA01 relies on the
- * 512-dot/256-colour two-page layout, while N_OHA also uses the sprite PCG
- * engine.  The normal PX68K ScrBuf renderer is retained for every non-PANIC
- * path; only PANIC mode takes this CPU0 compatibility presenter.
- * Layer8 Aug/17/2026
- */
-static inline uint8_t panic_gvram_pixel_16(int page, int x, int y)
-{
-    page &= 3;
-    const uint32_t sx = ((uint32_t)x + GrphScrollX[page]) & 0x1ffu;
-    const uint32_t sy = ((uint32_t)y + GrphScrollY[page]) & 0x1ffu;
-    const uint32_t off = (sy << 10) + (sx << 1) + (uint32_t)(page >> 1);
-    const uint8_t raw = GVRAM[off];
-    return (page & 1) ? (uint8_t)(raw >> 4) : (uint8_t)(raw & 0x0f);
-}
-
-static inline uint16_t panic_le16(const uint8_t *p)
-{
-    return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
-}
-
-static inline uint8_t panic_sprite_pixel(uint8_t pattern, int x, int y)
-{
-    const uint32_t raw = (uint32_t)pattern * 0x80u +
-                         (uint32_t)(y & 15) * 4u +
-                         (uint32_t)((x >> 1) & 3) +
-                         ((x & 8) ? 0x40u : 0u);
-    const uint8_t b = BG[raw & 0x7fffu];
-    return (x & 1) ? (uint8_t)(b & 0x0f) : (uint8_t)(b >> 4);
-}
-
-static void panic_render_sprites(uint32_t draw_w, uint32_t draw_h)
-{
-    if (!s_panic_compat_frame) return;
-    const int hstart = ((int)CRTC_Regs[0x04] << 8) | CRTC_Regs[0x05];
-    const int vstart = ((int)CRTC_Regs[0x0c] << 8) | CRTC_Regs[0x0d];
-    const int h_adjust = ((int)BG_Regs[0x0d] - (hstart + 4)) * 8;
-    const int v_div = (BG_Regs[0x11] & 4u) ? 1 : 2;
-    const int v_adjust = ((int)BG_Regs[0x0f] - vstart) / v_div;
-
-    for (int pri = 1; pri <= 3; ++pri) {
-        for (int n = 127; n >= 0; --n) {
-            const uint8_t *sp = Sprite_Regs + (size_t)n * 8u;
-            if ((sp[6] & 3u) != (uint8_t)pri) continue;
-            const uint16_t posx = panic_le16(sp + 0) & 0x03ffu;
-            const uint16_t posy = panic_le16(sp + 2) & 0x03ffu;
-            const uint16_t ctrl = panic_le16(sp + 4);
-            const int sx = (int)((posx + h_adjust) & 0x03ffu) - 16;
-            const int sy = (int)posy + v_adjust - 16;
-            if (sx >= (int)draw_w || sy >= (int)draw_h || sx + 16 <= 0 || sy + 16 <= 0) continue;
-
-            const uint8_t pattern = (uint8_t)ctrl;
-            const uint8_t palbase = (uint8_t)((ctrl >> 4) & 0xf0u);
-            const bool flip_x = (ctrl & 0x4000u) != 0;
-            const bool flip_y = (ctrl & 0x8000u) != 0;
-            for (int py = 0; py < 16; ++py) {
-                const int dy = sy + py;
-                if ((unsigned)dy >= draw_h) continue;
-                const int src_y = flip_y ? (15 - py) : py;
-                uint16_t *dst = s_panic_compat_frame + (size_t)dy * kPanicCompatPitch;
-                for (int px = 0; px < 16; ++px) {
-                    const int dx = sx + px;
-                    if ((unsigned)dx >= draw_w) continue;
-                    const int src_x = flip_x ? (15 - px) : px;
-                    const uint8_t pix = panic_sprite_pixel(pattern, src_x, src_y);
-                    if (pix) dst[dx] = TextPal[(uint8_t)(palbase | pix)];
-                }
-            }
-        }
-    }
-}
-
-static bool panic_render_compat_source(const present_request_t &req, present_request_t *out)
-{
-    if (!s_panic_compat_enabled || !out) return false;
-    if (!ensure_panic_compat_frame_allocated()) return false;
-    uint32_t draw_w = req.width;
-    uint32_t draw_h = req.height;
-    if (!draw_w || !draw_h) return false;
-    if (draw_w > 512u) draw_w = 512u;
-    if (draw_h > 512u) draw_h = 512u;
-
-    for (uint32_t y = 0; y < draw_h; ++y)
-        std::memset(s_panic_compat_frame + (size_t)y * kPanicCompatPitch, 0, draw_w * sizeof(uint16_t));
-
-    const uint8_t mode = (uint8_t)(VCReg0[1] & 3u);
-    const uint8_t enable = VCReg2[1];
-    bool graphics_supported = false;
-
-    if ((mode == 1u || mode == 2u) && (enable & 0x0fu)) {
-        uint32_t gx[4], gy[4];
-        for (int i=0; i<4; ++i) { gx[i] = GrphScrollX[i] & 0x1ffu; gy[i] = GrphScrollY[i] & 0x1ffu; }
-        const uint8_t pri = VCReg1[1];
-        const bool p0_on = (enable & 0x01u) != 0;
-        const bool p1_on = (enable & 0x04u) != 0;
-        const bool p0_top = (pri & 3u) <= ((pri >> 4) & 3u);
-        const bool p0_same_scroll = gx[0] == gx[1] && gy[0] == gy[1];
-        const bool p1_same_scroll = gx[2] == gx[3] && gy[2] == gy[3];
-        for (uint32_t y=0; y<draw_h; ++y) {
-            uint16_t *dst = s_panic_compat_frame + (size_t)y * kPanicCompatPitch;
-            const uint32_t row0 = ((y + gy[0]) & 0x1ffu) << 10;
-            const uint32_t row1 = ((y + gy[1]) & 0x1ffu) << 10;
-            const uint32_t row2 = ((y + gy[2]) & 0x1ffu) << 10;
-            const uint32_t row3 = ((y + gy[3]) & 0x1ffu) << 10;
-            for (uint32_t x=0; x<draw_w; ++x) {
-                uint8_t p0=0, p1=0;
-                if (p0_on) {
-                    const uint32_t x0 = ((x + gx[0]) & 0x1ffu) << 1;
-                    if (p0_same_scroll) p0 = GVRAM[row0 + x0];
-                    else {
-                        const uint32_t x1 = ((x + gx[1]) & 0x1ffu) << 1;
-                        p0 = (uint8_t)((GVRAM[row0+x0] & 0x0fu) | (GVRAM[row1+x1] & 0xf0u));
-                    }
-                }
-                uint8_t idx=0;
-                if (p0_top && p0_on && p0) idx=p0;
-                else {
-                    if (p1_on) {
-                        const uint32_t x2 = ((x + gx[2]) & 0x1ffu) << 1;
-                        if (p1_same_scroll) p1 = GVRAM[row2 + x2 + 1u];
-                        else {
-                            const uint32_t x3 = ((x + gx[3]) & 0x1ffu) << 1;
-                            p1 = (uint8_t)((GVRAM[row2+x2+1u] & 0x0fu) | (GVRAM[row3+x3+1u] & 0xf0u));
-                        }
-                    }
-                    if (p0_top) idx = p0_on ? (p0 ? p0 : p1) : p1;
-                    else idx = p1_on ? (p1 ? p1 : p0) : p0;
-                }
-                dst[x] = GrphPal[idx];
-            }
-        }
-        graphics_supported = true;
-    } else if (mode == 3u && (enable & 0x0fu)) {
-        /* Build 6.12c: 65536-colour PANIC data must not fall through to the
-         * sprite-only path.  Reproduce Grp_DrawLine16() byte-for-byte: one
-         * 16-bit GVRAM pixel is converted through Pal16Adr/Pal_Regs/Pal16.
-         * Keeping this on CPU0 avoids touching the proven normal WinDraw path. */
-        const uint32_t gx = GrphScrollX[0] & 0x1ffu;
-        for (uint32_t y=0; y<draw_h; ++y) {
-            uint32_t sy = GrphScrollY[0] + y;
-            if ((CRTC_Regs[0x29] & 0x1cu) == 0x1cu) sy += y;
-            sy &= 0x1ffu;
-            uint16_t *dst = s_panic_compat_frame + (size_t)y * kPanicCompatPitch;
-            for (uint32_t x=0; x<draw_w; ++x) {
-                const uint32_t sx = (gx + x) & 0x1ffu;
-                const uint32_t off = (sy << 10) + (sx << 1);
-                const uint8_t lo = GVRAM[off];
-                const uint8_t hi = GVRAM[off + 1u];
-                if ((lo | hi) == 0u) {
-                    dst[x] = 0;
-                } else {
-                    uint16_t pal = Pal_Regs[Pal16Adr[lo]];
-                    pal |= (uint16_t)((uint16_t)Pal_Regs[Pal16Adr[hi] + 2u] << 8);
-                    dst[x] = Pal16[pal];
-                }
-            }
-        }
-        graphics_supported = true;
-    } else if (mode == 0u && !(VCReg0[1] & 0x04u) && (enable & 0x0fu)) {
-        const uint8_t pri = VCReg1[1];
-        for (uint32_t y=0; y<draw_h; ++y) {
-            uint16_t *dst = s_panic_compat_frame + (size_t)y * kPanicCompatPitch;
-            for (uint32_t x=0; x<draw_w; ++x) {
-                uint8_t idx=0; bool have=false;
-                for (int slot=3; slot>=0; --slot) {
-                    if ((enable & (1u << slot)) == 0) continue;
-                    const int page=(pri >> (slot*2)) & 3;
-                    const uint8_t v=panic_gvram_pixel_16(page,(int)x,(int)y);
-                    if (!have) { idx=v; have=true; } else if (v) idx=v;
-                }
-                dst[x]=GrphPal[idx];
-            }
-        }
-        graphics_supported = true;
-    }
-
-    /* Sprite PCG is independent of the graphics-page mode and is required by
-     * PANIC data such as N_OHA. Transparent sprite pixels leave graphics intact. */
-    panic_render_sprites(draw_w, draw_h);
-
-    if (s_panic_compat_last_w != draw_w || s_panic_compat_last_h != draw_h ||
-        s_panic_compat_last_mode != mode || s_panic_compat_last_enable != enable) {
-        ESP_LOGI(TAG,
-                 "PANIC compat renderer: raw=%lux%lu VC0=%02X mode=%u VC1=%02X VC2=%02X graphics=%s",
-                 (unsigned long)draw_w, (unsigned long)draw_h, (unsigned)VCReg0[1],
-                 (unsigned)mode, (unsigned)VCReg1[1], (unsigned)enable,
-                 graphics_supported ? "DIRECT-GVRAM" : "SPRITE/FALLBACK");
-        s_panic_compat_last_w=draw_w; s_panic_compat_last_h=draw_h;
-        s_panic_compat_last_mode=mode; s_panic_compat_last_enable=enable;
-    }
-
-    *out = req;
-    out->frame = s_panic_compat_frame;
-    out->width = draw_w;
-    out->height = draw_h;
-    out->pitch_pixels = kPanicCompatPitch;
-    return graphics_supported || (enable & 0x10u) != 0u;
 }
 
 static inline void display_lock(void)
@@ -4183,25 +3977,9 @@ static bool push_live_frame(const present_request_t &req,
     const int lcd_w = M5.Display.width();
     const int lcd_h = M5.Display.height();
 
-    /* Normal games keep the fixed 4:3 960x720 viewport so the agreed side
-     * controls always have 160px on both sides.  PANIC's old standalone
-     * renderer, however, intentionally preserved the source raster aspect
-     * (notably 256x256).  Keep that behaviour in PANIC mode so square data is
-     * not stretched into 4:3.  Layer8 Aug/17/2026 */
-    uint32_t out_w = kAspectViewportWidth;
-    uint32_t out_h = kAspectViewportHeight;
-    if (s_panic_compat_enabled && req.width && req.height)
-    {
-        out_w = kAspectViewportWidth;
-        out_h = (uint32_t)(((uint64_t)out_w * req.height) / req.width);
-        if (out_h > kAspectViewportHeight)
-        {
-            out_h = kAspectViewportHeight;
-            out_w = (uint32_t)(((uint64_t)out_h * req.width) / req.height);
-        }
-        if (!out_w) out_w = 1;
-        if (!out_h) out_h = 1;
-    }
+    /* Production games use the fixed 4:3 960x720 viewport with 160px side controls. */
+    const uint32_t out_w = kAspectViewportWidth;
+    const uint32_t out_h = kAspectViewportHeight;
     if (!out_w || !out_h)
         return false;
 
@@ -4343,7 +4121,7 @@ static bool push_live_frame(const present_request_t &req,
     }
 
     /* R38: producer-published exact generations eliminate all LCD-side raw
-     * framebuffer compare traffic. PANIC/compat keeps the legacy path. */
+     * framebuffer compare traffic. */
     if (req.mode != PRESENT_MANAGED &&
         !force_source_scan && s_r32_direct_front && s_r34_selfcheck_ok && s_r35_pack8 &&
         r38_direct_native_present(req, out_w, out_h, (uint32_t)x, (uint32_t)y0,
@@ -4417,11 +4195,6 @@ static bool push_live_frame(const present_request_t &req,
             ++dy_end;
 
         const uint32_t observed_gen = line_generation(sy);
-        /* PANIC compat pixels are rebuilt on CPU0 and do not carry WinDraw's
-         * source-line generations.  Scan those rows every compat frame, but
-         * keep the previous scaled LCD image so the exact PIE pixel diff can
-         * suppress unchanged rows.  Do NOT turn the whole viewport into a
-         * full refresh merely because WinDraw metadata is unavailable. */
         const bool source_dirty = force_full ||
                                   (managed_map
                                        ? (req.managed_dirty_tiles[sy] != 0u)
@@ -4453,8 +4226,7 @@ static bool push_live_frame(const present_request_t &req,
         }
         else if (force_source_scan)
         {
-            /* CPU0 just finished building the PANIC compat framebuffer, so
-             * unlike WinDraw there is no concurrent writer to race here. */
+            /* Frozen/host-owned source: no concurrent WinDraw writer. */
             for (uint32_t dx = 0; dx < out_w; ++dx)
                 render0[dx] = src[s_aspect_xmap[dx]];
             stable = true;
@@ -4660,8 +4432,7 @@ static void video_pace_keep_latest_live(present_request_t *req)
 
 static void video_pace_wait_live(const present_request_t &req)
 {
-    if ((req.mode != PRESENT_LIVE_FB && req.mode != PRESENT_MANAGED) ||
-        s_panic_compat_enabled || !s_pace_timer)
+    if ((req.mode != PRESENT_LIVE_FB && req.mode != PRESENT_MANAGED) || !s_pace_timer)
     {
         video_pace_reset();
         return;
@@ -4957,17 +4728,10 @@ static void video_present_task(void *)
         } else {
             M5.Display.startWrite();
             if (req.mode == PRESENT_LIVE_FB || req.mode == PRESENT_LIVE_FROZEN) {
-                present_request_t compat = {};
-                if (req.mode == PRESENT_LIVE_FB && panic_render_compat_source(req, &compat)) {
-                    /* Build 6.12g: compat pixels are freshly rebuilt on CPU0, but
-                     * forcing s_aspect_seen_frame=NULL here made every PANIC frame
-                     * a 640/720-row LCD full refresh and starved IDLE0 until WDT. */
-                    (void)push_live_frame(compat, &live_retries, &live_unstable, true);
-                } else if (req.mode == PRESENT_LIVE_FROZEN) {
+                if (req.mode == PRESENT_LIVE_FROZEN)
                     (void)push_live_frame(req, &live_retries, &live_unstable, true);
-                } else {
+                else
                     (void)push_live_frame(req, &live_retries, &live_unstable, false);
-                }
             } else {
                 push_snapshot(req);
             }
@@ -5001,12 +4765,6 @@ static void video_present_task(void *)
         if (req.mode == PRESENT_MANAGED && req.screen_token)
             tab5_screen_manager_present_complete(req.screen_token, managed_present_ok ? 1 : 0);
 
-        /* Build 6.12g: PANIC can submit continuously while YM2151 also owns
-         * CPU0.  One RTOS tick of blocking after a compat frame guarantees an
-         * IDLE0 scheduling window instead of merely yielding to another ready
-         * higher-priority worker.  At the 100-Hz system tick this is <=10 ms. */
-        if (s_panic_compat_enabled && req.mode == PRESENT_LIVE_FB)
-            vTaskDelay(1);
 
     }
 }
@@ -5107,7 +4865,6 @@ static bool init_async_present(void)
      * the untouched vertical distance between unrelated changes. */
     if (!ensure_aspect_frame_allocated())
         return false;
-    s_panic_compat_frame = nullptr;
 
 #if defined(CONFIG_IDF_TARGET_ESP32P4)
     if (s_dsi_double_live && s_aspect_frame_ppa_capable)
@@ -5480,57 +5237,6 @@ void tab5_video_end_host_ui(void)
     ESP_LOGI(TAG, "Host UI exclusive released: guest LCD presentation resumed");
 }
 
-void tab5_video_set_panic_compat_enabled(int enabled)
-{
-    const bool was_enabled = s_panic_compat_enabled;
-    const bool now_enabled = enabled != 0;
-    s_panic_compat_enabled = now_enabled;
-    s_panic_compat_last_w = s_panic_compat_last_h = 0;
-    s_panic_compat_last_mode = s_panic_compat_last_enable = 0xff;
-    if (now_enabled != was_enabled)
-        tab5_video_touch_transition_begin(0u, 0u, 0u);
-
-    /* Build 6.12t: an in-place game -> PANIC switch intentionally keeps the
-     * ESP32-P4 host, LCD task and ES8388/I2S alive.  That also means the LCD
-     * still contains the game's last 960x720 frame.  PANIC can start at a
-     * smaller square/letterboxed viewport, so merely forcing a dirty refresh
-     * leaves the old game visible around/under the new image.
-     *
-     * On the OFF -> ON transition, wait for any in-flight CPU0 LCD push to
-     * finish, erase the physical panel, and forget every cached presentation
-     * surface/generation.  The next PANIC frame is therefore a true full
-     * refresh onto black, while audio/USB/FreeRTOS host services are untouched.
-     * Layer8 Aug/18/2026 */
-    if (now_enabled && !was_enabled)
-    {
-        display_lock();
-#if defined(CONFIG_IDF_TARGET_ESP32P4)
-        (void)dbfb615h17_prepare_m5gfx_front();
-#endif
-        M5.Display.fillScreen(TFT_BLACK);
-        if (s_aspect_frame)
-            std::memset(s_aspect_frame, 0,
-                        (size_t)kAspectViewportWidth * (size_t)kAspectViewportHeight * sizeof(uint16_t));
-        if (s_panic_compat_frame)
-            std::memset(s_panic_compat_frame, 0,
-                        (size_t)kPanicCompatPitch * (size_t)kPanicCompatHeight * sizeof(uint16_t));
-        std::memset(s_aspect_seen_generation, 0, sizeof(s_aspect_seen_generation));
-        s_aspect_seen_frame = nullptr;
-        s_aspect_seen_src_w = 0;
-        s_aspect_seen_src_h = 0;
-        s_aspect_seen_pitch = 0;
-        s_aspect_map_src_w = s_aspect_map_dst_w = 0;
-        s_aspect_map_src_h = s_aspect_map_dst_h = 0;
-        s_aspect_log_src_w = s_aspect_log_src_h = 0;
-        s_force_game_redraw = false;
-        __atomic_store_n(&s_present_started, 1u, __ATOMIC_RELEASE);
-        display_unlock();
-        ESP_LOGI(TAG, "PANIC display transition: previous guest frame cleared; host LCD/audio kept alive");
-    }
-
-    if (now_enabled)
-        ESP_LOGI(TAG, "PANIC compatibility presenter armed on CPU0");
-}
 
 extern "C" void tab5_video_set_tab5_keyboard_orientation(int enabled)
 {

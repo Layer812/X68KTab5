@@ -42,13 +42,13 @@
 #include "tab5_video.h"
 #include "tab5_branding.h"
 #include "tab5_launcher.h"
-#include "tab5_panic.h"
 #include "tab5_sd.h"
 #include "tab5_disk_control.h"
 #include "tab5_textview.h"
 #include "tab5_guest_input.h"
 #include "tab5_usb_keyboard.h"
 #include "tab5_audio.h"
+#include "retrop4_midi_uart.h"
 #include "tab5_compose.h"
 #include "tab5_screen_manager.h"
 #include "tab5_guest_bus.h"
@@ -155,66 +155,10 @@ static const tab5kbd_map_t s_tab5kbd_map_sym[TAB5KBD_KEYS] = {
     {0x2F,0x00},{0x30,0x00},{0x31,0x00},{0x3B,0x00},{0x3E,0x00},{0x3D,0x00},{0x35,0x00},
 };
 
-/* R57E105P boot-time map certificate for the nine punctuation cases reported
- * on real hardware.  This is diagnostic only; it does not touch A164 I2C,
- * task priority, 10-ms service cadence, KEY_EVENT acquisition, or RTQ flow. */
-typedef struct {
-    uint8_t idx;
-    bool sym;
-    uint8_t scan;
-    uint8_t modifier;
-    const char *name;
-} tab5kbd_r105p_expect_t;
-
-static void tab5kbd_r105p_map_selfcheck(void)
-{
-    static const tab5kbd_r105p_expect_t expect[] = {
-        {(uint8_t)(1u * TAB5KBD_COLS + 0u), false, 0x1B, 0x02, "`"},
-        {(uint8_t)(1u * TAB5KBD_COLS + 0u), true,  0x0D, 0x02, "~"},
-        {(uint8_t)(1u * TAB5KBD_COLS + 1u), true,  0x33, 0x02, "?"},
-        {(uint8_t)(2u * TAB5KBD_COLS + 11u),true,  0x28, 0x00, ":"},
-        {(uint8_t)(2u * TAB5KBD_COLS + 12u),true,  0x03, 0x02, "\""},
-        {(uint8_t)(3u * TAB5KBD_COLS + 12u),false, 0x34, 0x02, "_"},
-        {(uint8_t)(3u * TAB5KBD_COLS + 12u),true,  0x0C, 0x02, "="},
-        {(uint8_t)(4u * TAB5KBD_COLS + 9u), true,  0x31, 0x00, ","},
-        {(uint8_t)(1u * TAB5KBD_COLS + 8u), true,  0x33, 0x00, "/"},
-    };
-    bool ok = true;
-    for (unsigned i = 0; i < sizeof(expect) / sizeof(expect[0]); ++i) {
-        const tab5kbd_r105p_expect_t *e = &expect[i];
-        const tab5kbd_map_t m = e->sym ? s_tab5kbd_map_sym[e->idx] : s_tab5kbd_map_base[e->idx];
-        if (m.scan != e->scan || m.modifier != e->modifier) {
-            ok = false;
-            ESP_LOGE(TAG,
-                     "PX68K_TAB5KBD_R57E105P_MAPFAIL char=%s idx=%u sym=%u got=%02X/%02X want=%02X/%02X",
-                     e->name, (unsigned)e->idx, e->sym ? 1u : 0u,
-                     (unsigned)m.scan, (unsigned)m.modifier,
-                     (unsigned)e->scan, (unsigned)e->modifier);
-        }
-    }
-    if (ok) {
-        ESP_LOGI(TAG,
-                 "PX68K_TAB5KBD_R57E105P_MAPCERT PASS: ` ~ ? : quote _ = , / -> X68K native scans; A164 Sym layer source-exact");
-    }
-}
-
 static volatile bool s_tab5kbd_present = false;
 static volatile bool s_tab5kbd_input_armed = false;
 static uint8_t s_tab5kbd_fw = 0u;
 static uint32_t s_tab5kbd_hotkeys = 0u;
-static uint32_t s_tab5kbd_events = 0u;
-static uint32_t s_tab5kbd_i2c_errors = 0u;
-static uint32_t s_tab5kbd_raw_events = 0u;
-static uint32_t s_tab5kbd_key_downs = 0u;
-static uint32_t s_tab5kbd_key_ups = 0u;
-static uint32_t s_tab5kbd_modifier_edges = 0u;
-static uint32_t s_tab5kbd_repeat_reports = 0u;
-static uint32_t s_tab5kbd_unmapped = 0u;
-static uint32_t s_tab5kbd_invalid_events = 0u;
-static uint8_t s_tab5kbd_last_raw = TAB5KBD_EVENT_EMPTY;
-static uint8_t s_tab5kbd_last_row = 0u;
-static uint8_t s_tab5kbd_last_col = 0u;
-static bool s_tab5kbd_last_pressed = false;
 static bool s_tab5kbd_pressed[TAB5KBD_KEYS];
 static int16_t s_tab5kbd_active_scan[TAB5KBD_KEYS];
 static bool s_tab5kbd_active_forced_shift[TAB5KBD_KEYS];
@@ -236,7 +180,6 @@ static bool s_tab5kbd_missing_logged = false;
  * the official library.  A bounded health audit remains so a silent device
  * is distinguishable from a PX68K key-mapping problem. */
 static volatile bool s_tab5kbd_irq_pending = false;
-static volatile uint32_t s_tab5kbd_irq_edges = 0u;
 static bool s_tab5kbd_irq_installed = false;
 /* R57E99K: official UnitTab5Keyboard readiness semantics.  The current
  * M5Stack library drains when an IRQ is pending OR the active-low INT pin
@@ -245,19 +188,11 @@ static bool s_tab5kbd_irq_installed = false;
 /* R57E100K: diagnostic-only cross-core breadcrumb. CPU0 publishes the latest
  * A164->X68K enqueue attempt; CPU1 samples it immediately after guest_input_tick().
  * No input timing or queue semantics are changed. */
-static volatile uint32_t s_tab5kbd_pipe_seq_pub = 0u;
-static volatile uint8_t s_tab5kbd_pipe_scan_pub = 0u;
-static volatile uint8_t s_tab5kbd_pipe_down_pub = 0u;
-static volatile uint8_t s_tab5kbd_pipe_enq_pub = 0u;
-static uint8_t s_tab5kbd_last_mode_reg = 0xffu;
-static uint8_t s_tab5kbd_last_intcfg_reg = 0xffu;
-static uint8_t s_tab5kbd_last_intstat_reg = 0xffu;
 
 static void IRAM_ATTR tab5kbd_irq_handler(void *arg)
 {
     (void)arg;
     s_tab5kbd_irq_pending = true;
-    ++s_tab5kbd_irq_edges;
 }
 
 extern void tab5_video_set_tab5_keyboard_orientation(int enabled);
@@ -387,7 +322,6 @@ static bool tab5kbd_write_reg(uint8_t reg, uint8_t value)
     const esp_err_t e = i2c_master_transmit(s_tab5kbd_dev, msg, sizeof(msg), 20);
     if (e != ESP_OK) {
         s_tab5kbd_last_err = e;
-        ++s_tab5kbd_i2c_errors;
         return false;
     }
     return true;
@@ -402,7 +336,6 @@ static bool tab5kbd_read_reg(uint8_t reg, uint8_t *dst, size_t n)
                                                      20);
     if (e != ESP_OK) {
         s_tab5kbd_last_err = e;
-        ++s_tab5kbd_i2c_errors;
         return false;
     }
     return true;
@@ -492,9 +425,6 @@ static bool tab5kbd_detect_and_configure(void)
     s_tab5kbd_fw = fw;
     s_tab5kbd_missing_logged = false;
     s_tab5kbd_present = true;
-    s_tab5kbd_last_mode_reg = mode_verify;
-    s_tab5kbd_last_intcfg_reg = int_verify;
-    s_tab5kbd_last_intstat_reg = stat0;
     ESP_LOGI(TAG,
              "PX68K_TAB5KBD_R57E98T: A164 detected fw=0x%02X officialLifecycle mode %u->NORMAL intcfg=0x%02X IRQ50=%s INT=%d stat=0x%02X count=%u orientation=180deg",
              (unsigned)fw, (unsigned)mode_before, (unsigned)int_verify,
@@ -551,10 +481,7 @@ static void tab5kbd_queue_x68k_scan(uint8_t scan, bool down)
 static void tab5kbd_queue_x68k_retrok(int rk, bool down)
 {
     const int scan = tab5kbd_retrok_to_x68k_scan(rk);
-    if (scan < 0) {
-        ++s_tab5kbd_unmapped;
-        return;
-    }
+    if (scan < 0) return;
     tab5kbd_queue_x68k_scan((uint8_t)scan, down);
 }
 
@@ -563,7 +490,6 @@ static void tab5kbd_set_guest_modifier(unsigned rk, bool *state, bool down)
     if (*state == down) return;
     *state = down;
     tab5kbd_queue_x68k_retrok((int)rk, down);
-    ++s_tab5kbd_modifier_edges;
 }
 
 static void tab5kbd_sync_shift(void)
@@ -574,8 +500,6 @@ static void tab5kbd_sync_shift(void)
 
 static void tab5kbd_process_normal(uint8_t raw)
 {
-    ++s_tab5kbd_raw_events;
-    s_tab5kbd_last_raw = raw;
 
     if (raw == TAB5KBD_EVENT_EMPTY)
         return;
@@ -583,12 +507,8 @@ static void tab5kbd_process_normal(uint8_t raw)
     const bool pressed = (raw & 0x80u) != 0u;
     const uint8_t row = (uint8_t)((raw >> 4u) & 0x07u);
     const uint8_t col = (uint8_t)(raw & 0x0fu);
-    s_tab5kbd_last_row = row;
-    s_tab5kbd_last_col = col;
-    s_tab5kbd_last_pressed = pressed;
 
     if (row >= TAB5KBD_ROWS || col >= TAB5KBD_COLS) {
-        ++s_tab5kbd_invalid_events;
         return;
     }
 
@@ -596,46 +516,39 @@ static void tab5kbd_process_normal(uint8_t raw)
 
     /* Official modifier positions in the 5x14 Normal-mode matrix. */
     if (idx == TAB5KBD_KIDX_SYM) {
-        if (s_tab5kbd_pressed[idx] == pressed) { ++s_tab5kbd_repeat_reports; return; }
+        if (s_tab5kbd_pressed[idx] == pressed) { return; }
         s_tab5kbd_pressed[idx] = pressed;
         s_tab5kbd_sym_down = pressed;
-        ++s_tab5kbd_events;
         return;
     }
     if (idx == TAB5KBD_KIDX_AA) {
-        if (s_tab5kbd_pressed[idx] == pressed) { ++s_tab5kbd_repeat_reports; return; }
+        if (s_tab5kbd_pressed[idx] == pressed) { return; }
         s_tab5kbd_pressed[idx] = pressed;
         s_tab5kbd_aa_down = pressed;
         tab5kbd_sync_shift();
-        ++s_tab5kbd_events;
         return;
     }
     if (idx == TAB5KBD_KIDX_CTRL) {
-        if (s_tab5kbd_pressed[idx] == pressed) { ++s_tab5kbd_repeat_reports; return; }
+        if (s_tab5kbd_pressed[idx] == pressed) { return; }
         s_tab5kbd_pressed[idx] = pressed;
         tab5kbd_set_guest_modifier(RETROK_LCTRL, &s_tab5kbd_ctrl_down, pressed);
-        ++s_tab5kbd_events;
         return;
     }
     if (idx == TAB5KBD_KIDX_ALT) {
-        if (s_tab5kbd_pressed[idx] == pressed) { ++s_tab5kbd_repeat_reports; return; }
+        if (s_tab5kbd_pressed[idx] == pressed) { return; }
         s_tab5kbd_pressed[idx] = pressed;
         tab5kbd_set_guest_modifier(RETROK_LALT, &s_tab5kbd_alt_down, pressed);
-        ++s_tab5kbd_events;
         return;
     }
 
     if (pressed) {
         if (s_tab5kbd_pressed[idx]) {
-            ++s_tab5kbd_repeat_reports;
             return;
         }
         s_tab5kbd_pressed[idx] = true;
         const tab5kbd_map_t m = s_tab5kbd_sym_down ? s_tab5kbd_map_sym[idx] : s_tab5kbd_map_base[idx];
         if (m.scan == 0u) {
             s_tab5kbd_active_scan[idx] = -1;
-            ++s_tab5kbd_unmapped;
-            ++s_tab5kbd_events;
             return;
         }
 
@@ -646,8 +559,6 @@ static void tab5kbd_process_normal(uint8_t raw)
             ++s_tab5kbd_forced_shift_count;
         tab5kbd_sync_shift();
         tab5kbd_queue_x68k_scan(m.scan, true);
-        ++s_tab5kbd_key_downs;
-        ++s_tab5kbd_events;
         return;
     }
 
@@ -655,14 +566,12 @@ static void tab5kbd_process_normal(uint8_t raw)
      * Sym/Aa changed while another key was held, and it also supports genuine
      * multi-key operation without a single-active-key shortcut. */
     if (!s_tab5kbd_pressed[idx]) {
-        ++s_tab5kbd_repeat_reports;
         return;
     }
     s_tab5kbd_pressed[idx] = false;
     const int scan = s_tab5kbd_active_scan[idx];
     if (scan >= 0) {
         tab5kbd_queue_x68k_scan((uint8_t)scan, false);
-        ++s_tab5kbd_key_ups;
     }
     if (s_tab5kbd_active_forced_shift[idx]) {
         s_tab5kbd_active_forced_shift[idx] = false;
@@ -671,7 +580,6 @@ static void tab5kbd_process_normal(uint8_t raw)
     }
     s_tab5kbd_active_scan[idx] = -1;
     tab5kbd_sync_shift();
-    ++s_tab5kbd_events;
 }
 
 static void tab5kbd_drain_cpu0(void)
@@ -810,7 +718,6 @@ extern uint32_t m68k_tab5_dispatch_l2_bytes(void);
 #endif
 #define PX68K_TAB5_DYNAREC 1
 #define PX68K_TAB5_DYNAREC_GENERIC 0
-#define PX68K_TAB5_TRACE134 0
 #define PX68K_TAB5_X68P4_PREDECODE 1
 
 extern int WinX68k_LoadEmbeddedROMs(void);
@@ -954,8 +861,8 @@ typedef struct
     bool deferred_fdds_pending;
 } tab5_guest_boot_result_t;
 
-/* Build 6.12u: common in-process X68000 reboot path used by runtime FILE
- * (re)BOOT and by PANIC -> GUI launcher selection.  The ESP32-P4 host side
+/* Common in-process X68000 reboot path used by runtime FILE (re)BOOT.
+ * The ESP32-P4 host side
  * (M5Unified, ES8388/I2S, USB, LCD task and CPU0 audio workers) remains alive.
  * Only guest devices/CPU state are reset and selected media are reattached. */
 static bool tab5_guest_apply_boot_config(px68k_run_context_t *ctx,
@@ -969,13 +876,6 @@ static bool tab5_guest_apply_boot_config(px68k_run_context_t *ctx,
     tab5_launcher_config_t cfg = *requested;
     bool hds_layout_ok = false;
 
-    if (cfg.mode == TAB5_LAUNCH_MODE_PANIC)
-    {
-        cfg.boot_source = TAB5_LAUNCH_BOOT_FLOPPY0;
-        snprintf(cfg.floppy0, sizeof(cfg.floppy0), "%s", TAB5_FLASH_HUMAN_PATH);
-        cfg.floppy1[0] = '\0';
-        cfg.hdd0[0] = '\0';
-    }
 
     const bool direct_hdd = cfg.boot_source == TAB5_LAUNCH_BOOT_HDD0;
     const bool direct_fdd1 = cfg.boot_source == TAB5_LAUNCH_BOOT_FLOPPY1;
@@ -1084,9 +984,8 @@ static bool tab5_guest_apply_boot_config(px68k_run_context_t *ctx,
     tab5_video_set_runtime_boot_source(ctx->launcher_cfg.boot_source);
 
     ESP_LOGI(TAG,
-             "%s complete: mode=%s source=%s A=%s B=%s HDD0=%s; ESP host not restarted",
+             "%s complete: source=%s A=%s B=%s HDD0=%s; ESP host not restarted",
              reason ? reason : "guest reboot",
-             ctx->launcher_cfg.mode == TAB5_LAUNCH_MODE_PANIC ? "PANIC" : "PX68K",
              direct_hdd ? "HDD0" : (direct_fdd1 ? "FDD1" : "FDD0"),
              ctx->a_boot_path[0] ? ctx->a_boot_path : "<empty>",
              ctx->b_xdf_path[0] ? ctx->b_xdf_path : "<empty>",
@@ -1151,6 +1050,7 @@ void app_main(void)
      * services exist do we launch the X68000 time-axis as a dedicated CPU1
      * task. */
     tab5_video_init();
+    /* RP_SAM2695_PATCH_V1C: CPU0 host backend; CPU1 never touches UART. */
     ESP_LOGI(TAG, "PX68K_PRODUCT_P12R2: Standard12 44.1k MULTISCAN-AUTO FDD1-BOOT PRODUCTION-QUIET");
     ESP_LOGI(TAG, "PX68K_R57E92B: A164 dedicated AUTO-I2C base retained; M5Unified internal I2C untouched");
     ESP_LOGI(TAG, "PX68K_R57E105P: A164 official key-top/Sym semantic bridge ACTIVE");
@@ -1159,7 +1059,6 @@ void app_main(void)
     ESP_LOGI(TAG, "PX68K_R57E123A: legacy fused cache RETIRED by R138; touch liveness retained");
     ESP_LOGI(TAG, "PX68K_R57E139A6: X68P4 PRODUCTION-CLEAN MACHINE KERNEL ACTIVE; PREDECODE + Event Horizon + device-time ownership + CPU/DMA page coherency");
     ESP_LOGI(TAG, "PX68K_R57E139A6A3R2: FINAL PRODUCTION CLEAN FULL-TREE ACTIVE; backend/LP/video-flow observers retired; control/correctness semantics preserved");
-    tab5kbd_r105p_map_selfcheck();
     if (tab5kbd_detect_and_configure())
         tab5_video_set_tab5_keyboard_orientation(1);
     /* PX68K_R56S1_LAUNCHER_HOST_UI
@@ -1176,44 +1075,13 @@ void app_main(void)
         halt_forever();
     }
 
-    /* Intent: Remove transport files from interrupted/older PANIC sessions before
-     * the user sees the SD library. This also cleans legacy PLAY.PAN.
-     * Layer8 Aug/17/2026 */
-    tab5_panic_cleanup_staging();
-
-    /* Build 6.12u: no normal UI path restarts the ESP32-P4.  The launcher is
-     * authoritative at cold start; a PANIC staging failure simply returns to
-     * the same native launcher instead of rebooting M5Unified/ES8388/I2S. */
-    for (;;)
+    if (!tab5_launcher_run(ctx->human_path, &ctx->launcher_cfg))
     {
-        if (!tab5_launcher_run(ctx->human_path, &ctx->launcher_cfg))
-        {
-            ESP_LOGE(TAG, "Launcher failed");
-            halt_forever();
-        }
-
-        if (ctx->launcher_cfg.mode != TAB5_LAUNCH_MODE_PANIC)
-            break;
-
-        if (tab5_panic_prepare_runtime(ctx->launcher_cfg.panic_path))
-        {
-            ESP_LOGI(TAG, "PANIC mode selected: %s", ctx->launcher_cfg.panic_path);
-            break;
-        }
-
-        ESP_LOGE(TAG, "PANIC runtime preparation failed: %s", ctx->launcher_cfg.panic_path);
-        tab5_panic_cleanup_staging();
-        tab5_video_show_message("PANIC setup failed", "Returning to X68K Tab GUI...");
-        vTaskDelay(pdMS_TO_TICKS(900));
+        ESP_LOGE(TAG, "Launcher failed");
+        halt_forever();
     }
 
-    /*
-     * Intent: Normal PX68K games own the 160px side bars as touch JOY1.
-     * PANIC mode keeps the whole touch surface for tap=SPACE / corner-hold.
-     * Layer8 Aug/17/2026
-     */
-    tab5_video_set_game_controls_enabled(ctx->launcher_cfg.mode != TAB5_LAUNCH_MODE_PANIC);
-    tab5_video_set_panic_compat_enabled(ctx->launcher_cfg.mode == TAB5_LAUNCH_MODE_PANIC);
+    tab5_video_set_game_controls_enabled(1);
 
     snprintf(ctx->xdf_path, sizeof(ctx->xdf_path), "%s", ctx->launcher_cfg.floppy0);
     snprintf(ctx->b_xdf_path, sizeof(ctx->b_xdf_path), "%s", ctx->launcher_cfg.floppy1);
@@ -1222,8 +1090,7 @@ void app_main(void)
         snprintf(ctx->a_boot_path, sizeof(ctx->a_boot_path), "%s", ctx->hds_path);
     else
         snprintf(ctx->a_boot_path, sizeof(ctx->a_boot_path), "%s", ctx->xdf_path);
-    ESP_LOGI(TAG, "Launcher boot selection: mode=%s source=%s FDD0=%s FDD1=%s HDD0=%s",
-             ctx->launcher_cfg.mode == TAB5_LAUNCH_MODE_PANIC ? "PANIC" : "PX68K",
+    ESP_LOGI(TAG, "Launcher boot selection: source=%s FDD0=%s FDD1=%s HDD0=%s",
              ctx->launcher_cfg.boot_source == TAB5_LAUNCH_BOOT_HDD0 ? "HDD0" : "FLOPPY0",
              ctx->xdf_path[0] ? ctx->xdf_path : "<empty>",
              ctx->b_xdf_path[0] ? ctx->b_xdf_path : "<empty>",
@@ -1283,6 +1150,8 @@ void app_main(void)
         ESP_LOGW(TAG, "LPFAB_R10 unavailable; R57 + direct TouchJoy fallback retained");
 
     ctx->usb_host_ready = tab5_usb_keyboard_start() != 0;
+    /* RP_SAM2695_USBKBD_R1A2_USB_CALL_ANCHOR: USB HID start completed before PORT.A SAM2695 UART start. */
+    (void)rp_midi_uart_start();
     if (ctx->usb_host_ready)
     {
         ESP_LOGI(TAG, "USB keyboard/mouse/JoyPAD host ready on Type-A (CPU0 host side)");
@@ -1369,7 +1238,6 @@ static void px68k_emulation_task(void *arg)
 #define hds_path         (ctx->hds_path)
 #define audio_host_ready (ctx->audio_host_ready)
 #define usb_host_ready   (ctx->usb_host_ready)
-#define panic_mode       (ctx->launcher_cfg.mode == TAB5_LAUNCH_MODE_PANIC)
 
     bool direct_hdd_boot = ctx->launcher_cfg.boot_source == TAB5_LAUNCH_BOOT_HDD0;
     bool direct_fdd1_boot = ctx->launcher_cfg.boot_source == TAB5_LAUNCH_BOOT_FLOPPY1;
@@ -1402,8 +1270,8 @@ static void px68k_emulation_task(void *arg)
         ESP_LOGW(TAG, "DISKMAG1.XDF not found; F8 alternate boot disabled");
     }
 
-    tab5_video_show_message(panic_mode ? "PANIC Player" : (direct_hdd_boot ? "X68K Tab HDD0 boot" : (direct_fdd1_boot ? "X68K Tab FDD1 boot" : "X68K Tab boot media")),
-                            panic_mode ? ctx->launcher_cfg.panic_path : (direct_hdd_boot ? hds_path : (direct_fdd1_boot ? b_xdf_path : xdf_path)));
+    tab5_video_show_message(direct_hdd_boot ? "X68K Tab HDD0 boot" : (direct_fdd1_boot ? "X68K Tab FDD1 boot" : "X68K Tab boot media"),
+                            direct_hdd_boot ? hds_path : (direct_fdd1_boot ? b_xdf_path : xdf_path));
     ESP_LOGI(TAG,
              "PSRAM free before PX68K: %u bytes",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
@@ -1581,29 +1449,11 @@ static void px68k_emulation_task(void *arg)
              (unsigned long)m68k_get_reg(NULL, M68K_REG_SR));
 
     ESP_LOGI(TAG, "=======================================");
-    if (panic_mode)
-    {
-        ESP_LOGI(TAG, " PANIC Player mode - Human68k bootstrap");
-    }
-    else
-    {
-        ESP_LOGI(TAG, " Human68k + USB keyboard + manual console mode");
-    }
+    ESP_LOGI(TAG, " Human68k + USB keyboard + manual console mode");
     ESP_LOGI(TAG, "=======================================");
 
     bool ram_execution_seen = false;
     bool textview_active = false;
-    uint32_t panic_text_ready_frame = 0;
-    uint32_t panic_hostfs_ready_frame = 0;
-    uint32_t panic_touch_enable_frame = 0;
-    uint32_t panic_command_frame = 0;
-    uint32_t panic_command_gfx_base = 0;
-    uint32_t panic_command_pal_base = 0;
-    uint32_t panic_command_bat_open_base = 0;
-    uint32_t panic_command_player_open_base = 0;
-    uint32_t panic_command_pan_open_base = 0;
-    bool panic_command_sent = false;
-    bool panic_direct_fallback_sent = false;
     /* Build 5.63: the real emulator output is the default.  COLOR TEXT is now
      * an F9 diagnostic view rather than a boot-time mode the user must leave. */
     bool composite_view = true;
@@ -1641,17 +1491,6 @@ static void px68k_emulation_task(void *arg)
         ram_execution_seen = false; \
         textview_active = false; \
         composite_view = true; \
-        panic_text_ready_frame = 0; \
-        panic_hostfs_ready_frame = 0; \
-        panic_touch_enable_frame = 0; \
-        panic_command_frame = 0; \
-        panic_command_gfx_base = 0; \
-        panic_command_pal_base = 0; \
-        panic_command_bat_open_base = 0; \
-        panic_command_player_open_base = 0; \
-        panic_command_pan_open_base = 0; \
-        panic_command_sent = false; \
-        panic_direct_fallback_sent = false; \
         hds_enumeration_logged_in_ram = false; \
         gfx_watch_armed = false; \
         gfx_base_writes = 0; \
@@ -1698,8 +1537,6 @@ static void px68k_emulation_task(void *arg)
     ESP_LOGI(TAG, "PX68K_R57E44/BAT177NW14: video baseline retained byte-for-byte in renderer paths; exact common 65K GRP decode + GBT selector fusion ACTIVE");
     ESP_LOGI(TAG, "PX68K_DIRTY_R57E44: NW13 BG fuse retained; 65K GRP materialization deferred only for exact common CPU1 GBT rows");
     ESP_LOGI(TAG, "Console: manual HID only; retired automatic CLS/DIR regression injector removed");
-    if (panic_mode)
-        ESP_LOGI(TAG, "PANIC controls: tap screen=SPACE, hold upper-left 1.2s=return to GUI; PAN=%s", ctx->launcher_cfg.panic_path);
     ESP_LOGI(TAG, "Mouse: USB HID Boot Mouse -> PX68K SCC (left/right + relative motion)");
     ESP_LOGI(TAG, "JoyPAD: standard USB HID generic -> X68000 JOY1 CPSF/MD (X/Y or Hat + learned B1..B6,L,R; 2-button compatible)");
     ESP_LOGI(TAG, "R139A6 production-clean: periodic CPU/render/audio/device telemetry OFF");
@@ -1825,12 +1662,32 @@ static void px68k_emulation_task(void *arg)
             }
         }
 
+        /*
+         * R57E66T1 TEXT presentation debt:
+         *
+         * Disk I/O R1A2 can advance Human68k/app startup through several
+         * TEXT-only guest states before the next host-render opportunity.
+         * The old policy deliberately refused TEXT forcing while audio
+         * recharge/GUARD/CRITICAL was active, so those states could disappear
+         * before Screen Manager ever received a ScreenVersion.
+         *
+         * Keep audio shedding, but remember that real TVRAM work is waiting.
+         * A satisfied visual commit clears the debt and starts a short
+         * six-frame cooldown; this bounds rescue cadence to <= 10 fps at a
+         * 60-Hz guest while CPU1 remains completely nowait.
+         */
+        static uint8_t r57e66_text_present_debt = 0u;
+        static uint8_t r57e66_text_present_cooldown = 0u;
         const uint32_t text_epoch_now = TVRAM_Tab5TextWriteEpoch();
         if (text_epoch_now != r57e66_text_epoch)
         {
             r57e66_text_epoch = text_epoch_now;
             r57e66_text_hold = 4u;
+            r57e66_text_present_debt = 1u;
         }
+        if (r57e66_text_present_cooldown)
+            --r57e66_text_present_cooldown;
+
         bool budget_render = true;
         if (r57e57_audio_recharge)
         {
@@ -1879,10 +1736,24 @@ static void px68k_emulation_task(void *arg)
                 (budget.preexec_q_effective >= 1536u);
 
             if (text_force)
-            {
                 budget_render = true;
-            }
         }
+
+        /*
+         * R57E66T1: if normal policy still sheds this TEXT state, permit one
+         * bounded rescue once the speaker has >=1536 queued frames (~35 ms).
+         * This also applies during recharge/GUARD/CRITICAL, but the cooldown
+         * prevents continuous TVRAM traffic from defeating audio protection.
+         */
+        if (!budget_render &&
+            r57e66_text_present_debt &&
+            !r57e66_text_present_cooldown &&
+            !p12r6_turbo &&
+            budget.preexec_q_effective >= 1536u)
+        {
+            budget_render = true;
+        }
+
         if (r57e66_text_hold)
             --r57e66_text_hold;
 
@@ -1905,7 +1776,14 @@ static void px68k_emulation_task(void *arg)
         const bool r118_visual_commit = budget_render && r118_visual_window;
         budget_render = r118_visual_commit;
         if (r118_visual_commit)
+        {
             r118_host_visual_commit_now(p12r6_turbo ? 1 : 0);
+            if (r57e66_text_present_debt)
+            {
+                r57e66_text_present_debt = 0u;
+                r57e66_text_present_cooldown = 6u;
+            }
+        }
 
         /* BAT177NW1: geometry invalidation is CPU1 video-state owned.
          * There is deliberately no Screen Manager readback/force-render gate. */
@@ -2046,7 +1924,6 @@ static void px68k_emulation_task(void *arg)
                 tv.nonzero_pixels > 128u)
             {
                 textview_active = true;
-                if (panic_mode && !panic_text_ready_frame) panic_text_ready_frame = frame;
 
                 ESP_LOGI(TAG,
                          "*** CORE COLOR TEXT VIEW ACTIVE: NZ=%lu HASH=%08lX SY=%lu PAL=%d ***",
@@ -2096,87 +1973,12 @@ static void px68k_emulation_task(void *arg)
          * mutations here between guest frames so PX68K media state is never
          * changed concurrently with emulation.  FILE hot-swaps and ejects do
          * not reset or alter the boot source.  Layer8 Aug/17/2026 */
-        if (!panic_mode)
-        {
-            tab5_video_action_t ui_action = {0};
+        tab5_video_action_t ui_action = {0};
             while (tab5_video_poll_action(&ui_action))
             {
                 int ok = 0;
                 switch (ui_action.type)
                 {
-                    case TAB5_VIDEO_ACTION_PANIC_RANDOM:
-                    {
-                        /* Build 6.12t: game->PANIC is an in-process X68000 guest
-                         * reboot, NOT an ESP32-P4 reboot.  The old host-reset
-                         * path tore down M5Unified/ES8388/I2S and produced the
-                         * visible white hardware reboot reported on Tab5.
-                         *
-                         * CPU0 already selected and staged P68K.X/P68K.PAN. At
-                         * this guest-frame boundary, switch A: to the dedicated
-                         * Flash Human68k image and reset only PX68K.  The host
-                         * speaker/audio feeder remains alive continuously. */
-                        if (!ui_action.path[0]) {
-                            ESP_LOGE(TAG, "In-game PANIC live switch rejected: missing staged PAN path");
-                            break;
-                        }
-
-                        ESP_LOGI(TAG, "In-game PANIC live switch: guest-only reset, ESP/ES8388 preserved; PAN=%s",
-                                 ui_action.path);
-                        tab5_guest_input_cancel_text();
-                        tab5_video_status("PANIC", "Switching X68000 to Human68k...");
-
-                        /* Match launcher PANIC media state without restarting the host. */
-                        (void)tab5_disk_eject(0);
-                        (void)tab5_disk_eject(1);
-                        if (hds_path[0]) (void)tab5_hdd_eject(0);
-
-                        /* Preserve the live host audio stream here. WinX68k_Reset()
-                         * resets guest OPM/ADPCM state via DSound_Stop/Play, but
-                         * leaves the physical Tab5 speaker and CPU0 feeder up. */
-                        tab5_video_touch_transition_begin(0u, 0u, 0u);
-                        tab5_guest_video_state_reset();
-                        tab5_screen_video_reset();
-                        WinX68k_Reset();
-                        WinX68k_ProductSealFixedConfig();
-                        if (!WinX68k_MountFloppy(0, TAB5_FLASH_HUMAN_PATH)) {
-                            ESP_LOGE(TAG, "In-game PANIC live switch: Flash Human68k mount FAILED");
-                            tab5_video_status("PANIC start failed", "Flash Human68k mount failed");
-                            break;
-                        }
-
-                        snprintf(ctx->launcher_cfg.floppy0, sizeof(ctx->launcher_cfg.floppy0), "%s", TAB5_FLASH_HUMAN_PATH);
-                        ctx->launcher_cfg.floppy1[0] = '\0';
-                        ctx->launcher_cfg.hdd0[0] = '\0';
-                        snprintf(ctx->launcher_cfg.panic_path, sizeof(ctx->launcher_cfg.panic_path), "%s", ui_action.path);
-                        ctx->launcher_cfg.boot_source = TAB5_LAUNCH_BOOT_FLOPPY0;
-                        ctx->launcher_cfg.mode = TAB5_LAUNCH_MODE_PANIC;
-
-                        snprintf(xdf_path, 512, "%s", TAB5_FLASH_HUMAN_PATH);
-                        b_xdf_path[0] = '\0';
-                        hds_path[0] = '\0';
-                        snprintf(a_boot_path, 512, "%s", TAB5_FLASH_HUMAN_PATH);
-                        a_diskmag_boot = false;
-                        b_inserted = false;
-                        b_write_protected = false;
-                        direct_hdd_boot = false;
-                        direct_fdd1_boot = false;
-                        hds_layout_ok = false;
-                        deferred_fdds_pending = false;
-
-                        /* Re-arm the normal PANIC bootstrap state machine from
-                         * its initial Human68k boot state. */
-                        TAB5_REARM_GUEST_OBSERVERS();
-
-                        tab5_video_set_runtime_media_paths(xdf_path, b_xdf_path, hds_path);
-                        tab5_video_set_runtime_boot_source(TAB5_LAUNCH_BOOT_FLOPPY0);
-                        tab5_video_set_game_controls_enabled(0);
-                        tab5_video_set_panic_compat_enabled(1);
-                        tab5_panic_reset_touch();
-
-                        ESP_LOGI(TAG, "In-game PANIC live switch complete: PC=$%08lX A:=%s; no ESP restart",
-                                 (unsigned long)m68k_get_reg(NULL, M68K_REG_PC), TAB5_FLASH_HUMAN_PATH);
-                        break;
-                    }
                     case TAB5_VIDEO_ACTION_MOUNT_FDD0:
                         ok = tab5_disk_mount_path(0, ui_action.path);
                         if (ok) {
@@ -2231,8 +2033,6 @@ static void px68k_emulation_task(void *arg)
                         snprintf(reboot_cfg.floppy0, sizeof(reboot_cfg.floppy0), "%s", xdf_path);
                         snprintf(reboot_cfg.floppy1, sizeof(reboot_cfg.floppy1), "%s", b_xdf_path);
                         snprintf(reboot_cfg.hdd0, sizeof(reboot_cfg.hdd0), "%s", hds_path);
-                        reboot_cfg.panic_path[0] = '\0';
-                        reboot_cfg.mode = TAB5_LAUNCH_MODE_PX68K;
                         reboot_cfg.boot_source = !strcmp(ui_action.path, "HDD0") ? TAB5_LAUNCH_BOOT_HDD0 :
                                                  (!strcmp(ui_action.path, "FDD1") ? TAB5_LAUNCH_BOOT_FLOPPY1 : TAB5_LAUNCH_BOOT_FLOPPY0);
 
@@ -2241,7 +2041,6 @@ static void px68k_emulation_task(void *arg)
                                  reboot_cfg.boot_source == TAB5_LAUNCH_BOOT_HDD0 ? "HDD0" :
                                  (reboot_cfg.boot_source == TAB5_LAUNCH_BOOT_FLOPPY1 ? "FDD1" : "FDD0"));
                         tab5_video_set_game_controls_enabled(0);
-                        tab5_video_set_panic_compat_enabled(0);
 
                         if (!tab5_guest_apply_boot_config(ctx, &reboot_cfg, &boot_result,
                                                          "Runtime FILE (re)BOOT"))
@@ -2249,7 +2048,6 @@ static void px68k_emulation_task(void *arg)
                             tab5_launcher_config_t recovery = {0};
                             snprintf(recovery.floppy0, sizeof(recovery.floppy0), "%s", TAB5_FLASH_HUMAN_PATH);
                             recovery.boot_source = TAB5_LAUNCH_BOOT_FLOPPY0;
-                            recovery.mode = TAB5_LAUNCH_MODE_PX68K;
                             ESP_LOGW(TAG, "Runtime FILE (re)BOOT failed; recovering to Flash Human68k without host reset");
                             if (!tab5_guest_apply_boot_config(ctx, &recovery, &boot_result,
                                                              "Runtime FILE recovery"))
@@ -2268,9 +2066,7 @@ static void px68k_emulation_task(void *arg)
                         deferred_fdds_pending = boot_result.deferred_fdds_pending;
                         a_diskmag_boot = diskmag_path[0] && !strcmp(a_boot_path, diskmag_path);
                         TAB5_REARM_GUEST_OBSERVERS();
-                        tab5_panic_reset_touch();
                         tab5_video_set_game_controls_enabled(1);
-                        tab5_video_set_panic_compat_enabled(0);
                         ESP_LOGI(TAG, "Runtime FILE (re)BOOT complete: no ESP restart");
                         break;
                     }
@@ -2279,225 +2075,6 @@ static void px68k_emulation_task(void *arg)
                 }
                 tab5_video_set_runtime_media_paths(xdf_path, b_xdf_path, hds_path);
             }
-        }
-
-        /*
-         * PANIC one-shot bootstrap.  Keep the proven BAT-first sequence and
-         * direct retry policy.  R57E62 additionally accepts HostFS-ready after
-         * RAM execution when the host color-text detector never becomes active.
-         * No direct guest-memory probing is used.
-         */
-        if (panic_mode && !panic_command_sent && ram_execution_seen &&
-            !panic_hostfs_ready_frame)
-        {
-            const int ready_drive = HostFS_DebugDrive();
-            if (ready_drive >= 0 && ready_drive < 26) {
-                panic_hostfs_ready_frame = frame;
-                ESP_LOGI(TAG,
-                         "PANIC HostFS-ready fallback armed: drive=%c: frame=%lu; command eligible in 120 frames",
-                         (char)('A' + ready_drive), (unsigned long)frame);
-            }
-        }
-
-        const bool panic_text_trigger =
-            textview_active && panic_text_ready_frame &&
-            frame >= panic_text_ready_frame + 90u;
-        const bool panic_hostfs_trigger =
-            panic_hostfs_ready_frame &&
-            frame >= panic_hostfs_ready_frame + 120u;
-
-        if (panic_mode && !panic_command_sent &&
-            (panic_text_trigger || panic_hostfs_trigger) &&
-            !tab5_guest_input_busy())
-        {
-            const int host_drive = HostFS_DebugDrive();
-            if (host_drive >= 0 && host_drive < 26)
-            {
-                const char drive = (char)('A' + host_drive);
-                char command[40];
-                const bool batch_ready = tab5_panic_prepare_batch(drive) != 0;
-                if (batch_ready)
-                    snprintf(command, sizeof(command), "%c:\\P68K.BAT\r", drive);
-                else
-                    snprintf(command, sizeof(command), "%c:\\P68K.X %c:\\P68K.PAN\r", drive, drive);
-
-                ESP_LOGI(TAG, "PANIC audio launch: preserving live PCM/FM stream (6.11b behavior; no host flush)");
-                tab5_guest_input_set_interval_frames(3u);
-                if (tab5_guest_input_queue_text(command))
-                {
-                    panic_command_sent = true;
-                    panic_command_frame = frame;
-                    panic_command_gfx_base = GVRAM_DebugWriteCount();
-                    panic_command_pal_base = Pal_DebugGrphWriteCount();
-                    panic_command_bat_open_base = HostFS_DebugPanicBatchOpens();
-                    panic_command_player_open_base = HostFS_DebugPanicPlayerOpens();
-                    panic_command_pan_open_base = HostFS_DebugPanicPanOpens();
-                    panic_touch_enable_frame = frame + 240u;
-                    tab5_panic_reset_touch();
-                    ESP_LOGI(TAG, "*** PANIC AUTO START: drive=%c: via=%s trigger=%s selected=%s ***",
-                             drive, batch_ready ? "P68K.BAT" : "direct P68K.X",
-                             panic_text_trigger ? "TEXT" : "HOSTFS-FALLBACK",
-                             ctx->launcher_cfg.panic_path);
-                    tab5_video_status("PANIC.X starting", "Tap=SPACE / hold upper-left=menu");
-                }
-            }
-        }
-
-        /* Build 6.12q: the old fallback used only GVRAM/palette activity as
-         * its launch proof.  PANIC.X can be alive on its own title/initial
-         * screen before those counters move; in that case typing the direct
-         * command 10 seconds later becomes ordinary key input to PANIC.X,
-         * skipping the title and potentially disturbing its audio init.
-         *
-         * HostFS now counts successful opens of P68K.X/P68K.PAN.  If either
-         * was opened after our command, the guest really dispatched the
-         * player and the fallback MUST stay silent.  Only a genuinely
-         * undispatched BAT retains the proven direct retry. */
-        if (panic_mode && panic_command_sent && !panic_direct_fallback_sent &&
-            frame >= panic_command_frame + 600u && !tab5_guest_input_busy())
-        {
-            const uint32_t bat_opens = HostFS_DebugPanicBatchOpens();
-            const uint32_t player_opens = HostFS_DebugPanicPlayerOpens();
-            const uint32_t pan_opens = HostFS_DebugPanicPanOpens();
-            const bool player_dispatched =
-                player_opens > panic_command_player_open_base ||
-                pan_opens > panic_command_pan_open_base;
-
-            if (player_dispatched)
-            {
-                panic_direct_fallback_sent = true;
-                ESP_LOGI(TAG,
-                         "PANIC launch confirmed by HostFS opens; direct retry suppressed: BAT=%lu(+%lu) X=%lu(+%lu) PAN=%lu(+%lu)",
-                         (unsigned long)bat_opens,
-                         (unsigned long)(bat_opens - panic_command_bat_open_base),
-                         (unsigned long)player_opens,
-                         (unsigned long)(player_opens - panic_command_player_open_base),
-                         (unsigned long)pan_opens,
-                         (unsigned long)(pan_opens - panic_command_pan_open_base));
-            }
-            else if (GVRAM_DebugWriteCount() <= panic_command_gfx_base + 32u &&
-                     Pal_DebugGrphWriteCount() <= panic_command_pal_base + 16u)
-            {
-                const int host_drive = HostFS_DebugDrive();
-                if (host_drive >= 0 && host_drive < 26)
-                {
-                    const char drive = (char)('A' + host_drive);
-                    char direct[40];
-                    snprintf(direct, sizeof(direct), "%c:\\P68K.X %c:\\P68K.PAN\r", drive, drive);
-                    tab5_guest_input_set_interval_frames(3u);
-                    if (tab5_guest_input_queue_text(direct))
-                    {
-                        panic_direct_fallback_sent = true;
-                        panic_touch_enable_frame = frame + 240u;
-                        ESP_LOGW(TAG, "PANIC BAT did not open player after 10s; one direct P68K.X retry queued on %c: BATopens=%lu Xopens=%lu PANopens=%lu input_sent=%lu keyq=%lu delivered=%lu drop=%lu unmapped=%lu",
-                                 drive,
-                                 (unsigned long)bat_opens,
-                                 (unsigned long)player_opens,
-                                 (unsigned long)pan_opens,
-                                 (unsigned long)tab5_guest_input_sent_chars(),
-                                 (unsigned long)Keyboard_DebugQueued(),
-                                 (unsigned long)Keyboard_DebugIntDelivered(),
-                                 (unsigned long)Keyboard_DebugQueueDropped(),
-                                 (unsigned long)Keyboard_DebugUnmapped());
-                    }
-                }
-            }
-        }
-
-        /* R57E62 production freeze: one-shot PANIC audio diagnostics removed. */
-
-        if (panic_mode && panic_command_sent && frame >= panic_touch_enable_frame && (frame % 3u) == 0u)
-        {
-            const int touch_action = tab5_panic_poll_playback_touch();
-            if (touch_action == 1)
-            {
-                (void)tab5_guest_input_queue_key(RETROK_SPACE, 1);
-                (void)tab5_guest_input_queue_key(RETROK_SPACE, 0);
-            }
-            else if (touch_action == 2)
-            {
-                tab5_launcher_config_t next_cfg = {0};
-                tab5_guest_boot_result_t boot_result = {0};
-                bool launcher_ok = false;
-
-                ESP_LOGI(TAG, "PANIC return-to-GUI requested: entering native launcher without ESP restart");
-                tab5_guest_input_cancel_text();
-                tab5_video_set_game_controls_enabled(0);
-                tab5_video_set_panic_compat_enabled(0);
-                tab5_video_begin_host_ui();
-                tab5_panic_cleanup_staging();
-
-                for (;;)
-                {
-                    if (!tab5_launcher_run(human_path, &next_cfg))
-                    {
-                        ESP_LOGE(TAG, "Runtime launcher failed; falling back to Flash Human68k");
-                        memset(&next_cfg, 0, sizeof(next_cfg));
-                        snprintf(next_cfg.floppy0, sizeof(next_cfg.floppy0), "%s", TAB5_FLASH_HUMAN_PATH);
-                        next_cfg.boot_source = TAB5_LAUNCH_BOOT_FLOPPY0;
-                        next_cfg.mode = TAB5_LAUNCH_MODE_PX68K;
-                        launcher_ok = true;
-                        break;
-                    }
-
-                    if (next_cfg.mode != TAB5_LAUNCH_MODE_PANIC)
-                    {
-                        launcher_ok = true;
-                        break;
-                    }
-
-                    if (tab5_panic_prepare_runtime(next_cfg.panic_path))
-                    {
-                        launcher_ok = true;
-                        break;
-                    }
-
-                    ESP_LOGE(TAG, "Runtime launcher PANIC staging failed: %s", next_cfg.panic_path);
-                    tab5_panic_cleanup_staging();
-                    tab5_video_show_message("PANIC setup failed", "Returning to X68K Tab GUI...");
-                    vTaskDelay(pdMS_TO_TICKS(900));
-                }
-
-                if (launcher_ok && !tab5_guest_apply_boot_config(ctx, &next_cfg, &boot_result,
-                                                                  "PANIC -> GUI selection"))
-                {
-                    tab5_launcher_config_t recovery = {0};
-                    snprintf(recovery.floppy0, sizeof(recovery.floppy0), "%s", TAB5_FLASH_HUMAN_PATH);
-                    recovery.boot_source = TAB5_LAUNCH_BOOT_FLOPPY0;
-                    recovery.mode = TAB5_LAUNCH_MODE_PX68K;
-                    ESP_LOGW(TAG, "PANIC -> GUI selected boot failed; recovering Flash Human68k without host reset");
-                    launcher_ok = tab5_guest_apply_boot_config(ctx, &recovery, &boot_result,
-                                                               "PANIC -> GUI recovery");
-                }
-
-                if (!launcher_ok)
-                {
-                    tab5_video_end_host_ui();
-                    tab5_video_show_message("Guest boot failed", "ESP host/audio are still alive");
-                    ESP_LOGE(TAG, "PANIC -> GUI recovery failed; no ESP restart performed");
-                    break;
-                }
-
-                direct_hdd_boot = boot_result.direct_hdd_boot;
-                direct_fdd1_boot = boot_result.direct_fdd1_boot;
-                hds_layout_ok = boot_result.hds_layout_ok;
-                b_inserted = boot_result.b_inserted;
-                b_write_protected = false;
-                deferred_fdds_pending = boot_result.deferred_fdds_pending;
-                a_diskmag_boot = diskmag_path[0] && !strcmp(a_boot_path, diskmag_path);
-                TAB5_REARM_GUEST_OBSERVERS();
-                tab5_panic_reset_touch();
-
-                tab5_video_end_host_ui();
-                tab5_video_set_game_controls_enabled(panic_mode ? 0 : 1);
-                tab5_video_set_panic_compat_enabled(panic_mode ? 1 : 0);
-
-                ESP_LOGI(TAG,
-                         "PANIC -> GUI complete: selected mode=%s source=%s; ESP/M5/ES8388/I2S never restarted",
-                         panic_mode ? "PANIC" : "PX68K",
-                         direct_hdd_boot ? "HDD0" : "FDD0");
-            }
-        }
 
         /* R139A6A3: USB mouse/JoyPAD one-shot activity observers retired;
          * functional HID -> guest input transport is unchanged. */
@@ -2776,7 +2353,6 @@ static void px68k_emulation_task(void *arg)
     }
 
 #undef TAB5_REARM_GUEST_OBSERVERS
-#undef panic_mode
 #undef xdf_path
 #undef human_path
 #undef b_xdf_path

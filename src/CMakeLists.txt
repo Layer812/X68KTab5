@@ -1,14 +1,18 @@
 idf_component_register(
     SRCS
         "main.c"
+        "retrop4_midi_uart.cpp"
+        "midmod/midi_engine.c"
+        "midmod/gs2sam.c"
+        "midmod/gs2sam_processor.c"
+        "midmod/gs2sam_profile_sc55mk2.c"
+        "midmod/gs2sam_profile_csv.c"
         "tab5_dynarec_arena.c"
         "tab5_video.cpp"
         "tab5_ppa.c"
         "tab5_px68k_hotmem.c"
         "tab5_launcher.cpp"
         "tab5_media_ui.cpp"
-        "tab5_panic.cpp"
-        "panic_x_bin.c"
         "tab5_audio.cpp"
         "tab5_sd.c"
         "tab5_textview.c"
@@ -22,6 +26,7 @@ idf_component_register(
         "tab5_screen_manager.c"
     INCLUDE_DIRS
         "."
+        "midmod"
     REQUIRES
         # Project/core
         px68k
@@ -37,7 +42,7 @@ idf_component_register(
         log
         esp_timer
         esp_hw_support
-        esp_driver_gpio
+        esp_driver_gpio esp_driver_uart
         ulp
 
         # Storage

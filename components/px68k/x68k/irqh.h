@@ -7,6 +7,8 @@
 void IRQH_Init(void);
 void IRQH_IRQCallBack(uint8_t irq);
 void IRQH_Int(uint8_t irq, void* handler);
+void IRQH_R1A13GetStats(uint32_t *calls, uint32_t *effective,
+                        uint32_t *dup_total, uint32_t dup_by_level[8]);
 int IRQH_StateAction(StateMem *sm, int load, int data_only);
 
 #endif /* WINX68K_IRQ_H */
