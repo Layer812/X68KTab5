@@ -123,7 +123,7 @@ Connect it to X68K Tab PORT.A using MIDI at 31,250 bps.
 
 X68K Tab started from the [PanicPlayerTab5](https://github.com/Layer812/PanicPlayerTab5) project.
 
-However, not much PANIC data turned up in the end (lol), so **the integrated PANIC Player has been temporarily removed from the Production build.**
+However, I couldn't collect much PANIC data in the end (lol), so **the integrated PANIC Player has been temporarily removed from the Production build.**
 
 PanicPlayerTab5 itself remains available as a separate project.
 
@@ -148,7 +148,7 @@ The design prioritizes keeping the guest timeline from being unnecessarily stopp
 ## ESP32-P4 Multi-Core Architecture
 
 <p align="center">
-  <img src="./x68ktab_emulation_block_ja.png" alt="X68K Tab ESP32-P4 multi-core architecture" width="1100">
+  <img src="./x68ktab_emulation_block_en.png" alt="X68K Tab ESP32-P4 multi-core architecture" width="1100">
 </p>
 
 - **HP CPU1 — Guest Time Domain**  
