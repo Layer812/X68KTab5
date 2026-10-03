@@ -37,6 +37,17 @@ GS 系の MIDI データについても、MidMod の GS → SAM2695 マッピン
 
 今回の主な更新は **MIDI / MidMod / SAM2695 対応**です。
 
+### 2026-10-04 — Tab5 LCD panel compatibility trial
+
+一部の M5Stack Tab5 では、**製品の出荷時期やハードウェアリビジョンによって LCD パネル構成が異なる場合がある**ことが分かっています。
+
+今回、別個体で表示が正常に立ち上がらない事例があったため、ST7121 / ST7123 系パネルについて、物理 LCD の pixel clock を **60 MHz（約 49 Hz）** に揃え、PSRAM / MIPI-DSI 帯域に余裕を持たせる互換性調整を試行しました。
+
+この変更は LCD の物理 scanout 条件だけを対象としており、X68000 guest timing、CPU1、DoubleFB / PPA / presenter、MIDI、audio の動作方針は変更していません。
+
+> [!NOTE]
+> この対応は、出荷時期の異なるすべての Tab5 個体での動作を保証するものではありません。問題が報告された個体そのものでの最終確認はできていないため、現時点では **互換性改善の試行**として扱っています。
+
 | 項目 | Production 構成 |
 | --- | --- |
 | Guest CPU | **12 MHz** |
@@ -95,7 +106,7 @@ M5Burner の **Share Burn** で Share Code を入力してください。
 
 | バージョン | Share Code | 用途 |
 | --- | --- | --- |
-| **Latest / Production Release** | `hDtXR2HDxTGlzUED` | **MidMod / SAM2695 MIDI対応版** |
+| **Latest / Production Release** | `aJZ6m9VQmofOEXmg` | **MidMod / SAM2695 MIDI対応版** |
 
 まずはこちらを試してください。
 
