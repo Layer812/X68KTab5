@@ -37,6 +37,17 @@ The current Production build runs the **68000 guest CPU at 12 MHz, with the X680
 
 The main update in this release is **MIDI / MidMod / SAM2695 support**.
 
+### 2026-10-04 — Tab5 LCD panel compatibility trial
+
+Some M5Stack Tab5 units may use **different LCD panel configurations depending on production period and hardware revision**.
+
+After receiving a report that X68K Tab did not display correctly on another unit, an experimental compatibility adjustment was added for ST7121 / ST7123-class panels. The physical LCD pixel clock is set to **60 MHz (about 49 Hz)** to provide more margin for PSRAM / MIPI-DSI bandwidth.
+
+This change only targets the physical LCD scanout conditions. X68000 guest timing, CPU1 behavior, DoubleFB / PPA / presenter, MIDI, and audio policy are unchanged.
+
+> [!NOTE]
+> This does not guarantee operation on every Tab5 hardware revision or production batch. The reported affected unit itself has not been available for final verification, so this should currently be considered an **experimental compatibility improvement**.
+
 | Item | Production configuration |
 | --- | --- |
 | Guest CPU | **12 MHz** |
@@ -89,7 +100,7 @@ Enter the Share Code in **Share Burn** in M5Burner.
 
 | Version | Share Code | Description |
 | --- | --- | --- |
-| **Latest / Production Release** | `hDtXR2HDxTGlzUED` | **MidMod / SAM2695 MIDI support** |
+| **Latest / Production Release** | `aJZ6m9VQmofOEXmg` | **MidMod / SAM2695 MIDI support** |
 
 Start with this build.
 
