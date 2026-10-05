@@ -2,6 +2,24 @@ cmake_minimum_required(VERSION 3.16)
 
 set(EXTRA_COMPONENT_DIRS "${CMAKE_CURRENT_LIST_DIR}/src")
 
+# X68K Tab keeps M5GFX pinned to the validated upstream commit and applies the
+# small Tab5 panel-compatibility/DoubleFB overlay during configure. The script
+# is exact-guarded and idempotent; it refuses an unexpected M5GFX revision.
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+execute_process(
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_LIST_DIR}/patch_m5gfx_x68ktab.py"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_LIST_DIR}"
+    RESULT_VARIABLE X68KTAB_M5GFX_PATCH_RC
+    OUTPUT_VARIABLE X68KTAB_M5GFX_PATCH_OUT
+    ERROR_VARIABLE X68KTAB_M5GFX_PATCH_ERR
+)
+if(NOT X68KTAB_M5GFX_PATCH_RC EQUAL 0)
+    message(FATAL_ERROR
+        "X68K Tab M5GFX patch failed:\n${X68KTAB_M5GFX_PATCH_OUT}\n${X68KTAB_M5GFX_PATCH_ERR}")
+endif()
+string(STRIP "${X68KTAB_M5GFX_PATCH_OUT}" X68KTAB_M5GFX_PATCH_OUT)
+message(STATUS "${X68KTAB_M5GFX_PATCH_OUT}")
+
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 
 # PX68K Tab5 native ESP-IDF 5.5.4 production build.
