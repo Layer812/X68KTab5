@@ -215,6 +215,21 @@ Human68k 関連ファイルについても、適用される条件に従って�
 - PX68K
 - [MidMod](https://github.com/Layer812/MidMod)
 
+M5GFX / M5Unified は submodule です。新規取得時は submodule も初期化してください。
+
+```bash
+git clone --recurse-submodules https://github.com/Layer812/X68KTab5.git
+cd X68KTab5
+idf.py build
+```
+
+既存 checkout では、先に `git submodule update --init --recursive` を実行してください。
+
+CMake configure 時に `patch_m5gfx_x68ktab.py` が pinned M5GFX
+`729297d6e3d657ddc1ec5189bac2f2ea68828085` に対して、ST7121 / ST7123 /
+ILI9881C のパネル別互換設定と X68K Tab の DoubleFB 拡張を exact-guard 付きで適用します。
+そのため build 後に `components/M5GFX` がローカル変更ありと表示されるのは正常です。
+
 ローカルに必要な ROM / OS / disk image 等はリポジトリへ追加しないでください。
 
 ---
