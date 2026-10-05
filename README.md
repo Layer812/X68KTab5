@@ -37,16 +37,20 @@ GS 系の MIDI データについても、MidMod の GS → SAM2695 マッピン
 
 今回の主な更新は **MIDI / MidMod / SAM2695 対応**です。
 
-### 2026-10-04 — Tab5 LCD panel compatibility trial
+### 2026-10-05 — Tab5 LCD panel compatibility update
 
-一部の M5Stack Tab5 では、**製品の出荷時期やハードウェアリビジョンによって LCD パネル構成が異なる場合がある**ことが分かっています。
+M5Stack Tab5 には、出荷時期やハードウェアリビジョンによって **ILI9881C / ST7121 / ST7123** の異なる LCD 構成が存在することが分かっています。
 
-今回、別個体で表示が正常に立ち上がらない事例があったため、ST7121 / ST7123 系パネルについて、物理 LCD の pixel clock を **60 MHz（約 49 Hz）** に揃え、PSRAM / MIPI-DSI 帯域に余裕を持たせる互換性調整を試行しました。
+2026-10-04 に行った pixel clock 60 MHz のみの互換性試行では、報告のあった個体の表示問題は解決しませんでした。その後、パネル判定、MIPI-DSI lane rate、pixel clock、porch、frame ACK/BTA、clock-lane 動作、初期化シーケンスを切り分け、パネルごとに互換設定を適用する方式へ更新しました。
 
-この変更は LCD の物理 scanout 条件だけを対象としており、X68000 guest timing、CPU1、DoubleFB / PPA / presenter、MIDI、audio の動作方針は変更していません。
+**ST7121 搭載 Tab5 については、表示できなかった実機で X68K Tab が正常に動作することを確認できました。** ST7123 は既知良好個体の安定動作を維持する設定を使用し、ILI9881C 向けの互換設定も含めています。
+
+この対応は物理 LCD / MIPI-DSI の初期化・scanout 条件を対象としており、X68000 guest timing、CPU1、DoubleFB / PPA / presenter、MIDI、audio の基本方針は変更していません。
 
 > [!NOTE]
-> この対応は、出荷時期の異なるすべての Tab5 個体での動作を保証するものではありません。問題が報告された個体そのものでの最終確認はできていないため、現時点では **互換性改善の試行**として扱っています。
+> Tab5 の全製造ロットでの動作を保証するものではありません。表示に問題がある場合は、使用している Tab5 の情報と症状を Issue で教えてください。
+>
+> **Special thanks to Nochiさん！** ST7121 搭載 Tab5 での実機検証と互換表示対応の確認にご協力いただき、ありがとうございました。
 
 | 項目 | Production 構成 |
 | --- | --- |
@@ -106,7 +110,7 @@ M5Burner の **Share Burn** で Share Code を入力してください。
 
 | バージョン | Share Code | 用途 |
 | --- | --- | --- |
-| **Latest / Production Release** | `aJZ6m9VQmofOEXmg` | **MidMod / SAM2695 MIDI対応版** |
+| **Latest / Production Release** | `soDETfCXCWpkWT37` | **Tab5 LCD互換対応 + MidMod / SAM2695 MIDI対応版** |
 
 まずはこちらを試してください。
 
