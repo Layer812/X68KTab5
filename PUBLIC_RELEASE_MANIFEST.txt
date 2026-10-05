@@ -1,6 +1,7 @@
 X68K Tab public release folder
 Source: G:\px68k-tab5
 Destination: G:\X68KTab5
+Build-time M5GFX overlay: patch_m5gfx_x68ktab.py
 Latest M5Burner Share Code: soDETfCXCWpkWT37
 
 Whitelisted directories:
