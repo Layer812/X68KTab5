@@ -37,16 +37,20 @@ The current Production build runs the **68000 guest CPU at 12 MHz, with the X680
 
 The main update in this release is **MIDI / MidMod / SAM2695 support**.
 
-### 2026-10-04 — Tab5 LCD panel compatibility trial
+### 2026-10-05 — Tab5 LCD panel compatibility update
 
-Some M5Stack Tab5 units may use **different LCD panel configurations depending on production period and hardware revision**.
+M5Stack Tab5 units are known to exist with different LCD configurations depending on production period and hardware revision, including **ILI9881C, ST7121, and ST7123**.
 
-After receiving a report that X68K Tab did not display correctly on another unit, an experimental compatibility adjustment was added for ST7121 / ST7123-class panels. The physical LCD pixel clock is set to **60 MHz (about 49 Hz)** to provide more margin for PSRAM / MIPI-DSI bandwidth.
+The initial 2026-10-04 compatibility trial that only lowered the pixel clock to 60 MHz did not solve the reported display problem. Further testing separated panel detection, MIPI-DSI lane rate, pixel clock, porch timing, frame ACK/BTA behavior, clock-lane behavior, and panel initialization sequence. X68K Tab now applies panel-specific compatibility settings.
 
-This change only targets the physical LCD scanout conditions. X68000 guest timing, CPU1 behavior, DoubleFB / PPA / presenter, MIDI, and audio policy are unchanged.
+**An affected Tab5 equipped with ST7121 has now been confirmed to display and run X68K Tab correctly.** ST7123 keeps the known-good stable settings used by the reference unit, and an ILI9881C compatibility profile is also included.
+
+These changes target physical LCD / MIPI-DSI initialization and scanout conditions only. The basic X68000 guest timing, CPU1, DoubleFB / PPA / presenter, MIDI, and audio policies are unchanged.
 
 > [!NOTE]
-> This does not guarantee operation on every Tab5 hardware revision or production batch. The reported affected unit itself has not been available for final verification, so this should currently be considered an **experimental compatibility improvement**.
+> Operation on every Tab5 production batch cannot be guaranteed. If you encounter a display problem, please open an Issue with information about your Tab5 and the observed symptoms.
+>
+> **Special thanks to Nochi!** Thank you for testing on an ST7121-based Tab5 and confirming the LCD compatibility fix.
 
 | Item | Production configuration |
 | --- | --- |
@@ -100,7 +104,7 @@ Enter the Share Code in **Share Burn** in M5Burner.
 
 | Version | Share Code | Description |
 | --- | --- | --- |
-| **Latest / Production Release** | `aJZ6m9VQmofOEXmg` | **MidMod / SAM2695 MIDI support** |
+| **Latest / Production Release** | `soDETfCXCWpkWT37` | **Tab5 LCD compatibility + MidMod / SAM2695 MIDI support** |
 
 Start with this build.
 
