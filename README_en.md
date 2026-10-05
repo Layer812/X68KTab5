@@ -209,6 +209,22 @@ Current Production baseline:
 - PX68K
 - [MidMod](https://github.com/Layer812/MidMod)
 
+M5GFX and M5Unified are submodules. Initialize them when cloning:
+
+```bash
+git clone --recurse-submodules https://github.com/Layer812/X68KTab5.git
+cd X68KTab5
+idf.py build
+```
+
+For an existing checkout, run `git submodule update --init --recursive` first.
+
+During CMake configure, `patch_m5gfx_x68ktab.py` applies the exact-guarded X68K Tab
+panel compatibility and DoubleFB overlay to pinned M5GFX
+`729297d6e3d657ddc1ec5189bac2f2ea68828085`. It includes separate ST7121 /
+ST7123 / ILI9881C display settings. Seeing `components/M5GFX` as locally modified
+after configuring/building is therefore expected.
+
 Do not add locally required ROMs, OS files, disk images, or similar files to the repository.
 
 ---
