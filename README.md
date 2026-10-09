@@ -35,7 +35,17 @@ GS 系の MIDI データについても、MidMod の GS → SAM2695 マッピン
 
 現在の Production 版では、**68000 guest CPU を 12 MHz、X68000 peripheral time domain を exact 10 MHz** としています。
 
-今回の主な更新は **MIDI / MidMod / SAM2695 対応**です。
+現在の主な更新は **PDX / ADPCM 再生修正、Tab5 LCD互換対応、MIDI / MidMod / SAM2695 対応**です。
+
+### 2026-10-09 — PDX / ADPCM 半速再生修正
+
+MDX から PDX / ADPCM を再生した際、特定の再生経路で PCM が本来の約半分の速度になる問題を修正しました。
+
+原因は ESP32-P4 向け FastOPM の guest-visible control plane で、YM2151 の **WRITE BUSY (status bit 7)** が省略されていたことでした。X68000 側のソフトウェアは YM2151 の BUSY を待つ前提で動作しており、BUSY が常に解除状態に見えることで、本来 BUSY 中に無効となるデータ書き込みが有効になり、YM2151 レジスタ $1B の CT1 が変化して ADPCM クロックが 8 MHz → 4 MHz へ切り替わる場合がありました。
+
+Production では YM2151 の WRITE BUSY を **68 input clocks** として復元しています。4 MHz の YM2151 clock では約 17 µs、現在の 12 MHz guest CPU では 204 guest CPU cycles に相当します。BUSY 中の data-port write は CPU1 control plane と CPU0 waveform/timeline の両方へ適用しません。
+
+実機で PDX 再生が正常速度へ戻ることを確認済みです。MIDI、CPU1_WAIT、guest 12 MHz timing、ADPCM rate table、DMA cadence は変更していません。
 
 ### 2026-10-05 — Tab5 LCD panel compatibility update
 
@@ -110,7 +120,7 @@ M5Burner の **Share Burn** で Share Code を入力してください。
 
 | バージョン | Share Code | 用途 |
 | --- | --- | --- |
-| **Latest / Production Release** | `soDETfCXCWpkWT37` | **Tab5 LCD互換対応 + MidMod / SAM2695 MIDI対応版** |
+| **Latest / Production Release** | `tLkdgjcPoEoGbGEt` | **PDX / ADPCM 半速再生修正版 + Tab5 LCD互換対応 + MidMod / SAM2695 MIDI対応版** |
 
 まずはこちらを試してください。
 
