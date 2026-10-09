@@ -43,10 +43,6 @@ Fixed an issue where PCM from PDX / ADPCM could play at roughly half of the inte
 
 The root cause was that the ESP32-P4 FastOPM guest-visible control plane did not expose the YM2151 **WRITE BUSY (status bit 7)** state. X68000 software expects to wait for YM2151 BUSY to clear. When BUSY always appeared clear, a data write that should have been rejected while the chip was busy could take effect and change CT1 in YM2151 register $1B, switching the ADPCM clock from 8 MHz to 4 MHz.
 
-Production now restores YM2151 WRITE BUSY for **68 input clocks**. At the 4 MHz YM2151 clock this is about 17 µs, corresponding to 204 guest CPU cycles with the current 12 MHz guest CPU. Data-port writes while BUSY are not applied to either the CPU1 control plane or the CPU0 waveform/timeline backend.
-
-Correct-speed PDX playback has been confirmed on real hardware. MIDI, CPU1_WAIT, guest 12 MHz timing, ADPCM rate tables, and DMA cadence are unchanged.
-
 ### 2026-10-05 — Tab5 LCD panel compatibility update
 
 M5Stack Tab5 units are known to exist with different LCD configurations depending on production period and hardware revision, including **ILI9881C, ST7121, and ST7123**.
