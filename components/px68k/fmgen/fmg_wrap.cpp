@@ -136,6 +136,11 @@ static MyOPM* opm = NULL;
  * The old FMGEN Count() while-loops are reduced to constant-time modulo math.
  */
 extern "C" void rp_midi_diag_event(uint8_t kind, uint32_t value);
+/* X68KTAB_MDX_PCM_PRODUCTION_R8_YM2151_BUSY
+ * Restore guest-visible YM2151 WRITE BUSY after the CPU1 FastOPM control
+ * plane split. Busy duration advances inside the active Musashi timeslice. */
+extern "C" int m68k_cycles_run(void);
+extern "C" int m68k_cycles_remaining(void);
 /* RP_MIDI_SCHED_DIAG_V1I */
 struct FastOPMControl
 {
@@ -149,6 +154,13 @@ struct FastOPMControl
     uint32_t timerb_us;
     uint32_t timera_count_us;
     uint32_t timerb_count_us;
+
+    /* YM2151 WRITE BUSY: 68 input clocks at 4 MHz = 17 us.
+     * Standalone X68K guest CPU is fixed at 12 MHz => 204 guest cycles. */
+    uint32_t busy_cpu_cycles;
+    int32_t busy_last_run;
+    int32_t busy_last_remaining;
+    uint8_t busy_stamp_valid;
 #if PX68K_TAB5_R57E63_AUDIO_AUDIT
     uint64_t audit_guest_clocks;
     uint32_t audit_timer_calls;
@@ -173,6 +185,10 @@ struct FastOPMControl
         timerb_us = 256u * 256u;
         timera_count_us = 0;
         timerb_count_us = 0;
+        busy_cpu_cycles = 0u;
+        busy_last_run = 0;
+        busy_last_remaining = 0;
+        busy_stamp_valid = 0u;
 #if PX68K_TAB5_R57E63_AUDIO_AUDIT
         audit_guest_clocks = 0;
         audit_timer_calls = 0;
@@ -290,6 +306,58 @@ struct FastOPMControl
         if (us) CountUs(us);
     }
 
+    void BusySyncCPU()
+    {
+        int run = m68k_cycles_run();
+        int rem = m68k_cycles_remaining();
+        if (run < 0) run = 0;
+        if (rem < 0) rem = 0;
+
+        if (!busy_stamp_valid)
+        {
+            busy_last_run = run;
+            busy_last_remaining = rem;
+            busy_stamp_valid = 1u;
+            return;
+        }
+
+        uint32_t delta;
+        if (run >= busy_last_run)
+            delta = (uint32_t)(run - busy_last_run);
+        else
+            delta = (uint32_t)busy_last_remaining + (uint32_t)run;
+
+        if (busy_cpu_cycles)
+        {
+            if (delta >= busy_cpu_cycles) busy_cpu_cycles = 0u;
+            else busy_cpu_cycles -= delta;
+        }
+
+        busy_last_run = run;
+        busy_last_remaining = rem;
+    }
+
+    uint8_t StatusWithBusy()
+    {
+        BusySyncCPU();
+        return (uint8_t)(status | (busy_cpu_cycles ? 0x80u : 0u));
+    }
+
+    bool BeginDataWrite()
+    {
+        BusySyncCPU();
+        if (busy_cpu_cycles)
+            return false;
+
+        busy_cpu_cycles = 204u;
+        busy_last_run = m68k_cycles_run();
+        busy_last_remaining = m68k_cycles_remaining();
+        if (busy_last_run < 0) busy_last_run = 0;
+        if (busy_last_remaining < 0) busy_last_remaining = 0;
+        busy_stamp_valid = 1u;
+        return true;
+    }
+
     uint32_t NextObservable10MHz() const
     {
         uint32_t best = R1A18_OPM_LAZY_MAX_CYCLES;
@@ -361,6 +429,7 @@ struct FastOPMControl
             SFVAR(timerb_us),
             SFVAR(timera_count_us),
             SFVAR(timerb_count_us),
+            SFVAR(busy_cpu_cycles),
             SFEND
         };
         return PX68KSS_StateAction(sm, load, data_only, StateRegs, "MYOPM_FAST", false);
@@ -1035,7 +1104,7 @@ uint8_t FASTCALL OPM_Read(void)
 #ifdef ESP_PLATFORM
     if (g_x68p4_opm_lazy_pending) (void)0;
     OPM_R1A18Materialize();
-    return s_fast_opm_ready ? s_fast_opm.status : 0;
+    return s_fast_opm_ready ? s_fast_opm.StatusWithBusy() : 0;
 #else
     if (opm) return opm->ReadStatus();
     return 0;
@@ -1102,6 +1171,7 @@ extern "C" void OPM_R57E63TimerAuditGet(
 void FASTCALL OPM_WriteTimed(uint32_t adr, uint8_t data, uint32_t frames)
 {
 #ifdef ESP_PLATFORM
+    bool r8_accept = true;
     if (s_fast_opm_ready)
     {
         /* Data-port writes can alter timer period/control/status. Advance the
@@ -1111,10 +1181,17 @@ void FASTCALL OPM_WriteTimed(uint32_t adr, uint8_t data, uint32_t frames)
         {
             if (g_x68p4_opm_lazy_pending) (void)0;
             OPM_R1A18Materialize();
+            r8_accept = s_fast_opm.BeginDataWrite();
         }
-        s_fast_opm.WriteIO(adr, data);
+        if (r8_accept) s_fast_opm.WriteIO(adr, data);
         if (adr & 1u) r1a18_opm_rearm_deadline();
     }
+
+    /* Real YM2151 ignores/forbids data-port writes while WRITE BUSY is set.
+     * Do not leak rejected writes into the CPU0 waveform/timeline backend. */
+    if ((adr & 1u) && !r8_accept)
+        return;
+
     if (s_audio_async_enabled)
     {
         if ((adr & 1) == 0)
