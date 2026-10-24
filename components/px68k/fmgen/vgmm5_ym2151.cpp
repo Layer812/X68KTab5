@@ -137,20 +137,65 @@ static void init_tables(void)
     s_tables_ready=1;
 }
 
+/* Directly backported from user-supplied vgmM5 R58 fm_engine.c.
+ * R36: DT2 frequency ratios; R39: key-code dependent, signed DT1 phase-step
+ * adjustment. R38 KF upper six bits retained. The audio output rate stays
+ * at 44.1 kHz; this does not enable R41 native-rate/FIR on X68KTab5. */
+static const uint8_t s_ym2151_dt1_mag[32][4] = {
+
+        {0,0,1,2},
+        {0,0,1,2},
+        {0,0,1,2},
+        {0,0,1,2},
+        {0,1,2,2},
+        {0,1,2,3},
+        {0,1,2,3},
+        {0,1,2,3},
+        {0,1,2,4},
+        {0,1,3,4},
+        {0,1,3,4},
+        {0,1,3,5},
+        {0,2,4,5},
+        {0,2,4,6},
+        {0,2,4,6},
+        {0,2,5,7},
+        {0,2,5,8},
+        {0,3,6,8},
+        {0,3,6,9},
+        {0,3,7,10},
+        {0,4,8,11},
+        {0,4,8,12},
+        {0,4,9,13},
+        {0,5,10,14},
+        {0,5,11,16},
+        {0,6,12,17},
+        {0,6,13,19},
+        {0,7,14,20},
+        {0,8,16,22},
+        {0,8,16,22},
+        {0,8,16,22},
+        {0,8,16,22},
+};
+
 static void update_phase(VgmM5YM2151 *e,int ch)
 {
     static const uint8_t kc_to_n[16]={1,2,3,3,4,5,6,6,7,8,9,9,10,11,12,12};
-    static const float dt1_tab[8]={1.0f,1.002f,1.004f,1.006f,1.0f,0.998f,0.996f,0.994f};
-    static const float dt2_tab[4]={0.0f,384.0f,500.0f,608.0f};
-    /* YM2151 KF is stored in register bits 7:2 (R38). */
-    int note=e->kc[ch]&15, oct=(e->kc[ch]>>4)&7, kf=(e->kf[ch]>>2)&63;
-    uint32_t base=e->freq_tab[kc_to_n[note]][kf] << oct;
-    float bf=(float)base;
+    static const float dt2_tab[4]={1.0f,1.4142135624f,1.5700748447f,1.7310731220f};
+    const int kc=e->kc[ch];
+    const int kf=(e->kf[ch]>>2)&63;
+    const int note=kc&15;
+    const int oct=(kc>>4)&7;
+    const uint32_t base=e->freq_tab[kc_to_n[note]][kf] << oct;
+    const float step_f=(float)base;
     for(int o=0;o<4;o++) {
         YMOp *op=&e->ops[ch*4+o];
-        float mul=op->mul? (float)op->mul : 0.5f;
-        float dt2=dt2_tab[op->dt2&3] * e->phase_step_factor * 0.5f;
-        op->phase_step=(uint32_t)(bf*mul*dt1_tab[op->dt1&7]+dt2);
+        const float mul=op->mul ? (float)op->mul : 0.5f;
+        const int dt1=op->dt1;
+        int32_t dt1_delta=s_ym2151_dt1_mag[(kc>>2)&31][dt1&3];
+        if(dt1&4)dt1_delta=-dt1_delta;
+        const float dt1_step=(float)dt1_delta * ((float)e->clock * 64.0f / (float)e->sample_rate);
+        const float dt2_m=dt2_tab[op->dt2&3];
+        op->phase_step=(uint32_t)((step_f * dt2_m + dt1_step) * mul);
     }
 }
 
