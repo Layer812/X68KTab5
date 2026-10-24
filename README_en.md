@@ -1,7 +1,7 @@
 # X68K Tab
 
 > [!WARNING]
-> **This branch is an experimental YM2151 R61 FIX1 source preview, not a device-verified firmware release.** The native 62.5kHz YM2151 synthesis/FIR path has not yet passed an ESP-IDF build or physical Tab5 audio/performance testing. Use [main](https://github.com/Layer812/X68KTab5) for the current stable/M5Burner version. See the [R61 preview verification notes](TAB5_YM2151_R61_PREVIEW.md).
+> **This branch is an experimental YM2151 R61 FIX1 source preview, not a device-verified firmware release.** The native 62.5kHz YM2151 synthesis/FIR path has passed an ESP-IDF 5.5.4/ESP32-P4 native build, but has not passed physical Tab5 audio/performance testing. Use [main](https://github.com/Layer812/X68KTab5) for the current stable/M5Burner version. See the [R61 preview verification notes](TAB5_YM2151_R61_PREVIEW.md).
 
 [**日本語 README → README.md**](README.md)
 
