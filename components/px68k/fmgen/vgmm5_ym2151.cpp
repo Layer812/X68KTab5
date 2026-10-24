@@ -142,7 +142,8 @@ static void update_phase(VgmM5YM2151 *e,int ch)
     static const uint8_t kc_to_n[16]={1,2,3,3,4,5,6,6,7,8,9,9,10,11,12,12};
     static const float dt1_tab[8]={1.0f,1.002f,1.004f,1.006f,1.0f,0.998f,0.996f,0.994f};
     static const float dt2_tab[4]={0.0f,384.0f,500.0f,608.0f};
-    int note=e->kc[ch]&15, oct=(e->kc[ch]>>4)&7, kf=e->kf[ch]&63;
+    /* YM2151 KF is stored in register bits 7:2 (R38). */
+    int note=e->kc[ch]&15, oct=(e->kc[ch]>>4)&7, kf=(e->kf[ch]>>2)&63;
     uint32_t base=e->freq_tab[kc_to_n[note]][kf] << oct;
     float bf=(float)base;
     for(int o=0;o<4;o++) {
@@ -222,7 +223,7 @@ static __attribute__((always_inline,optimize("O3"))) inline int32_t calc_op_modu
 {
     if(p->env_state==EG_OFF)return 0;
     uint32_t step=p->phase_step;
-    mod*=2;
+    /* R33: YM2151 phase modulation is not doubled. */
     if(pm) step+=(uint32_t)((((int32_t)(step>>10))*pm)>>3);
     p->phase+=step;
     int32_t atten=(p->env_level>>EG_FRACTION_BITS)+p->tl_atten;
@@ -249,7 +250,7 @@ static IRAM_ATTR __attribute__((always_inline,optimize("O3"))) inline int32_t ca
     VgmM5YM2151 *e,YMOp *p,int32_t mod,int noise)
 {
     if(p->env_state==EG_OFF)return 0;
-    mod*=2;
+    /* R33: YM2151 phase modulation is not doubled. */
     p->phase+=p->phase_step;
     int32_t atten=(p->env_level>>EG_FRACTION_BITS)+p->tl_atten;
     if(atten>=3840)return 0;
@@ -455,7 +456,7 @@ static IRAM_ATTR __attribute__((always_inline,optimize("O3"))) inline void tick(
         e->cached_am=0;
     }
     int32_t l=0,r=0;synth(e,&l,&r);
-    l=(l+e->prev_l)/2;r=(r+e->prev_r)/2;e->prev_l=l;e->prev_r=r;
+    /* R37: preserve YM2151 high harmonics; no legacy two-tap smoothing. */
     *ol=l;*orr=r;
 }
 
@@ -481,10 +482,7 @@ static IRAM_ATTR __attribute__((always_inline,optimize("O3"))) inline void tick_
     e->cached_am=0;
     int32_t l=0,r=0;
     synth_zero_hot(e,&l,&r);
-    l=(l+e->prev_l)/2;
-    r=(r+e->prev_r)/2;
-    e->prev_l=l;
-    e->prev_r=r;
+    /* R37: same unfiltered output as the modulated tick. */
     *ol=l;
     *orr=r;
 }
