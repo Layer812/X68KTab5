@@ -4,6 +4,14 @@ on:
   push:
     branches:
       - tab5-ym2151-r61-preview
+    paths:
+      - 'components/px68k/fmgen/**'
+      - 'components/px68k/CMakeLists.txt'
+      - 'src/**'
+      - 'sdkconfig'
+      - 'partitions.csv'
+      - 'CMakeLists.txt'
+      - 'patch_m5gfx_x68ktab.py'
   workflow_dispatch:
 
 permissions:
