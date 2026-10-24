@@ -5,9 +5,9 @@
 **参照 / Reference:** User-provided `vgmM5_R61_FIX1_PRODUCTION_LOCK_20261025.zip` (2026-10-25). Its source package and firmware evidence checksums were independently verified.  
 **安定版 / Current stable:** [main](https://github.com/Layer812/X68KTab5/tree/main)
 
-> このブランチはM5Burner用完成ファームではありません。**ESP-IDFネイティブビルド、Tab5実機での音質、CPU0負荷、音切れ、長時間再生は未確認**です。既存のProduction公開版は変更していません。
+> このブランチはM5Burner用完成ファームではありません。**ESP-IDF 5.5.4／ESP32-P4ネイティブビルドはPASSしましたが、Tab5実機での音質、CPU0負荷、音切れ、長時間再生は未確認**です。既存のProduction公開版は変更していません。
 >
-> This is **NOT** a device-verified firmware release. No ESP-IDF native build, physical Tab5 sound/performance test or flash has been performed for this branch. The existing Production code and M5Burner share code remain unchanged.
+> This is **NOT** a device-verified firmware release. ESP-IDF 5.5.4 / ESP32-P4 native build has PASSED, but physical Tab5 sound/performance testing and flashing have NOT been performed. The existing Production code and M5Burner share code remain unchanged.
 
 ## 何を取り込んだか / Backport scope
 
@@ -48,9 +48,20 @@ CMakeのソースリスト、`fmg_wrap.cpp`、guest CPU、YM2151 WRITE BUSY / Ti
 
 ### 未実施 / Not done
 
-- Tab5向けESP-IDF 5.5.x実ビルド、IRAM使用量測定、実機フラッシュ、MDX/PDX音声、画面/USB/MIDI同時動作、音声キューのunderrun調査。
+- Tab5実機フラッシュ、MDX/PDX音声、画面/USB/MIDI同時動作、音声キューのunderrun調査、実機負荷とIRAM余裕の評価。
 - 実機ではCPU0に**約1.42倍のYM2151 FMティックと25タップFIR**の負荷が増えるため、ゲストCPU1の時間基準と音声連続性を維持できることを一括して確認する必要があります。
 - ソフトウェアに関する新たなROM、ディスクイメージ、ゲーム音楽データは追加していません。
+
+## ESP-IDFネイティブビルド結果 / Native-build evidence
+
+- **GitHub Actions PASS:** [ESP-IDF 5.5.4 / ESP32-P4 (2026-10-25)](https://github.com/Layer812/X68KTab5/actions/runs/40109972436)
+- **Commit:** `b630a8265becf2034f123eaaf60e0ce4de6bc603`
+- **App image:** `px68k_tab5.bin` — 2,422,416 bytes; SHA-256: `2b5ff584cd5c93fe5c4c3fb563b60628224e225d1247deb19488b1aec0564208`
+- **ESP32-P4 ELF:** `px68k_tab5.elf` — 21,917,768 bytes; verified RISC-V ELF32.
+- **Partition validation:** factory app at `0x10000` (8MiB), HumanXDF at `0x810000` (0x140000 bytes). App occupies 29% of its partition; 71% available.
+- **Artifacts:** [Verified BIN/ELF/bootloader/partition-table ZIP](https://github.com/Layer812/X68KTab5/actions/runs/40109972436/artifacts/12566127902) (GitHub Actions retention seven days).
+- Source checksum/host PCM continuity checks passed; the CI compile produced compiler warnings but **no errors**.
+- **No device flash or actual Tab5 sound test was done**. Device acceptance and performance are not established.
 
 ## ソース取得 / Checkout
 
