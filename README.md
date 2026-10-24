@@ -1,7 +1,7 @@
 # X68K Tab
 
 > [!WARNING]
-> **このブランチはYM2151 R61 FIX1の開発プレビューです。** 4MHz YM2151の内部62.5kHz合成とFIRを移植しましたが、ESP-IDF実ビルドとTab5実機での音声・負荷確認はまだ完了していません。通常のM5Burner安定版をお探しの方は [main](https://github.com/Layer812/X68KTab5) を使用してください。詳細は [R61プレビュー検証メモ](TAB5_YM2151_R61_PREVIEW.md) を参照してください。
+> **このブランチはYM2151 R61 FIX1の開発プレビューです。** 4MHz YM2151の内部62.5kHz合成とFIRを移植しましたが、ESP-IDF 5.5.4でのESP32-P4ネイティブビルドはPASSしましたが、Tab5実機での音声・負荷確認は未完了です。通常のM5Burner安定版をお探しの方は [main](https://github.com/Layer812/X68KTab5) を使用してください。詳細は [R61プレビュー検証メモ](TAB5_YM2151_R61_PREVIEW.md) を参照してください。
 
 [**English README → README_en.md**](README_en.md)
 
