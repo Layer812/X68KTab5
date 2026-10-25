@@ -4,8 +4,11 @@ on:
   push:
     branches:
       - tab5-ym2151-r61-preview
+      - work/ym2151-r61-fir-speed-20261025
     paths:
       - 'components/px68k/fmgen/**'
+      - 'tests/ym2151_r61_fir_parity_host.cpp'
+      - '.github/workflows/r61-tab5-native-build.yml'
       - 'components/px68k/CMakeLists.txt'
       - 'src/**'
       - 'sdkconfig'
@@ -47,6 +50,15 @@ jobs:
           test -f components/px68k/fmgen/r41_ym2151_native.h
           test -f components/px68k/fmgen/r47_ym2151_fir25.h
           python3 -m py_compile patch_m5gfx_x68ktab.py
+
+      - name: Verify R61 FM FIR25 bitwise parity on host (350k samples)
+        shell: bash
+        run: |
+          set -euo pipefail
+          g++ -std=c++17 -O2 tests/ym2151_r61_fir_parity_host.cpp -o /tmp/x68ktab_fir_parity
+          /tmp/x68ktab_fir_parity
+          g++ -std=c++17 -O1 -g -fsanitize=undefined tests/ym2151_r61_fir_parity_host.cpp -o /tmp/x68ktab_fir_ubsan
+          UBSAN_OPTIONS=halt_on_error=1 /tmp/x68ktab_fir_ubsan
 
       - name: ESP-IDF 5.5.4 real project build (no flash)
         uses: espressif/esp-idf-ci-action@v1
