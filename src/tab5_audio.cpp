@@ -143,6 +143,19 @@ static void audio_source_ready_cb(void)
         xTaskNotifyGive(task);
 }
 
+/* M5Unified 0.2.28: the actual Speaker playback task reports when its
+ * previously queued PCM buffer is no longer referenced. Wake the existing
+ * CPU0 feeder then, rather than relying on the 100Hz tick alone. This runs
+ * in the Speaker task, not an ISR, and never touches the audio ring. */
+static void audio_speaker_buffer_released_cb(void *, const void *, uint8_t channel)
+{
+    if (channel != kSpeakerChannel)
+        return;
+    TaskHandle_t task = s_task;
+    if (task)
+        xTaskNotifyGive(task);
+}
+
 static void pump_host_source(void)
 {
     if (!s_started || !s_source_pull)
@@ -241,7 +254,10 @@ static void audio_task(void *)
              * PCM committed at 44.1 kHz, so a single tick cannot starve audio
              * on the current target and guarantees an IDLE scheduling window.
              */
-            vTaskDelay(1);
+            /* 100Hz ticks are ~10ms while a 512-frame PCM block lasts
+             * only ~11.6ms. Release callback wakes us promptly on slot
+             * turnover; the one-tick bound remains the safe fallback. */
+            ulTaskNotifyTake(pdTRUE, 1);
             continue;
         }
 
@@ -435,6 +451,11 @@ if (s_started)
         ESP_LOGE(TAG, "M5Unified speaker begin failed after cold recovery");
         return 0;
     }
+
+    /* M5Unified 0.2.28 guarantees this callback is issued after a PCM
+     * buffer is no longer referenced. Register before our first playRaw.
+     * Never request/play audio from the Speaker callback itself. */
+    M5.Speaker.setBufferReleaseCallback(nullptr, audio_speaker_buffer_released_cb);
 
     /* Allow ES8388 clocks/VREF and the external amplifier to settle before
      * the feeder starts queueing PCM.  Channel gains are forced to their
