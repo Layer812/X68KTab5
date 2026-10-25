@@ -1,5 +1,8 @@
 # X68K Tab
 
+> [!NOTE]
+> **最新ソース: 2026.10.25 — vgmM5 R61 FIX1のYM2151更新＋FIR高速化版。** Tab5実機で音質安定・複数ソフト起動が確認されました。長時間・全機能の互換性や定量的速度改善は未保証です。詳しくは[更新履歴と検証結果](RELEASE_NOTES_2026-10-25.md)を参照してください。**この版のM5Burner Share Codeは準備中**です。旧Share Codeは新ファームウェアではありません。
+
 [**English README → README_en.md**](README_en.md)
 
 <p align="center">
@@ -21,7 +24,7 @@ PX68K / Musashi をベースに、ESP32-P4 の 2つの HP CPU、LP Core、PSRAM�
 
 PANIC を再生するために必要な X68000 環境を少しずつ実装していったら...いつの間にか X68000 エミュレータになりました。
 
-今回の更新では、[**MidMod**](https://github.com/Layer812/MidMod) を組み込み、X68000 の MIDI 出力を [**M5Stack Unit Synth (SAM2695)**](https://www.switch-science.com/products/9510) で鳴らせるようにしました。
+MIDIについては [**MidMod**](https://github.com/Layer812/MidMod) を組み込み、X68000 の MIDI 出力を [**M5Stack Unit Synth (SAM2695)**](https://www.switch-science.com/products/9510) で鳴らせるようにしました。
 
 GS 系の MIDI データについても、MidMod の GS → SAM2695 マッピングを利用して、自然に再生できるよう変換しています。
 
@@ -35,7 +38,13 @@ GS 系の MIDI データについても、MidMod の GS → SAM2695 マッピン
 
 現在の Production 版では、**68000 guest CPU を 12 MHz、X68000 peripheral time domain を exact 10 MHz** としています。
 
-現在の主な更新は **PDX / ADPCM 再生修正、Tab5 LCD互換対応、MIDI / MidMod / SAM2695 対応**です。
+最新ソース **2026.10.25** では、従来の **PDX / ADPCM 再生修正、Tab5 LCD互換対応、MIDI / MidMod / SAM2695 対応**を維持したまま、**YM2151のR61高精度FM合成とFIR処理の高速化**を追加しました。
+
+### 2026-10-25 — YM2151音質・FIR高速化（Tab5実機で初期確認済み）
+
+[vgmM5](https://github.com/Layer812/vgmM5) のR61 FIX1を基準に、位相変調・KF・DT1/DT2、高音域の数値変換を改善しました。YM2151の内部62.5kHz合成＋25タップFIRを追加し、FIRのリング処理をPCM一致のまま高速化しています。最終出力は44.1kHzを維持します。
+
+**ESP-IDF 5.5.4 / ESP32-P4ネイティブビルドPASS、実機で音質安定・複数ソフト起動を確認。** 速度は良好との初期評価で、定量的な負荷・性能比較と長時間回帰は未実施です。詳細は [リリースノート](RELEASE_NOTES_2026-10-25.md) を参照してください。
 
 ### 2026-10-09 — PDX / ADPCM 半速再生修正
 
@@ -116,9 +125,10 @@ M5Burner の **Share Burn** で Share Code を入力してください。
 
 | バージョン | Share Code | 用途 |
 | --- | --- | --- |
-| **Latest / Production Release** | `tLkdgjcPoEoGbGEt` | **PDX / ADPCM 半速再生修正版 + Tab5 LCD互換対応 + MidMod / SAM2695 MIDI対応版** |
+| **2026.10.25 — 最新ソース版** | **シェアコード準備中** | **YM2151 R61音質改善 + FIR高速化。実機で初期確認済み** |
+| **2026-10-09 — 従来M5Burner公開版** | `tLkdgjcPoEoGbGEt` | **PDX / ADPCM 半速修正 + Tab5 LCD互換 + MidMod / SAM2695 MIDI** |
 
-まずはこちらを試してください。
+新しいShare Codeが公開されるまでは、M5Burnerから入手できるのは上記の従来版です。2026.10.25版と混同しないでください。
 
 ---
 

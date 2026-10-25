@@ -1,0 +1,94 @@
+name: X68KTab5 R61 native build (no flash)
+
+on:
+  push:
+    branches:
+      - tab5-ym2151-r61-preview
+      - work/ym2151-r61-fir-speed-20261025
+    paths:
+      - 'components/px68k/fmgen/**'
+      - 'tests/ym2151_r61_fir_parity_host.cpp'
+      - '.github/workflows/r61-tab5-native-build.yml'
+      - 'components/px68k/CMakeLists.txt'
+      - 'src/**'
+      - 'sdkconfig'
+      - 'partitions.csv'
+      - 'CMakeLists.txt'
+      - 'patch_m5gfx_x68ktab.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: r61-preview-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  esp32p4-no-flash:
+    name: ESP-IDF 5.5.4 ESP32-P4 native build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Confirm pinned M5GFX and source invariants
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Repo ref: ${GITHUB_SHA}"
+          test "$(git -C components/M5GFX rev-parse HEAD)" = "729297d6e3d657ddc1ec5189bac2f2ea68828085"
+          grep -q 'CONFIG_IDF_TARGET="esp32p4"' sdkconfig
+          grep -q 'CONFIG_SPIRAM=y' sdkconfig
+          grep -q 'CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=360' sdkconfig
+          grep -q 'R41YM2151Native' components/px68k/fmgen/vgmm5_ym2151.cpp
+          grep -q 'ym2151_phase_advance_mod32' components/px68k/fmgen/vgmm5_ym2151.cpp
+          grep -q 'r47_ym2151_fir_tick' components/px68k/fmgen/vgmm5_ym2151.cpp
+          test -f components/px68k/fmgen/r41_ym2151_native.h
+          test -f components/px68k/fmgen/r47_ym2151_fir25.h
+          python3 -m py_compile patch_m5gfx_x68ktab.py
+
+      - name: Verify R61 FM FIR25 bitwise parity on host (350k samples)
+        shell: bash
+        run: |
+          set -euo pipefail
+          g++ -std=c++17 -O2 tests/ym2151_r61_fir_parity_host.cpp -o /tmp/x68ktab_fir_parity
+          /tmp/x68ktab_fir_parity
+          g++ -std=c++17 -O1 -g -fsanitize=undefined tests/ym2151_r61_fir_parity_host.cpp -o /tmp/x68ktab_fir_ubsan
+          UBSAN_OPTIONS=halt_on_error=1 /tmp/x68ktab_fir_ubsan
+
+      - name: ESP-IDF 5.5.4 real project build (no flash)
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.5.4
+          target: esp32p4
+          path: '.'
+          command: idf.py build
+
+      - name: Verify native output headers, never flash
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s build/px68k_tab5.bin
+          test -s build/px68k_tab5.elf
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib,json
+          p=Path('build/px68k_tab5.bin')
+          print(json.dumps({'firmware':str(p),'bytes':p.stat().st_size,'sha256':hashlib.sha256(p.read_bytes()).hexdigest(),'flash':False}, indent=2))
+          PY
+
+      - name: Save build outputs for review (only when build succeeds)
+        uses: actions/upload-artifact@v4
+        with:
+          name: x68ktab-r61-preview-esp32p4-build
+          if-no-files-found: error
+          path: |
+            build/px68k_tab5.bin
+            build/px68k_tab5.elf
+            build/partition_table/partition-table.bin
+            build/bootloader/bootloader.bin
+          retention-days: 7

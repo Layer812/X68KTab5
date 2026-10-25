@@ -1,5 +1,8 @@
 # X68K Tab
 
+> [!NOTE]
+> **Latest source: 2026.10.25 — YM2151 vgmM5 R61 FIX1 backport + FIR optimization for Tab5.** Physical smoke tests report stable sound and several applications booting, but not exhaustive compatibility, long-term endurance or a measured overall speedup. See [release notes and evidence](RELEASE_NOTES_2026-10-25.md). **The new M5Burner Share Code is being prepared**; the old code does NOT refer to this new firmware.
+
 [**日本語 README → README.md**](README.md)
 
 <p align="center">
@@ -21,7 +24,7 @@ The project originally started because I wanted to play old X68000 **PANIC** dat
 
 As I gradually implemented the X68000 environment needed to play PANIC... somehow it turned into an X68000 emulator.
 
-This update integrates [**MidMod**](https://github.com/Layer812/MidMod), allowing X68000 MIDI output to be played through the [**M5Stack Unit Synth (SAM2695)**](https://www.switch-science.com/products/9510).
+MIDI support integrates [**MidMod**](https://github.com/Layer812/MidMod), allowing X68000 MIDI output to be played through the [**M5Stack Unit Synth (SAM2695)**](https://www.switch-science.com/products/9510).
 
 GS MIDI data is also converted using MidMod's GS → SAM2695 mapping so that it can be played as naturally as possible on the SAM2695.
 
@@ -35,7 +38,13 @@ GS MIDI data is also converted using MidMod's GS → SAM2695 mapping so that it 
 
 The current Production build runs the **68000 guest CPU at 12 MHz, with the X68000 peripheral time domain at exact 10 MHz**.
 
-The current Production update includes the **PDX / ADPCM playback fix, Tab5 LCD compatibility improvements, and MIDI / MidMod / SAM2695 support**.
+Source release **2026.10.25** adds the **R61-based YM2151 synthesis and FIR speed optimization** while preserving the **PDX/ADPCM playback fix, Tab5 LCD compatibility, and MidMod/SAM2695 MIDI support**.
+
+### 2026-10-25 — YM2151 sound fidelity and FIR speed optimization (Tab5 smoke-tested)
+
+The YM2151-only backend now incorporates corrections based on [vgmM5](https://github.com/Layer812/vgmM5) R61 FIX1: phase modulation, KF, KC-dependent DT1 / DT2, and high-note conversion safety. Its native 62.5kHz FM+25-tap FIR is resampled to the unchanged 44.1kHz PCM output. The FIR ring was optimized with bit-identical host PCM results.
+
+**ESP-IDF 5.5.4 / ESP32-P4 native build PASS.** On a physical Tab5, stable sound and several applications booting were reported. Quantified speedup, sustained operation, and full-device regression testing are not claimed. Read the [release notes](RELEASE_NOTES_2026-10-25.md).
 
 ### 2026-10-09 — PDX / ADPCM half-speed playback fix
 
@@ -110,9 +119,10 @@ Enter the Share Code in **Share Burn** in M5Burner.
 
 | Version | Share Code | Description |
 | --- | --- | --- |
-| **Latest / Production Release** | `tLkdgjcPoEoGbGEt` | **PDX / ADPCM half-speed fix + Tab5 LCD compatibility + MidMod / SAM2695 MIDI support** |
+| **2026.10.25 — Latest source** | **Share Code pending** | **YM2151 R61 quality improvements + FIR optimization, smoke-tested on Tab5** |
+| **2026-10-09 — Previous M5Burner release** | `tLkdgjcPoEoGbGEt` | **PDX / ADPCM half-speed fix + Tab5 LCD + MidMod / SAM2695 MIDI** |
 
-Start with this build.
+Until the new Share Code is available, the previously published M5Burner build remains the one listed above; it does not contain the 2026.10.25 YM2151 changes.
 
 ---
 

@@ -16,6 +16,15 @@
  * Layer8 Aug/17/2026
  */
 #include "vgmm5_ym2151.h"
+/* R61 FIX1 reference: Layer812/vgmM5 R41 native bridge + R47 FIR25. */
+#include "r41_ym2151_native.h"
+#include "r47_ym2151_fir25.h"
+
+/* Preview-only opt-in. Production main does not define or use this path.
+ * This experimental native engine needs a native Tab5 performance/audio test. */
+#ifndef X68KTAB_YM2151_R61_NATIVE_FIR_PREVIEW
+#define X68KTAB_YM2151_R61_NATIVE_FIR_PREVIEW 1
+#endif
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -59,7 +68,11 @@ struct YMOp {
 };
 
 struct VgmM5YM2151 {
-    uint32_t sample_rate;
+    uint32_t sample_rate;       /* FM internal synthesizer rate */
+    uint32_t output_sample_rate; /* guest/audio PCM rate; stays 44100 */
+    uint32_t r41_eg_phase;
+    R41YM2151Native r41_native;
+    R47YM2151Fir25 r47_fir;
     uint32_t clock;
     float phase_step_factor;
     uint32_t output_tick_counter;
@@ -137,19 +150,78 @@ static void init_tables(void)
     s_tables_ready=1;
 }
 
+/* Directly backported from user-supplied vgmM5 R58 fm_engine.c.
+ * R36: DT2 frequency ratios; R39: key-code dependent, signed DT1 phase-step
+ * adjustment. R38 KF upper six bits retained. The audio output rate stays
+ * at 44.1 kHz; this does not enable R41 native-rate/FIR on X68KTab5. */
+static const uint8_t s_ym2151_dt1_mag[32][4] = {
+
+        {0,0,1,2},
+        {0,0,1,2},
+        {0,0,1,2},
+        {0,0,1,2},
+        {0,1,2,2},
+        {0,1,2,3},
+        {0,1,2,3},
+        {0,1,2,3},
+        {0,1,2,4},
+        {0,1,3,4},
+        {0,1,3,4},
+        {0,1,3,5},
+        {0,2,4,5},
+        {0,2,4,6},
+        {0,2,4,6},
+        {0,2,5,7},
+        {0,2,5,8},
+        {0,3,6,8},
+        {0,3,6,9},
+        {0,3,7,10},
+        {0,4,8,11},
+        {0,4,8,12},
+        {0,4,9,13},
+        {0,5,10,14},
+        {0,5,11,16},
+        {0,6,12,17},
+        {0,6,13,19},
+        {0,7,14,20},
+        {0,8,16,22},
+        {0,8,16,22},
+        {0,8,16,22},
+        {0,8,16,22},
+};
+
+/* R59, exact production vgmM5 R61 FIX1 conversion:
+ * reduce out-of-range phase advances in the uint32 modulo ring instead
+ * of relying on undefined float -> unsigned casts at high KC/MUL. */
+static inline uint32_t ym2151_phase_advance_mod32(float advance)
+{
+    if (advance >= 0.0f && advance < 4294967296.0f)
+        return (uint32_t)advance;
+    if (!isfinite(advance)) return 0u;
+    double rem = fmod((double)advance, 4294967296.0);
+    if (rem < 0.0) rem += 4294967296.0;
+    return (uint32_t)rem;
+}
+
 static void update_phase(VgmM5YM2151 *e,int ch)
 {
     static const uint8_t kc_to_n[16]={1,2,3,3,4,5,6,6,7,8,9,9,10,11,12,12};
-    static const float dt1_tab[8]={1.0f,1.002f,1.004f,1.006f,1.0f,0.998f,0.996f,0.994f};
-    static const float dt2_tab[4]={0.0f,384.0f,500.0f,608.0f};
-    int note=e->kc[ch]&15, oct=(e->kc[ch]>>4)&7, kf=e->kf[ch]&63;
-    uint32_t base=e->freq_tab[kc_to_n[note]][kf] << oct;
-    float bf=(float)base;
+    static const float dt2_tab[4]={1.0f,1.4142135624f,1.5700748447f,1.7310731220f};
+    const int kc=e->kc[ch];
+    const int kf=(e->kf[ch]>>2)&63;
+    const int note=kc&15;
+    const int oct=(kc>>4)&7;
+    const uint32_t base=e->freq_tab[kc_to_n[note]][kf] << oct;
+    const float step_f=(float)base;
     for(int o=0;o<4;o++) {
         YMOp *op=&e->ops[ch*4+o];
-        float mul=op->mul? (float)op->mul : 0.5f;
-        float dt2=dt2_tab[op->dt2&3] * e->phase_step_factor * 0.5f;
-        op->phase_step=(uint32_t)(bf*mul*dt1_tab[op->dt1&7]+dt2);
+        const float mul=op->mul ? (float)op->mul : 0.5f;
+        const int dt1=op->dt1;
+        int32_t dt1_delta=s_ym2151_dt1_mag[(kc>>2)&31][dt1&3];
+        if(dt1&4)dt1_delta=-dt1_delta;
+        const float dt1_step=(float)dt1_delta * ((float)e->clock * 64.0f / (float)e->sample_rate);
+        const float dt2_m=dt2_tab[op->dt2&3];
+        op->phase_step=ym2151_phase_advance_mod32((step_f * dt2_m + dt1_step) * mul);
     }
 }
 
@@ -222,7 +294,7 @@ static __attribute__((always_inline,optimize("O3"))) inline int32_t calc_op_modu
 {
     if(p->env_state==EG_OFF)return 0;
     uint32_t step=p->phase_step;
-    mod*=2;
+    /* R33: YM2151 phase modulation is not doubled. */
     if(pm) step+=(uint32_t)((((int32_t)(step>>10))*pm)>>3);
     p->phase+=step;
     int32_t atten=(p->env_level>>EG_FRACTION_BITS)+p->tl_atten;
@@ -249,7 +321,7 @@ static IRAM_ATTR __attribute__((always_inline,optimize("O3"))) inline int32_t ca
     VgmM5YM2151 *e,YMOp *p,int32_t mod,int noise)
 {
     if(p->env_state==EG_OFF)return 0;
-    mod*=2;
+    /* R33: YM2151 phase modulation is not doubled. */
     p->phase+=p->phase_step;
     int32_t atten=(p->env_level>>EG_FRACTION_BITS)+p->tl_atten;
     if(atten>=3840)return 0;
@@ -429,10 +501,26 @@ static IRAM_ATTR __attribute__((noinline,optimize("O3"))) void synth(VgmM5YM2151
     *ml=l;*mr=r;
 }
 
+/* Mirror R61's EG wall-clock accounting while the FM core ticks at
+ * 62.5 kHz: the envelope still advances on the old 44.1 kHz timebase.
+ * Do not apply this accounting to the 11/22/44 kHz legacy paths. */
+static IRAM_ATTR inline void tick_envelope_clock(VgmM5YM2151 *e, uint32_t legacy_mask)
+{
+    if (e->r41_native.enabled) {
+        e->r41_eg_phase += e->output_sample_rate;
+        if (e->r41_eg_phase >= 4u * e->sample_rate) {
+            e->r41_eg_phase -= 4u * e->sample_rate;
+            update_envelopes(e);
+        }
+    } else if ((e->output_tick_counter++ & legacy_mask) == 0u) {
+        update_envelopes(e);
+    }
+}
+
 static IRAM_ATTR __attribute__((always_inline,optimize("O3"))) inline void tick(VgmM5YM2151 *e,int32_t *ol,int32_t *orr)
 {
     const uint32_t r120a_env_mask=(e->sample_rate <= 11025u) ? 0u : ((e->sample_rate <= 22050u) ? 1u : 3u);
-    if((e->output_tick_counter++&r120a_env_mask)==0u)update_envelopes(e);
+    tick_envelope_clock(e,r120a_env_mask);
     if(e->noise_enable) {
         e->noise_phase+=e->noise_step;
         if(!e->noise_step)e->noise_step=0x00400000u;
@@ -455,7 +543,7 @@ static IRAM_ATTR __attribute__((always_inline,optimize("O3"))) inline void tick(
         e->cached_am=0;
     }
     int32_t l=0,r=0;synth(e,&l,&r);
-    l=(l+e->prev_l)/2;r=(r+e->prev_r)/2;e->prev_l=l;e->prev_r=r;
+    /* R37: preserve YM2151 high harmonics; no legacy two-tap smoothing. */
     *ol=l;*orr=r;
 }
 
@@ -467,7 +555,7 @@ static IRAM_ATTR __attribute__((always_inline,optimize("O3"))) inline void tick(
 static IRAM_ATTR __attribute__((always_inline,optimize("O3"))) inline void tick_zero_depth(
     VgmM5YM2151 *e,int32_t *ol,int32_t *orr)
 {
-    if((e->output_tick_counter++&3u)==0u)update_envelopes(e);
+    tick_envelope_clock(e,3u);
     if(e->noise_enable) {
         e->noise_phase+=e->noise_step;
         if(!e->noise_step)e->noise_step=0x00400000u;
@@ -481,10 +569,7 @@ static IRAM_ATTR __attribute__((always_inline,optimize("O3"))) inline void tick_
     e->cached_am=0;
     int32_t l=0,r=0;
     synth_zero_hot(e,&l,&r);
-    l=(l+e->prev_l)/2;
-    r=(r+e->prev_r)/2;
-    e->prev_l=l;
-    e->prev_r=r;
+    /* R37: same unfiltered output as the modulated tick. */
     *ol=l;
     *orr=r;
 }
@@ -492,9 +577,19 @@ static IRAM_ATTR __attribute__((always_inline,optimize("O3"))) inline void tick_
 static void init_state(VgmM5YM2151 *e,uint32_t clock,uint32_t sr,int32_t volume)
 {
     memset(e,0,sizeof(*e));
-    e->clock=clock;e->sample_rate=sr;e->volume_q14=volume;e->noise_rng=1;
-    e->phase_step_factor=4294967296.0f/(float)sr;
-    e->lfo_step=(uint32_t)((5.0*4294967296.0)/(double)sr);
+    e->clock=clock;e->output_sample_rate=sr;e->volume_q14=volume;e->noise_rng=1;
+#if X68KTAB_YM2151_R61_NATIVE_FIR_PREVIEW
+    const uint32_t native_clock=r47_ym2151_select_native_clock(clock,sr,1);
+#else
+    const uint32_t native_clock=0u;
+#endif
+    r41_native_init(&e->r41_native,native_clock,sr);
+    e->sample_rate=e->r41_native.enabled?e->r41_native.native_hz:sr;
+    r47_ym2151_fir_reset(&e->r47_fir);
+    if(e->r41_native.enabled)
+        e->r41_eg_phase=4u*e->sample_rate-e->output_sample_rate;
+    e->phase_step_factor=4294967296.0f/(float)e->sample_rate;
+    e->lfo_step=(uint32_t)((5.0*4294967296.0)/(double)e->sample_rate);
     for(int ch=0;ch<8;ch++){e->pan_l[ch]=1;e->pan_r[ch]=1;}
     for(int n=0;n<=12;n++)for(int k=0;k<64;k++){
         float semi=(float)n+(float)k/64.0f;
@@ -526,18 +621,32 @@ extern "C" void vgmm5_ym2151_set_sample_rate(VgmM5YM2151 *e,uint32_t sr)
 {
     if(!e)return;
     sr=(sr <= 11025u) ? 11025u : ((sr <= 22050u) ? 22050u : 44100u);
+    R41YM2151Native next_native;
+#if X68KTAB_YM2151_R61_NATIVE_FIR_PREVIEW
+    const uint32_t native_clock=r47_ym2151_select_native_clock(e->clock,sr,1);
+#else
+    const uint32_t native_clock=0u;
+#endif
+    r41_native_init(&next_native,native_clock,sr);
+    const uint32_t new_core_sr=next_native.enabled?next_native.native_hz:sr;
     const uint32_t old=e->sample_rate?e->sample_rate:44100u;
-    if(old==sr)return;
-#define R120A_SCALE_U32(x) ((uint32_t)((((uint64_t)(x))*old + (sr/2u))/sr))
-    e->phase_step_factor *= (float)old/(float)sr;
+    if(old==new_core_sr && e->output_sample_rate==sr)return;
+#define R120A_SCALE_U32(x) ((uint32_t)((((uint64_t)(x))*old + (new_core_sr/2u))/new_core_sr))
+    e->phase_step_factor *= (float)old/(float)new_core_sr;
     for(int n=0;n<=12;n++)for(int k=0;k<64;k++)e->freq_tab[n][k]=R120A_SCALE_U32(e->freq_tab[n][k]);
-    for(int i=0;i<YM_OPS;i++)e->ops[i].phase_step=R120A_SCALE_U32(e->ops[i].phase_step);
     e->lfo_step=R120A_SCALE_U32(e->lfo_step);
     e->noise_step=R120A_SCALE_U32(e->noise_step);
-    e->sample_rate=sr;
+    e->output_sample_rate=sr;
+    e->sample_rate=new_core_sr;
+    e->r41_native=next_native;
+    r47_ym2151_fir_reset(&e->r47_fir);
+    e->r41_eg_phase=e->r41_native.enabled?(4u*new_core_sr-sr):0u;
+    /* Recompute from registers: DT1/DT2 cannot be approximated by scaling
+       a modulo-wrapped operator phase step. */
+    for(int ch=0;ch<YM_CH;ch++)update_phase(e,ch);
 #undef R120A_SCALE_U32
 }
-extern "C" void vgmm5_ym2151_reset(VgmM5YM2151 *e){if(!e)return;uint32_t c=e->clock,s=e->sample_rate;int32_t v=e->volume_q14;init_state(e,c,s,v);}
+extern "C" void vgmm5_ym2151_reset(VgmM5YM2151 *e){if(!e)return;uint32_t c=e->clock,s=e->output_sample_rate;int32_t v=e->volume_q14;init_state(e,c,s,v);}
 extern "C" void vgmm5_ym2151_set_px_volume(VgmM5YM2151 *e,uint8_t vol){if(!e)return;int v=vol?((16-(int)vol)*4):192;if(v>=192)e->volume_q14=0;else e->volume_q14=(int32_t)(16384.0f*powf(10.0f,-(float)v/40.0f));}
 
 extern "C" void vgmm5_ym2151_write(VgmM5YM2151 *e,uint8_t a,uint8_t d)
@@ -574,10 +683,39 @@ extern "C" void vgmm5_ym2151_csm_pulse(VgmM5YM2151 *e)
     }
 }
 
+/* Native-only callback. Filter FM before resampling, never ADPCM or the
+ * guest-visible YM2151 event/IRQ timeline. On R61 FIX1 this exact 25-tap
+ * filter runs once per native core tick, not per 44.1-kHz output frame. */
+static IRAM_ATTR void r61_ym2151_fir_native_callback(void *ctx,int32_t *l,int32_t *r)
+{
+    VgmM5YM2151 *e=(VgmM5YM2151*)ctx;
+    int32_t fm_l=0,fm_r=0,filtered_l=0,filtered_r=0;
+    if((e->pmd|e->amd)==0u)tick_zero_depth(e,&fm_l,&fm_r);
+    else tick(e,&fm_l,&fm_r);
+    r47_ym2151_fir_tick(&e->r47_fir,fm_l,fm_r,&filtered_l,&filtered_r);
+    *l+=filtered_l;
+    *r+=filtered_r;
+}
+
 extern "C" IRAM_ATTR __attribute__((noinline,optimize("O3"))) void vgmm5_ym2151_render(VgmM5YM2151 *e,int16_t *dst,uint32_t frames)
 {
     if(!e||!dst)return;
     int32_t vol=e->volume_q14;
+    if(e->r41_native.enabled) {
+        /* R61 native 62.5kHz FM+FIR, Q32 interpolation into unmodified
+           44.1kHz X68KTab5 output; guest register writes remain frame-timed. */
+        for(uint32_t i=0;i<frames;i++) {
+            int32_t l=0,r=0;
+            r41_native_tick(&e->r41_native,r61_ym2151_fir_native_callback,e,&l,&r);
+            if(l>65535)l=65535;else if(l<-65536)l=-65536;
+            if(r>65535)r=65535;else if(r<-65536)r=-65536;
+            l=(l*vol)>>14;r=(r*vol)>>14;
+            if(l>32767)l=32767;else if(l<-32768)l=-32768;
+            if(r>32767)r=32767;else if(r<-32768)r=-32768;
+            dst[i*2]=(int16_t)l;dst[i*2+1]=(int16_t)r;
+        }
+        return;
+    }
     if(__builtin_expect((e->pmd|e->amd)==0u,1)){
         for(uint32_t i=0;i<frames;i++){
             int32_t l,r;tick_zero_depth(e,&l,&r);
