@@ -1,0 +1,92 @@
+name: X68KTab5 M5Unified 0.2.28 M5GFX 0.2.35 Tab5 migration (NO FLASH)
+
+on:
+  push:
+    branches:
+      - work/m5unified-028-m5gfx-035-tab5-safe-20261025
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tab5-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 85
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Lock official dependencies and preserved firmware semantics
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C components/M5GFX rev-parse HEAD)" = "65c816a38386062d2c3dc47d41237a9083acbc75"
+          test "$(git -C components/M5Unified rev-parse HEAD)" = "368ad60807161625aa65baad37a4a3af2a7eccea"
+          test "$(git show 01615055e19eb950d62df5ac847952b290ca7b86:components/px68k/fmgen/vgmm5_ym2151.cpp | git hash-object --stdin)" = "$(git hash-object components/px68k/fmgen/vgmm5_ym2151.cpp)"
+          test "$(git show 01615055e19eb950d62df5ac847952b290ca7b86:src/tab5_audio.cpp | git hash-object --stdin)" = "$(git hash-object src/tab5_audio.cpp)"
+          test "$(git show 01615055e19eb950d62df5ac847952b290ca7b86:src/tab5_video.cpp | git hash-object --stdin)" = "$(git hash-object src/tab5_video.cpp)"
+          test "$(git show 01615055e19eb950d62df5ac847952b290ca7b86:partitions.csv | git hash-object --stdin)" = "$(git hash-object partitions.csv)"
+          python3 -m py_compile patch_m5gfx_x68ktab.py
+
+      - name: Validate official Tab5 probe and retained ST7121/ST7123/ILI9881C/DoubleFB overlay
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 patch_m5gfx_x68ktab.py
+          python3 patch_m5gfx_x68ktab.py
+          grep -q 'X68KTAB_PANEL_COMPAT_R3' components/M5GFX/src/M5GFX.cpp
+          grep -q 'X68KTAB_PANEL_COMPAT_R3' components/M5GFX/src/lgfx/v1/platforms/esp32p4/Panel_DSI.inl
+          grep -q 'num_fbs = 2;' components/M5GFX/src/lgfx/v1/platforms/esp32p4/Panel_DSI.inl
+          test -f components/M5GFX/src/lgfx/v1/platforms/esp32p4/Panel_DSI.inl
+
+      - name: Existing bit-identical R61 FIR host regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          g++ -std=c++17 -O2 tests/ym2151_r61_fir_parity_host.cpp -o /tmp/x68ktab_fir_parity
+          /tmp/x68ktab_fir_parity
+
+      - name: Current stable YM2151 KON and phase-edge host regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          g++ -std=c++17 -O2 -Wno-attributes tests/ym2151_kon_phase_host.cpp -o /tmp/x68ktab_kon_phase -lm
+          /tmp/x68ktab_kon_phase
+
+      - name: Native ESP-IDF 5.5.4 ESP32-P4 build (NO FLASH)
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.5.4
+          target: esp32p4
+          path: '.'
+          command: idf.py build
+
+      - name: Validate application image (NO FLASH)
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s build/px68k_tab5.bin
+          test -s build/px68k_tab5.elf
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib, json
+          p=Path("build/px68k_tab5.bin")
+          b=p.read_bytes()
+          assert b[:1]==b"\xe9" and 100000 < len(b) < 0x800000
+          print(json.dumps({"app":str(p),"size":len(b),"sha256":hashlib.sha256(b).hexdigest(),"flash":False},indent=2))
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: x68ktab-M5Unified-028-M5GFX-035-no-flash
+          if-no-files-found: error
+          path: |
+            build/px68k_tab5.bin
+            build/px68k_tab5.elf
+            build/partition_table/partition-table.bin
+          retention-days: 7
