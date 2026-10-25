@@ -1,5 +1,9 @@
 # Tab5向け YM2151 更新版（vgmM5 R58参照） / YM2151 R58-based Preview for Tab5
 
+> [!NOTE]
+> **この文書はR58段階の歴史的プレビュー記録です。** 2026.10.25版ではR61 FIX1の高音域修正・ネイティブFIRとFIR高速化まで進み、実機で音質安定・複数ソフト起動の初期確認が行われました。現在の状態は[2026.10.25リリースノート](RELEASE_NOTES_2026-10-25.md)を参照してください。以下の「未実施」はR58当時の状況です。
+
+
 **公開区分 / Status:** ソースコード・プレビュー（開発版） / Source preview (development version)  
 **対象 / Target:** M5Stack Tab5 / ESP32-P4, X68K Tab  
 **公開日 / Published:** 2026-10-25  
