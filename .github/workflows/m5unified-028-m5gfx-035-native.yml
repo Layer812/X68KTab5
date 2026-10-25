@@ -30,7 +30,8 @@ jobs:
           test "$(git show 01615055e19eb950d62df5ac847952b290ca7b86:src/tab5_audio.cpp | git hash-object --stdin)" = "$(git hash-object src/tab5_audio.cpp)"
           test "$(git show 01615055e19eb950d62df5ac847952b290ca7b86:src/tab5_video.cpp | git hash-object --stdin)" = "$(git hash-object src/tab5_video.cpp)"
           test "$(git show 01615055e19eb950d62df5ac847952b290ca7b86:partitions.csv | git hash-object --stdin)" = "$(git hash-object partitions.csv)"
-          python3 -m py_compile patch_m5gfx_x68ktab.py
+          python3 -m py_compile patch_m5gfx_x68ktab.py patch_m5unified_x68ktab_es8388.py
+          grep -q 'patch_m5unified_x68ktab_es8388.py' CMakeLists.txt
 
       - name: Validate official Tab5 probe and retained ST7121/ST7123/ILI9881C/DoubleFB overlay
         shell: bash
@@ -42,6 +43,31 @@ jobs:
           grep -q 'X68KTAB_PANEL_COMPAT_R3' components/M5GFX/src/lgfx/v1/platforms/esp32p4/Panel_DSI.inl
           grep -q 'num_fbs = 2;' components/M5GFX/src/lgfx/v1/platforms/esp32p4/Panel_DSI.inl
           test -f components/M5GFX/src/lgfx/v1/platforms/esp32p4/Panel_DSI.inl
+
+      - name: Verify exact ES8388 MCLK/LRCK 256fs correction and idempotence
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 patch_m5unified_x68ktab_es8388.py
+          python3 patch_m5unified_x68ktab_es8388.py
+          python3 - <<'PY'
+          from pathlib import Path
+          import subprocess
+          root=Path("components/M5Unified")
+          before=subprocess.check_output(
+              ["git","-C",str(root),"show","HEAD:src/M5Unified.inl"]
+          )
+          after=(root/"src/M5Unified.inl").read_bytes()
+          old=b"      2,   24, 0x00, //I2S MCLK ratio (128)"
+          new=b"      2,   24, 0x02, //X68KTAB_ES8388_MCLK256_R1: P4 I2S driver MCLK=256fs"
+          assert before.count(old)==after.count(new)==1
+          assert before.replace(old,new)==after, "Only the Tab5 DACCONTROL2 setting may differ"
+          assert old not in after
+          spk=(root/"src/utility/Speaker_Class.inl").read_bytes()
+          assert b"i2s_mclk_multiple_t::I2S_MCLK_MULTIPLE_256" in spk
+          assert b"i2s_config.clk_cfg.sample_rate_hz = _cfg.sample_rate;" in spk
+          print("PASS one-line Tab5 ES8388 DACCONTROL2 128fs -> 256fs, no other M5Unified changes")
+          PY
 
       - name: Existing bit-identical R61 FIR host regression
         shell: bash
