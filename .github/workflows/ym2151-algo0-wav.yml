@@ -1,0 +1,65 @@
+name: YM2151 algorithm 0 three-way host WAV comparison (no flash)
+on:
+  push:
+    branches:
+      - work/ym2151-alg0-3way-wav-20261025
+    paths:
+      - tests/ym2151_algo0_render_host.cpp
+      - tests/ym2151_algo0_generate.py
+      - .github/workflows/ym2151-algo0-wav.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  reference:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Compile authentic R61 vs R5 YM2151 host engines
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build/ym2151_algo0_audio
+          for version in 0 1; do
+            g++ -std=c++17 -O2 -Wno-attributes -DX68KTAB_YM2151_R5_ALGO0_PREVIEW=$version tests/ym2151_algo0_render_host.cpp -o /tmp/x68ktab_ym2151_wav_$version -lm
+          done
+
+      - name: Generate original YM2151 register events and 4 comparison WAVs
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd build/ym2151_algo0_audio
+          python3 ../../tests/ym2151_algo0_generate.py .
+          for feedback in 0 5; do
+            vgm=YM2151_alg0_fb${feedback}_original_demo.vgm
+            /tmp/x68ktab_ym2151_wav_0 "$vgm" "YM2151_alg0_fb${feedback}_X68K_R61.wav"
+            /tmp/x68ktab_ym2151_wav_1 "$vgm" "YM2151_alg0_fb${feedback}_X68K_R5.wav"
+          done
+          python3 - <<'PY'
+          import hashlib,wave,os
+          from pathlib import Path
+          for feedback in (0,5):
+              old=Path(f'YM2151_alg0_fb{feedback}_X68K_R61.wav')
+              new=Path(f'YM2151_alg0_fb{feedback}_X68K_R5.wav')
+              assert old.read_bytes()!=new.read_bytes(), 'Algorithm 0 must change output'
+              for file in (old,new):
+                  with wave.open(str(file),'rb') as w:
+                      assert w.getnchannels()==2 and w.getsampwidth()==2 and w.getframerate()==44100
+                      assert 200000 <= w.getnframes() <= 220000
+                  print(file,'bytes=',file.stat().st_size,'sha256=',hashlib.sha256(file.read_bytes()).hexdigest())
+          PY
+          sha256sum *.vgm *.wav > SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: x68ktab-ym2151-alg0-R61-R5-wav
+          path: build/ym2151_algo0_audio/
+          if-no-files-found: error
+          retention-days: 7
