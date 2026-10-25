@@ -1,7 +1,7 @@
 # X68K Tab
 
 > [!NOTE]
-> **最新ソース: 2026.10.25 — vgmM5 R61 FIX1のYM2151更新＋FIR高速化版。** Tab5実機で音質安定・複数ソフト起動が確認されました。長時間・全機能の互換性や定量的速度改善は未保証です。詳しくは[更新履歴と検証結果](RELEASE_NOTES_2026-10-25.md)を参照してください。**M5Burner Share Codeは `2cODB4oLECo97g0u`** です。旧Share Codeは従来版です。
+> **最新ソース: 2026.10.25 — vgmM5 R61 FIX1のYM2151更新＋FIR高速化版。** 詳しくは[更新履歴と検証結果](RELEASE_NOTES_2026-10-25.md)を参照してください。**M5Burner Share Codeは `2cODB4oLECo97g0u`** です。
 
 [**English README → README_en.md**](README_en.md)
 
@@ -24,47 +24,22 @@ PX68K / Musashi をベースに、ESP32-P4 の 2つの HP CPU、LP Core、PSRAM�
 
 PANIC を再生するために必要な X68000 環境を少しずつ実装していったら...いつの間にか X68000 エミュレータになりました。
 
-MIDIについては [**MidMod**](https://github.com/Layer812/MidMod) を組み込み、X68000 の MIDI 出力を [**M5Stack Unit Synth (SAM2695)**](https://www.switch-science.com/products/9510) で鳴らせるようにしました。
-
-GS 系の MIDI データについても、MidMod の GS → SAM2695 マッピングを利用して、自然に再生できるよう変換しています。
-
-> [!IMPORTANT]
-> すべての X68000 ソフトウェアの完全互換を保証するものではありません。  
-> 表示、音声、入力、USB機器、ディスク、MIDIなどで問題を見つけたら、再現方法を添えて Issue で教えてください。
-
 ---
 
 ## Current Production
-
-現在の Production 版では、**68000 guest CPU を 12 MHz、X68000 peripheral time domain を exact 10 MHz** としています。
-
-最新ソース **2026.10.25** では、従来の **PDX / ADPCM 再生修正、Tab5 LCD互換対応、MIDI / MidMod / SAM2695 対応**を維持したまま、**YM2151のR61高精度FM合成とFIR処理の高速化**を追加しました。
 
 ### 2026-10-25 — YM2151音質・FIR高速化（Tab5実機で初期確認済み）
 
 [vgmM5](https://github.com/Layer812/vgmM5) のR61 FIX1を基準に、位相変調・KF・DT1/DT2、高音域の数値変換を改善しました。YM2151の内部62.5kHz合成＋25タップFIRを追加し、FIRのリング処理をPCM一致のまま高速化しています。最終出力は44.1kHzを維持します。
 
-**ESP-IDF 5.5.4 / ESP32-P4ネイティブビルドPASS、実機で音質安定・複数ソフト起動を確認。** 速度は良好との初期評価で、定量的な負荷・性能比較と長時間回帰は未実施です。詳細は [リリースノート](RELEASE_NOTES_2026-10-25.md) を参照してください。
-
 ### 2026-10-09 — PDX / ADPCM 半速再生修正
 
 MDX から PDX / ADPCM を再生した際、特定の再生経路で PCM が本来の約半分の速度になる問題を修正しました。
 
-原因は ESP32-P4 向け FastOPM の guest-visible control plane で、YM2151 の **WRITE BUSY (status bit 7)** が省略されていたことでした。X68000 側のソフトウェアは YM2151 の BUSY を待つ前提で動作しており、BUSY が常に解除状態に見えることで、本来 BUSY 中に無効となるデータ書き込みが有効になり、YM2151 レジスタ $1B の CT1 が変化して ADPCM クロックが 8 MHz → 4 MHz へ切り替わる場合がありました。
-
 ### 2026-10-05 — Tab5 LCD panel compatibility update
-
-M5Stack Tab5 には、出荷時期やハードウェアリビジョンによって **ILI9881C / ST7121 / ST7123** の異なる LCD 構成が存在することが分かっています。
-
-2026-10-04 に行った pixel clock 60 MHz のみの互換性試行では、報告のあった個体の表示問題は解決しませんでした。その後、パネル判定、MIPI-DSI lane rate、pixel clock、porch、frame ACK/BTA、clock-lane 動作、初期化シーケンスを切り分け、パネルごとに互換設定を適用する方式へ更新しました。
 
 **ST7121 搭載 Tab5 については、表示できなかった実機で X68K Tab が正常に動作することを確認できました。** ST7123 は既知良好個体の安定動作を維持する設定を使用し、ILI9881C 向けの互換設定も含めています。
 
-この対応は物理 LCD / MIPI-DSI の初期化・scanout 条件を対象としており、X68000 guest timing、CPU1、DoubleFB / PPA / presenter、MIDI、audio の基本方針は変更していません。
-
-> [!NOTE]
-> Tab5 の全製造ロットでの動作を保証するものではありません。表示に問題がある場合は、使用している Tab5 の情報と症状を Issue で教えてください。
->
 > **Special thanks to Nochiさん！** ST7121 搭載 Tab5 での実機検証と互換表示対応の確認にご協力いただき、ありがとうございました。
 
 | 項目 | Production 構成 |
@@ -88,29 +63,9 @@ M5Stack Tab5 には、出荷時期やハードウェアリビジョンによっ�
 
 今回の更新で、X68000 の MIDI 出力に対応しました。
 
-使用している MIDI 処理ライブラリは、
+使用している MIDI 処理ライブラリは、[**MidMod — Modifiable MIDI Module**](https://github.com/Layer812/MidMod) です。
 
-- [**MidMod — Modifiable MIDI Module**](https://github.com/Layer812/MidMod)
-
-です。
-
-音源は、
-
-- [**M5Stack Unit Synth (SAM2695)**](https://www.switch-science.com/products/9510)
-
-を使用します。
-
-### GS mapping
-
-SAM2695 は Roland SC-55 / SC-88 そのものではないため、GSデータを完全に同じ音色で再生することはできません。
-
-そこで MidMod の GS → SAM2695 マッピングを使い、
-
-> **「そのGSデータがSAM2695だったら、どの音で鳴らすのが自然か」**
-
-という方向でマッピングしています。
-
-マッピングは今後も MidMod 側で改善していく予定です。
+音源は、[**M5Stack Unit Synth (SAM2695)**](https://www.switch-science.com/products/9510) を使用します。
 
 X68K Tab 側では `/sdcard/midimap.csv` を置くことで、マッピングプロファイルを差し替えることもできます。
 
@@ -136,15 +91,13 @@ M5Burner の **Share Burn** で Share Code を入力してください。
 
 - [M5Stack Tab5](https://docs.m5stack.com/en/core/Tab5)
 - microSD カード
-- 正当に利用できる X68000 ソフトウェア / ディスクイメージ
+- 利用できる X68000 ソフトウェア / ディスクイメージ
   - FDD: `XDF`, `DIM`
   - HDD: `HDS`
 
 ### MIDIを使う場合
 
 - [M5Stack Unit Synth (SAM2695)](https://www.switch-science.com/products/9510)
-
-X68K Tab の PORT.A から MIDI 31,250 bps で接続します。
 
 ### 入力機器
 
@@ -153,32 +106,6 @@ X68K Tab の PORT.A から MIDI 31,250 bps で接続します。
 - USB Joypad / Gamepad
 - USB マウス
 - 画面上のタッチ UI / バーチャルキーボード / Joypad
-
----
-
-## PANIC Player
-
-X68K Tab は [PanicPlayerTab5](https://github.com/Layer812/PanicPlayerTab5) から始まったプロジェクトです。
-
-ただ、肝心の PANIC データがなかなか集まらなかったので（笑）、**Production版では PANIC Player の統合機能を一旦外しました。**
-
-PanicPlayerTab5 自体は別プロジェクトとして残しています。
-
----
-
-## Display / MULTISCAN
-
-X68K Tab は guest 側の CRTC 状態から **15 kHz / 24 kHz / 31 kHz 系モードを自動判定**し、Tab5 の 1280×720 LCD へ変換して表示します。
-
-X68000 の走査周波数そのものを外部へ出力するものではありません。Tab5 の LCD は固定出力で、guest video mode を内部で変換します。
-
----
-
-## Audio
-
-YM2151 + ADPCM を ESP32-P4 上で再生します。
-
-host-side の一時的な表示負荷などで guest timeline を不必要に止めないことを優先しています。
 
 ---
 
@@ -215,38 +142,6 @@ Human68k 関連ファイルについても、適用される条件に従って�
 - `LICENSE_PANIC_X.txt`
 - `PANIC_V1.38_NOTICE.txt`
 - `THIRD_PARTY_NOTICES.md`
-
----
-
-## Source Build
-
-現在の Production 基準:
-
-- ESP-IDF 5.5.x
-- ESP32-P4 360 MHz
-- PSRAM 32 MiB / 200 MHz
-- Flash QIO / 80 MHz
-- M5Unified / M5GFX
-- Musashi
-- PX68K
-- [MidMod](https://github.com/Layer812/MidMod)
-
-M5GFX / M5Unified は submodule です。新規取得時は submodule も初期化してください。
-
-```bash
-git clone --recurse-submodules https://github.com/Layer812/X68KTab5.git
-cd X68KTab5
-idf.py build
-```
-
-既存 checkout では、先に `git submodule update --init --recursive` を実行してください。
-
-CMake configure 時に `patch_m5gfx_x68ktab.py` が pinned M5GFX
-`729297d6e3d657ddc1ec5189bac2f2ea68828085` に対して、ST7121 / ST7123 /
-ILI9881C のパネル別互換設定と X68K Tab の DoubleFB 拡張を exact-guard 付きで適用します。
-そのため build 後に `components/M5GFX` がローカル変更ありと表示されるのは正常です。
-
-ローカルに必要な ROM / OS / disk image 等はリポジトリへ追加しないでください。
 
 ---
 
