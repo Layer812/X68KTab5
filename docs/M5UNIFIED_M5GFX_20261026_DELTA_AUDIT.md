@@ -42,9 +42,19 @@
 
 ### 安定版の判断・現在の方針
 1. **MDXモタツキが再現しているためPR #10はDraft／Productionには統合しない。** 今回のソースレビューだけで直ったとは扱わない。
-2. 音声`isPlaying`の誤った推定修正は戻し、`src/tab5_audio.cpp`を基準Productionとバイト同一に復元済み。現在の開発ブランチはライブラリ、LCD overlay、CI、監査文書だけを変える。
+2. 音声`isPlaying`の誤った二重カウント修正は撤回済み。**その後の別件**として、新版Speakerのバッファ解放通知で音声フィーダを即時起床させる3か所の限定変更を追加。10ms tickによる待機を最大1tickフォールバックに変更したが、実機の改善効果は未確認。
 3. M5UnifiedのP4 I2SクロックとES8388正常終了処理は根拠があるので不用意に戻さず、音声出力の実テンポ／CPU0 deadlineなどの客観証拠を優先する。
 4. ディスク読み込み高速化は有望だが、ライブラリ差分だけから原因や速度改善率を推測しない。
 5. 次の実機依頼は、通常版としての具体的な修正を絞りネイティブビルドまで通した後にまとめる。計測専用ビルド、小刻みな再検証、フルフラッシュ、バックアップ作成は行わない。
 
 CI／移行対象: https://github.com/Layer812/X68KTab5/pull/10
+
+### 2026-10-26：ES8388 256fs の実機フィードバックとSpeakerスロット解放通知
+
+- 利用者がTab5実機で **ES8388 DACCONTROL2 reg 0x18: 0x00→0x02** 適用版のMDX再生を確認。「かなり改善したが、まだ詰まる」と報告。クロック比不整合は実装上確認できており、改善と時間的に対応する。ただし原因の単独確定には相当しない。
+- 旧ライブラリから継承した音声フィーダの満杯キュー処理は `vTaskDelay(1)` に固定。現行 `CONFIG_FREERTOS_HZ=100` なので最大約10ms待機する。44.1kHz の512フレームは11.61ms、2 slot 全体は23.22ms。これは必ずアンダーランするという意味ではなく、CPU0起床と残量予測の余裕が小さいことを示す。
+- 新M5Unified 0.2.28は `Speaker.setBufferReleaseCallback()` を正式公開し、Speaker taskが処理済みPCMの参照を手放したときに callback を発行する。
+- 開発用 Draft に限定して、`src/tab5_audio.cpp` 3か所を追加修正：①解放callbackが既存の音声タスクに `xTaskNotifyGive`、②`Speaker.begin()`の後／最初の`playRaw`より前にcallbackを登録、③キュー満杯時の`vTaskDelay(1)`を`ulTaskNotifyTake(pdTRUE, 1)`に変更して即時通知で早く復帰、通知欠落時は従来の1tick上限を残す。
+- **CPU1ゲスト、FM/ADPCM演算、44.1kHz、512フレーム、3 play buffers、Speaker I2S/DMA、音量、音声タスクprio4、DSI timing は変更しない。** 上流新機能を用いるだけで、callback内で`playRaw`しない。
+- 以前誤って導入した `speaker_queue + isPlaying()` の二重加算は**復活させない**。
+- この追加修正に対するホスト正確差分ガード＋ネイティブESP32-P4ビルドの結果と、修正版実機確認の両方が揃うまではProduction版とはしない。
