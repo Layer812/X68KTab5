@@ -62,6 +62,7 @@ struct YMOp {
     int32_t env_level;
     int32_t ar_step, dr_step, d2r_step, sl_level, rr_step;
     uint8_t env_state;
+    uint8_t key_on; /* Yamaha KON latch: never infer held-key state from EG state. */
     uint8_t mul, dt1, dt2;
     uint8_t am_enable;
     uint8_t ar, dr, d2r, rr, ks;
@@ -653,7 +654,35 @@ extern "C" void vgmm5_ym2151_write(VgmM5YM2151 *e,uint8_t a,uint8_t d)
 {
     if(!e)return;
     if(a==0x01){if(d&2)e->lfo_phase=0;return;}
-    if(a==0x08){int ch=d&7;for(int o=0;o<4;o++){YMOp *p=&e->ops[ch*4+o];if((d>>(3+o))&1){if(p->env_state==EG_OFF)p->env_level=EG_MAX;p->phase=0;p->env_state=EG_ATTACK;}else if(p->env_state!=EG_OFF)p->env_state=EG_RELEASE;}const YMOp *q=&e->ops[ch*4];if(q[0].env_state!=EG_OFF||q[1].env_state!=EG_OFF||q[2].env_state!=EG_OFF||q[3].env_state!=EG_OFF)e->active_ch_mask|=(uint8_t)(1u<<ch);else e->active_ch_mask&=(uint8_t)~(1u<<ch);return;}
+    if(a==0x08){
+        const int ch=d&7;
+        /* vgmM5 Tab5 stable d20fa032 / Yamaha YM2151:
+         * Physical parameter order is M1(0), M2(1), C1(2), C2(3);
+         * hardware KON register D3=M1, D4=C1, D5=M2, D6=C2.
+         * Reset only the operator's phase on a real OFF->ON key transition.
+         * Repeated held KON writes must not restart EG or phase.
+         * Keep the original C1->MEM(1 sample)->M2 algorithm-0 path. */
+        static const uint8_t kon_bit[4]={3,5,4,6};
+        for(int op=0;op<4;op++){
+            YMOp *p=&e->ops[ch*4+op];
+            const uint8_t now_on=(uint8_t)((d>>kon_bit[op])&1u);
+            if(now_on && !p->key_on){
+                if(p->env_state==EG_OFF)p->env_level=EG_MAX;
+                p->phase=0u;
+                p->env_state=EG_ATTACK;
+            }else if(!now_on && p->key_on && p->env_state!=EG_OFF){
+                p->env_state=EG_RELEASE;
+            }
+            p->key_on=now_on;
+        }
+        const YMOp *q=&e->ops[ch*4];
+        if(q[0].env_state!=EG_OFF||q[1].env_state!=EG_OFF||
+           q[2].env_state!=EG_OFF||q[3].env_state!=EG_OFF)
+            e->active_ch_mask|=(uint8_t)(1u<<ch);
+        else
+            e->active_ch_mask&=(uint8_t)~(1u<<ch);
+        return;
+    }
     if(a==0x0f){e->noise_enable=(d>>7)&1;uint8_t nr=d&31;if(nr==31)nr=30;float f=(float)e->clock/(32.0f*(32.0f-(float)nr));float st=f*e->phase_step_factor;if(st>=4294967295.0f)st=4294967295.0f;e->noise_step=(uint32_t)st;return;}
     if(a==0x18){float f=(float)(d+1)*0.15f;e->lfo_step=(uint32_t)(f*e->phase_step_factor);return;}
     if(a==0x19){if(d&0x80)e->amd=d&0x7f;else e->pmd=d&0x7f;return;}
