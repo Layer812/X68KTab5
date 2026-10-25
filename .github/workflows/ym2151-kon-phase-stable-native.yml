@@ -1,0 +1,114 @@
+name: X68KTab5 stable vgmM5 YM2151 KON/phase backport (NO FLASH)
+
+on:
+  push:
+    branches:
+      - work/ym2151-stable-kon-phase-20261025
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  stable-kon-phase:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Guard source exactly to vgmM5 stable KON + phase edge backport
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import subprocess
+          base="f58bc0b4d8360fd83845e5a9a9f378b775de4f3f"
+          path="components/px68k/fmgen/vgmm5_ym2151.cpp"
+          old=subprocess.check_output(["git","show",f"{base}:{path}"],text=True)
+          now=Path(path).read_text()
+          old_field="    uint8_t env_state;\n    uint8_t mul, dt1, dt2;"
+          new_field="    uint8_t env_state;\n    uint8_t key_on; /* Yamaha KON latch: never infer held-key state from EG state. */\n    uint8_t mul, dt1, dt2;"
+          assert old.count(old_field)==1 and now.count(new_field)==1
+          old_begin=old.index("    if(a==0x08){int ch=d&7;")
+          new_begin=now.index("    if(a==0x08){")
+          old_end=old.index("    if(a==0x0f){",old_begin)
+          new_end=now.index("    if(a==0x0f){",new_begin)
+          assert now[:new_begin].replace(new_field,old_field)==old[:old_begin],"unexpected non-KON change before handler"
+          assert now[new_end:]==old[old_end:],"unexpected non-KON change after handler"
+          block=now[new_begin:new_end]
+          for term in ("kon_bit[4]={3,5,4,6}", "now_on && !p->key_on", "p->phase=0u;", "p->key_on=now_on"):
+              assert term in block,term
+          assert "d20fa032" in block
+          assert old.count("e->mem_value[ch]=o2; out=o3; break;")==now.count("e->mem_value[ch]=o2; out=o3; break;")>=2
+          changed=subprocess.check_output(["git","diff","--name-only",base,"HEAD"],text=True).splitlines()
+          assert sorted(changed)==sorted([
+              ".github/workflows/ym2151-kon-phase-stable-native.yml",
+              "components/px68k/fmgen/vgmm5_ym2151.cpp",
+              "tests/ym2151_kon_phase_host.cpp"]),changed
+          print("PASS exact two YM2151 semantic changes; all other source/DoubleFB/audio/guest timing untouched")
+          PY
+          test "$(git -C components/M5GFX rev-parse HEAD)" = "729297d6e3d657ddc1ec5189bac2f2ea68828085"
+          test "$(git -C components/M5Unified rev-parse HEAD)" = "4fb444784c85791e0b0207701392b42be234b2e7"
+          grep -q 'CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=360' sdkconfig
+          grep -q 'CONFIG_SPIRAM=y' sdkconfig
+
+      - name: Host regression mapping (56), edges (48), and repeated CSM
+        shell: bash
+        run: |
+          set -euo pipefail
+          g++ -std=c++17 -O2 -Wno-attributes tests/ym2151_kon_phase_host.cpp -o /tmp/x68ktab_kon_phase -lm
+          /tmp/x68ktab_kon_phase
+          g++ -std=c++17 -O1 -g -Wno-attributes -fsanitize=undefined tests/ym2151_kon_phase_host.cpp -o /tmp/x68ktab_kon_phase_ubsan -lm
+          UBSAN_OPTIONS=halt_on_error=1 /tmp/x68ktab_kon_phase_ubsan
+
+      - name: Existing R61 native PCM segmentation/rate/reset regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          g++ -std=c++17 -O2 -Wno-attributes tests/ym2151_r61_native_host.cpp -o /tmp/x68ktab_r61_qa -lm
+          /tmp/x68ktab_r61_qa
+
+      - name: Existing 350k FIR25 bitwise parity regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          g++ -std=c++17 -O2 tests/ym2151_r61_fir_parity_host.cpp -o /tmp/x68ktab_fir_parity
+          /tmp/x68ktab_fir_parity
+
+      - name: Native ESP-IDF 5.5.4 ESP32-P4 firmware build (NO FLASH)
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.5.4
+          target: esp32p4
+          path: '.'
+          command: idf.py build
+
+      - name: Verify generated app/ELF and report hash; NO FLASH
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s build/px68k_tab5.bin
+          test -s build/px68k_tab5.elf
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib,json
+          p=Path("build/px68k_tab5.bin")
+          assert p.read_bytes()[:1] == b"\xe9" and 100000 < p.stat().st_size < 0x800000
+          print(json.dumps({"path":str(p),"size":p.stat().st_size,"sha256":hashlib.sha256(p.read_bytes()).hexdigest(),"flash":False},indent=2))
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: x68ktab-ym2151-stable-kon-phase-no-flash
+          if-no-files-found: error
+          path: |
+            build/px68k_tab5.bin
+            build/px68k_tab5.elf
+            build/partition_table/partition-table.bin
+          retention-days: 7
