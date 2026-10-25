@@ -1,7 +1,7 @@
 # X68K Tab
 
 > [!NOTE]
-> **Latest source: 2026.10.25 — YM2151 vgmM5 R61 FIX1 backport + FIR optimization for Tab5.** Physical smoke tests report stable sound and several applications booting, but not exhaustive compatibility, long-term endurance or a measured overall speedup. See [release notes and evidence](RELEASE_NOTES_2026-10-25.md). **The new M5Burner Share Code is being prepared**; the old code does NOT refer to this new firmware.
+> **Latest source: 2026.10.25 — YM2151 vgmM5 R61 FIX1 backport + FIR optimization for Tab5.** Physical smoke tests report stable sound and several applications booting, but not exhaustive compatibility, long-term endurance or a measured overall speedup. See [release notes and evidence](RELEASE_NOTES_2026-10-25.md). **M5Burner Share Code: `2cODB4oLECo97g0u`**. The old code is for the previous firmware.
 
 [**日本語 README → README.md**](README.md)
 
@@ -119,10 +119,10 @@ Enter the Share Code in **Share Burn** in M5Burner.
 
 | Version | Share Code | Description |
 | --- | --- | --- |
-| **2026.10.25 — Latest source** | **Share Code pending** | **YM2151 R61 quality improvements + FIR optimization, smoke-tested on Tab5** |
+| **2026.10.25 — Latest M5Burner release** | `2cODB4oLECo97g0u` | **YM2151 R61 fidelity improvements + FIR optimization, smoke-tested on Tab5** |
 | **2026-10-09 — Previous M5Burner release** | `tLkdgjcPoEoGbGEt` | **PDX / ADPCM half-speed fix + Tab5 LCD + MidMod / SAM2695 MIDI** |
 
-Until the new Share Code is available, the previously published M5Burner build remains the one listed above; it does not contain the 2026.10.25 YM2151 changes.
+**Use `2cODB4oLECo97g0u` for version 2026.10.25.** The previous Share Code listed below it does not include these YM2151 changes.
 
 ---
 

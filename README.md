@@ -1,7 +1,7 @@
 # X68K Tab
 
 > [!NOTE]
-> **最新ソース: 2026.10.25 — vgmM5 R61 FIX1のYM2151更新＋FIR高速化版。** Tab5実機で音質安定・複数ソフト起動が確認されました。長時間・全機能の互換性や定量的速度改善は未保証です。詳しくは[更新履歴と検証結果](RELEASE_NOTES_2026-10-25.md)を参照してください。**この版のM5Burner Share Codeは準備中**です。旧Share Codeは新ファームウェアではありません。
+> **最新ソース: 2026.10.25 — vgmM5 R61 FIX1のYM2151更新＋FIR高速化版。** Tab5実機で音質安定・複数ソフト起動が確認されました。長時間・全機能の互換性や定量的速度改善は未保証です。詳しくは[更新履歴と検証結果](RELEASE_NOTES_2026-10-25.md)を参照してください。**M5Burner Share Codeは `2cODB4oLECo97g0u`** です。旧Share Codeは従来版です。
 
 [**English README → README_en.md**](README_en.md)
 
@@ -125,10 +125,10 @@ M5Burner の **Share Burn** で Share Code を入力してください。
 
 | バージョン | Share Code | 用途 |
 | --- | --- | --- |
-| **2026.10.25 — 最新ソース版** | **シェアコード準備中** | **YM2151 R61音質改善 + FIR高速化。実機で初期確認済み** |
+| **2026.10.25 — 最新M5Burner版** | `2cODB4oLECo97g0u` | **YM2151 R61音質改善 + FIR高速化。Tab5実機で初期確認済み** |
 | **2026-10-09 — 従来M5Burner公開版** | `tLkdgjcPoEoGbGEt` | **PDX / ADPCM 半速修正 + Tab5 LCD互換 + MidMod / SAM2695 MIDI** |
 
-新しいShare Codeが公開されるまでは、M5Burnerから入手できるのは上記の従来版です。2026.10.25版と混同しないでください。
+**2026.10.25版は上段の `2cODB4oLECo97g0u` を使用してください。** 下段は従来版のコードです。
 
 ---
 
