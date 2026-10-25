@@ -224,17 +224,9 @@ static void audio_task(void *)
          * playRaw() while both are occupied: _set_next_wav() may otherwise
          * wait for a slot and keep CPU0 runnable for too long.
          */
-        /* M5Unified 0.2.28 separates the currently playing wave from its
-         * two queued request slots. isPlaying(channel) counts QUEUED slots,
-         * while isPlaying() also reports an active playback request. The old
-         * M5Unified 0.2.19 counted current+pending in isPlaying(channel).
-         * Preserve X68KTab5's existing effective audio-reserve semantics
-         * without changing guest clocks, PCM blocks or Speaker buffering. */
         const size_t speaker_queue = M5.Speaker.isPlaying(kSpeakerChannel);
-        const bool speaker_active = M5.Speaker.isPlaying();
-        const size_t speaker_inflight = speaker_queue + (speaker_active ? 1u : 0u);
         __atomic_store_n(&s_speaker_queued_frames,
-                         (uint32_t)(speaker_inflight * active_chunk), __ATOMIC_RELEASE);
+                         (uint32_t)(speaker_queue * active_chunk), __ATOMIC_RELEASE);
         if (speaker_queue >= 2)
         {
             /*
@@ -299,11 +291,9 @@ static void audio_task(void *)
 
         if (!take)
         {
-            if (!speaker_active && playback_started)
+            if (speaker_queue == 0 && playback_started)
             {
-                /* A real speaker starvation: rebuild reserve only when no
-                 * current playback remains, not merely when the waiting
-                 * request slots are empty. */
+                /* A real speaker starvation: rebuild reserve before restart. */
                 primed = false;
             }
 
