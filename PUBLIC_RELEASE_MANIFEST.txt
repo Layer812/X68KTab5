@@ -5,7 +5,7 @@ GitHub source: https://github.com/Layer812/X68KTab5
 Exact Tab5-tested firmware source commit: 5704225d65cfd94d5f0d951253a359db6cda6aed
 YM2151 R61 FIR optimization native build: PASS (ESP-IDF 5.5.4; GitHub Actions #40171386894)
 Device: app-only flash/readback PASS; HumanXDF retained; user reported stable sound and several apps booting
-2026.10.25 M5Burner Share Code: PENDING (not published)
+2026.10.25 M5Burner Share Code: 2cODB4oLECo97g0u (provided by the project owner)
 Previous M5Burner Share Code (2026-10-09 baseline): tLkdgjcPoEoGbGEt
 Release notes: RELEASE_NOTES_2026-10-25.md
 Build-time M5GFX overlay: patch_m5gfx_x68ktab.py
