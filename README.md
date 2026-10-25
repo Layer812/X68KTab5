@@ -1,7 +1,7 @@
 # X68K Tab
 
 > [!NOTE]
-> **最新ソース: 2026.10.25 — vgmM5 R61 FIX1のYM2151更新＋FIR高速化版。** 詳しくは[更新履歴と検証結果](RELEASE_NOTES_2026-10-25.md)を参照してください。**M5Burner Share Codeは `2cODB4oLECo97g0u`** です。
+> **最新ソース: 2026.10.25 — YM2151のKEY ON対応と位相リセットを改善。** 詳しくは[更新履歴と検証結果](RELEASE_NOTES_2026-10-25.md)を参照してください。**M5Burner Share Codeは `wOuCl6ZAtFxUpdy6`** です。
 
 [**English README → README_en.md**](README_en.md)
 
@@ -27,6 +27,10 @@ PANIC を再生するために必要な X68000 環境を少しずつ実装して
 ---
 
 ## Current Production
+
+### 2026-10-25 — YM2151 KEY ON・位相リセット修正（実機初期確認済み）
+
+M2/C1のKEY ON対応と発音開始時の位相リセットを修正しました。実機再生は良好で、現時点でプチノイズは確認されていません。
 
 ### 2026-10-25 — YM2151音質・FIR高速化（Tab5実機で初期確認済み）
 
@@ -80,10 +84,11 @@ M5Burner の **Share Burn** で Share Code を入力してください。
 
 | バージョン | Share Code | 用途 |
 | --- | --- | --- |
-| **2026.10.25 — 最新M5Burner版** | `2cODB4oLECo97g0u` | **YM2151 R61音質改善 + FIR高速化。Tab5実機で初期確認済み** |
+| **2026.10.25 — 最新M5Burner版** | `wOuCl6ZAtFxUpdy6` | **YM2151 KEY ON・位相リセット修正（実機初期確認済み）** |
+| 2026.10.25 — 従来版 | `2cODB4oLECo97g0u` | YM2151 R61音質改善 + FIR高速化 |
 | **2026-10-09 — 従来M5Burner公開版** | `tLkdgjcPoEoGbGEt` | **PDX / ADPCM 半速修正 + Tab5 LCD互換 + MidMod / SAM2695 MIDI** |
 
-**2026.10.25版は上段の `2cODB4oLECo97g0u` を使用してください。** 下段は従来版のコードです。
+**最新版は `wOuCl6ZAtFxUpdy6` を使用してください。** その他は従来版のコードです。
 
 ---
 
