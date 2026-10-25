@@ -6,7 +6,7 @@
 **初回実機確認版ソース / Original tested firmware source:** `5704225d65cfd94d5f0d951253a359db6cda6aed`  
 **プレビュー開発:** [R61移植PR #2](https://github.com/Layer812/X68KTab5/pull/2), [FIR最適化PR #3](https://github.com/Layer812/X68KTab5/pull/3)
 
- > 本リリース番号はGitHubソースの公開識別子です。初回実機確認に使用したBINは、上記のソースコミットをGitHub Actionsでビルドしたものです。リリース文書追加によってBINは変更していません。ESP-IDFが起動ログへ出力するアプリのビルド識別子は、そのBIN生成時のGitコミット情報のままです。
+> 本リリース番号はGitHubソースの公開識別子です。初回実機確認に使用したBINは、上記のソースコミットをGitHub Actionsでビルドしたものです。リリース文書追加によってBINは変更していません。ESP-IDFが起動ログへ出力するアプリのビルド識別子は、そのBIN生成時のGitコミット情報のままです。
 >
 > Version `2026.10.25` identifies this published source update. The proven BIN was built from the exact source commit above. Documentation/version metadata commits have **not** been recompiled into or flashed onto the tested BIN.
 
