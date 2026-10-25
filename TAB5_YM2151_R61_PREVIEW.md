@@ -1,5 +1,9 @@
 # X68K Tab — YM2151 R61 FIX1 Tab5プレビュー / R61 FIX1 YM2151 Preview
 
+> [!NOTE]
+> **この文書はR61移植初期の歴史的プレビュー記録です。** 後続のFIR高速化版が2026-10-25にESP32-P4でビルドされ、実機へのapp-only書込み・HumanXDF保持・音質安定・複数ソフト起動が確認されました。最新情報は[2026.10.25リリースノート](RELEASE_NOTES_2026-10-25.md)を参照してください。以下の「実機未検証」は移植初期時点の記述です。
+
+
 **状態 / Status:** **ソースコード開発プレビュー（実機未検証） / Source preview — NOT device verified**  
 **対象 / Target:** M5Stack Tab5 / ESP32-P4  
 **参照 / Reference:** User-provided `vgmM5_R61_FIX1_PRODUCTION_LOCK_20261025.zip` (2026-10-25). Its source package and firmware evidence checksums were independently verified.  
