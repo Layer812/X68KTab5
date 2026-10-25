@@ -27,20 +27,7 @@ jobs:
           test "$(git -C components/M5GFX rev-parse HEAD)" = "65c816a38386062d2c3dc47d41237a9083acbc75"
           test "$(git -C components/M5Unified rev-parse HEAD)" = "368ad60807161625aa65baad37a4a3af2a7eccea"
           test "$(git show 01615055e19eb950d62df5ac847952b290ca7b86:components/px68k/fmgen/vgmm5_ym2151.cpp | git hash-object --stdin)" = "$(git hash-object components/px68k/fmgen/vgmm5_ym2151.cpp)"
-          python3 - <<'PY'
-          from pathlib import Path
-          import subprocess
-          old = subprocess.check_output(["git","show","01615055e19eb950d62df5ac847952b290ca7b86:src/tab5_audio.cpp"],text=True)
-          new = Path("src/tab5_audio.cpp").read_text()
-          first_old = "        const size_t speaker_queue = M5.Speaker.isPlaying(kSpeakerChannel);\n        __atomic_store_n(&s_speaker_queued_frames,\n                         (uint32_t)(speaker_queue * active_chunk), __ATOMIC_RELEASE);\n"
-          first_new = "        /* M5Unified 0.2.28 separates the currently playing wave from its\n         * two queued request slots. isPlaying(channel) counts QUEUED slots,\n         * while isPlaying() also reports an active playback request. The old\n         * M5Unified 0.2.19 counted current+pending in isPlaying(channel).\n         * Preserve X68KTab5's existing effective audio-reserve semantics\n         * without changing guest clocks, PCM blocks or Speaker buffering. */\n        const size_t speaker_queue = M5.Speaker.isPlaying(kSpeakerChannel);\n        const bool speaker_active = M5.Speaker.isPlaying();\n        const size_t speaker_inflight = speaker_queue + (speaker_active ? 1u : 0u);\n        __atomic_store_n(&s_speaker_queued_frames,\n                         (uint32_t)(speaker_inflight * active_chunk), __ATOMIC_RELEASE);\n"
-          second_old = "            if (speaker_queue == 0 && playback_started)\n            {\n                /* A real speaker starvation: rebuild reserve before restart. */\n                primed = false;\n            }\n\n"
-          second_new = "            if (!speaker_active && playback_started)\n            {\n                /* A real speaker starvation: rebuild reserve only when no\n                 * current playback remains, not merely when the waiting\n                 * request slots are empty. */\n                primed = false;\n            }\n\n"
-          assert old.count(first_old) == old.count(second_old) == 1
-          assert new.count(first_new) == new.count(second_new) == 1
-          assert old.replace(first_old,first_new).replace(second_old,second_new) == new, "audio changed outside documented M5Unified slot API compatibility"
-          print("PASS speaker active/pending semantic update; PCM, clocks, ring, feed and scheduler unchanged")
-          PY
+          test "$(git show 01615055e19eb950d62df5ac847952b290ca7b86:src/tab5_audio.cpp | git hash-object --stdin)" = "$(git hash-object src/tab5_audio.cpp)"
           test "$(git show 01615055e19eb950d62df5ac847952b290ca7b86:src/tab5_video.cpp | git hash-object --stdin)" = "$(git hash-object src/tab5_video.cpp)"
           test "$(git show 01615055e19eb950d62df5ac847952b290ca7b86:partitions.csv | git hash-object --stdin)" = "$(git hash-object partitions.csv)"
           python3 -m py_compile patch_m5gfx_x68ktab.py
