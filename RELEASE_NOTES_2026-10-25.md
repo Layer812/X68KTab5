@@ -32,7 +32,7 @@
 ## 配布 / Distribution
 
 - ソース: [Layer812/X68KTab5](https://github.com/Layer812/X68KTab5)
-- **M5Burner Share Code（2026.10.25版）:** 提供予定。コード確定までは旧Share Codeを2026.10.25版と取り違えないでください。
+- **M5Burner Share Code（2026.10.25版）:** `2cODB4oLECo97g0u`（開発者提供。GitHubへの記録は確認済み。M5Burner側の受信・公開状態はここでは独立検証していません）。
 - 以前のProduction M5Burnerコード: `tLkdgjcPoEoGbGEt`（2026.10.09までのPDX/ADPCM・LCD・MIDI更新を含む既存版）。
 - Github Actionsアーティファクトは保存期限があるため、恒久的なBIN配布先とは扱いません。
 - X68000の独自ROM、Human68k、商用ソフトウェア／音楽／ディスクイメージは再配布しません。権利関係は `THIRD_PARTY_NOTICES.md` 等を参照してください。
