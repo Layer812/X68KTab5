@@ -1,7 +1,7 @@
 # X68K Tab
 
 > [!NOTE]
-> **Latest source: 2026.10.25 — YM2151 vgmM5 R61 FIX1 backport + FIR optimization for Tab5.** Physical smoke tests report stable sound and several applications booting, but not exhaustive compatibility, long-term endurance or a measured overall speedup. See [release notes and evidence](RELEASE_NOTES_2026-10-25.md). **M5Burner Share Code: `2cODB4oLECo97g0u`**. The old code is for the previous firmware.
+> **Latest source: 2026.10.25 — YM2151 KEY ON mapping and note-on phase reset updated.** Physical smoke tests report stable sound and several applications booting, but not exhaustive compatibility, long-term endurance or a measured overall speedup. See [release notes and evidence](RELEASE_NOTES_2026-10-25.md). **M5Burner Share Code: `wOuCl6ZAtFxUpdy6`**. The old code is for the previous firmware.
 
 [**日本語 README → README.md**](README.md)
 
@@ -39,6 +39,10 @@ GS MIDI data is also converted using MidMod's GS → SAM2695 mapping so that it 
 The current Production build runs the **68000 guest CPU at 12 MHz, with the X68000 peripheral time domain at exact 10 MHz**.
 
 Source release **2026.10.25** adds the **R61-based YM2151 synthesis and FIR speed optimization** while preserving the **PDX/ADPCM playback fix, Tab5 LCD compatibility, and MidMod/SAM2695 MIDI support**.
+
+### 2026-10-25 — YM2151 KEY ON and phase reset fix (Tab5 smoke-tested)
+
+Corrected M2/C1 KEY ON assignment and resets operator phase only on a new note. Playback is good in initial device testing, with no clicking heard so far.
 
 ### 2026-10-25 — YM2151 sound fidelity and FIR speed optimization (Tab5 smoke-tested)
 
@@ -119,10 +123,11 @@ Enter the Share Code in **Share Burn** in M5Burner.
 
 | Version | Share Code | Description |
 | --- | --- | --- |
-| **2026.10.25 — Latest M5Burner release** | `2cODB4oLECo97g0u` | **YM2151 R61 fidelity improvements + FIR optimization, smoke-tested on Tab5** |
+| **2026.10.25 — Latest M5Burner release** | `wOuCl6ZAtFxUpdy6` | **YM2151 KEY ON and note-on phase reset fix, smoke-tested on Tab5** |
+| 2026.10.25 — Previous release | `2cODB4oLECo97g0u` | YM2151 R61 fidelity improvements + FIR optimization |
 | **2026-10-09 — Previous M5Burner release** | `tLkdgjcPoEoGbGEt` | **PDX / ADPCM half-speed fix + Tab5 LCD + MidMod / SAM2695 MIDI** |
 
-**Use `2cODB4oLECo97g0u` for version 2026.10.25.** The previous Share Code listed below it does not include these YM2151 changes.
+**Use `wOuCl6ZAtFxUpdy6` for the latest build.** Older Share Codes are listed below.
 
 ---
 
