@@ -36,6 +36,21 @@ endif()
 string(STRIP "${X68KTAB_ES8388_PATCH_OUT}" X68KTAB_ES8388_PATCH_OUT)
 message(STATUS "${X68KTAB_ES8388_PATCH_OUT}")
 
+# Non-invasive Tab5 Speaker fast wake: skip one pending idle PCM padding block
+# only if a playRaw notification is already queued. Keep all other DMA paths.
+execute_process(
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_LIST_DIR}/patch_m5unified_x68ktab_speaker_idle.py"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_LIST_DIR}"
+    RESULT_VARIABLE X68KTAB_SPK_IDLE_RC
+    OUTPUT_VARIABLE X68KTAB_SPK_IDLE_OUT
+    ERROR_VARIABLE X68KTAB_SPK_IDLE_ERR
+)
+if(NOT X68KTAB_SPK_IDLE_RC EQUAL 0)
+    message(FATAL_ERROR "X68K Tab Speaker idle overlay failed:\n${X68KTAB_SPK_IDLE_OUT}\n${X68KTAB_SPK_IDLE_ERR}")
+endif()
+string(STRIP "${X68KTAB_SPK_IDLE_OUT}" X68KTAB_SPK_IDLE_OUT)
+message(STATUS "${X68KTAB_SPK_IDLE_OUT}")
+
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 
 # PX68K Tab5 native ESP-IDF 5.5.4 production build.
