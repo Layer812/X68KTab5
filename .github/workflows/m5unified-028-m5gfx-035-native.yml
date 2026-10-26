@@ -69,6 +69,57 @@ jobs:
           grep -q 'num_fbs = 2;' components/M5GFX/src/lgfx/v1/platforms/esp32p4/Panel_DSI.inl
           test -f components/M5GFX/src/lgfx/v1/platforms/esp32p4/Panel_DSI.inl
 
+      - name: Verify M5GFX 0.2.35 native capabilities and Tab5 adoption
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          gfx=Path("components/M5GFX/src")
+          dsi=(gfx/"lgfx/v1/platforms/esp32p4/Panel_DSI.inl").read_text()
+          hpp=(gfx/"lgfx/v1/platforms/esp32p4/Panel_DSI.hpp").read_text()
+          bus=(gfx/"lgfx/v1/platforms/esp32p4/Bus_DSI.inl").read_text()
+          det=(gfx/"M5GFX.cpp").read_text()
+          fb=(gfx/"lgfx/v1/panel/Panel_FrameBufferBase.hpp").read_text()
+          video=Path("src/tab5_video.cpp").read_text()
+
+          # 0.2.35 upstream owns two actual driver framebuffers. The project
+          # overlay exposes both pointers and native panel handle without
+          # introducing an additional driver allocation or losing DSI fencing.
+          assert dsi.count("dpi_config.num_fbs = 2;")==1
+          assert "dpi_config.num_fbs = 1;" not in dsi
+          assert "dpi_config.flags.use_dma2d = true;" in dsi
+          assert "esp_lcd_dpi_panel_enable_dma2d(_disp_panel_handle)" in dsi
+          assert "_config_detail.buffer2" in dsi
+          assert "_config_detail.px68k_dpi_panel = _disp_panel_handle;" in dsi
+          assert "void* buffer2 = nullptr;" in hpp
+          assert "esp_lcd_panel_handle_t px68k_dpi_panel = nullptr;" in hpp
+          assert "getResetDelayBeforeDpi" in hpp and "initInCommandMode" in hpp
+          assert "esp_lcd_dsi_bus_config_t bus_config = {};" in bus
+          assert "for (int i = 0; i < 60; ++i)" in det
+          assert "bool found_gt911 = false;" in det
+          assert "bool dmaBusy(void) override { return false; }" in fb
+
+          # Do not silently fall back to full-frame M5GFX drawImage while
+          # claiming that the managed sparse native path is active.
+          for token in (
+              "r84_managed_direct_native_present(",
+              "req.managed_dirty_tiles",
+              "r35_swrot_tile8_packed(",
+              "esp_cache_msync(",
+              "s_dsi_double_live = buffers_ok && callbacks_ok;",
+              "dbfb615h17_wait_refresh()",
+              "esp_lcd_dpi_panel_register_event_callbacks(",
+              "s_dsi_fb[0] = reinterpret_cast<uint16_t *>(dsi_cfg.buffer);",
+              "s_dsi_fb[1] = reinterpret_cast<uint16_t *>(dsi_cfg.buffer2);",
+              "s_dsi_dpi_panel = dsi_cfg.px68k_dpi_panel;",
+          ):
+              assert token in video, f"Missing Tab5 display contract: {token}"
+          assert Path("docs/M5GFX_0235_FEATURE_ADOPTION_AUDIT.md").is_file()
+          print("PASS 0.2.35 native DoubleFB, DMA2D, panel probe and Tab5 sparse present contracts")
+          print("NOTE DMA2D DPI flag was already available in old M5GFX; no new speedup asserted")
+          PY
+
       - name: Verify exact ES8388 MCLK/LRCK 256fs correction and idempotence
         shell: bash
         run: |
