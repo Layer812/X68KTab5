@@ -5,7 +5,7 @@ R6 CI: https://github.com/Layer812/X68KTab5/actions/runs/40661572999 (all checks
 R6 device observation: on physical Tab5, MDX playback no longer exhibited the earlier perceptible stutter (owner report, 2026-10-28)
 R6 scope: M5Unified 0.2.28, M5GFX 0.2.35, ES8388 256fs, Speaker buffer-release notification, deadline-first PCM handoff
 R6 release notes: RELEASE_NOTES_2026-10-28.md
-M5Burner Share Code below still refers to the 2026-10-25 firmware; no R6 M5Burner image/share code has been published or verified.
+R6 M5Burner Share Code: 8i9Cp1C6ufGpGC5J (provided by project owner 2026-10-28; hosted BIN SHA-256 not independently matched to physically tested R6 app BIN).
 Target: M5Stack Tab5 / ESP32-P4
 GitHub source: https://github.com/Layer812/X68KTab5
 Original 2026.10.25 tested firmware source commit: 5704225d65cfd94d5f0d951253a359db6cda6aed
@@ -13,7 +13,8 @@ Current YM2151 stable source commit: 468ee6a38ef119addab2dc6a2f5132eb63a672a1
 YM2151 KEY ON / phase reset: native CI PASS (Actions #40200136475); app-only device smoke PASS; no clicking observed so far
 YM2151 R61 FIR optimization native build: PASS (ESP-IDF 5.5.4; GitHub Actions #40171386894)
 Device: app-only flash/readback PASS; HumanXDF retained; user reported stable sound and several apps booting
-Latest M5Burner Share Code: wOuCl6ZAtFxUpdy6 (provided by the project owner; image hash not independently verified)
+Latest M5Burner Share Code: 8i9Cp1C6ufGpGC5J (R6; provided by project owner; hosted image hash not independently verified)
+Previous 2026.10.25 M5Burner Share Code: wOuCl6ZAtFxUpdy6 (provided by project owner; previous production)
 Previous 2026.10.25 M5Burner Share Code: 2cODB4oLECo97g0u
 Previous M5Burner Share Code (2026-10-09 baseline): tLkdgjcPoEoGbGEt
 Release notes: RELEASE_NOTES_2026-10-25.md

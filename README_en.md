@@ -1,7 +1,7 @@
 # X68K Tab
 
 > [!NOTE]
-> **Latest GitHub source: 2026.10.28 R6 — M5Unified 0.2.28 / M5GFX 0.2.35 and a physically confirmed reduction in MDX playback stutter.** See the [R6 release notes](RELEASE_NOTES_2026-10-28.md). **The latest published M5Burner Share Code remains `wOuCl6ZAtFxUpdy6` (older firmware, NOT R6).**
+> **Latest GitHub source: 2026.10.28 R6 — M5Unified 0.2.28 / M5GFX 0.2.35 and a physically confirmed reduction in MDX playback stutter.** See the [R6 release notes](RELEASE_NOTES_2026-10-28.md). **R6 M5Burner Share Code: `8i9Cp1C6ufGpGC5J` (provided by the project owner).**
 
 [**日本語 README → README.md**](README.md)
 
@@ -38,7 +38,7 @@ GS MIDI data is also converted using MidMod's GS → SAM2695 mapping so that it 
 
 ### 2026-10-28 — R6 library upgrade and MDX playback stabilization
 
-Upgraded to M5Unified 0.2.28 and M5GFX 0.2.35 while retaining the existing LCD panel profiles, DoubleFB, and guest timing. ES8388 uses 256fs MCLK/LRCK, with Speaker buffer-release notifications. R6 prioritizes PCM already queued in the host ring before further upstream pulling. The owner reported MDX playback without the earlier perceptible stutter on a physical Tab5. **R6 is the updated source/device-tested candidate; it is NOT the image associated with the existing M5Burner Share Code.** See the [scope and verification notes](RELEASE_NOTES_2026-10-28.md).
+Upgraded to M5Unified 0.2.28 and M5GFX 0.2.35 while retaining the existing LCD panel profiles, DoubleFB, and guest timing. ES8388 uses 256fs MCLK/LRCK, with Speaker buffer-release notifications. R6 prioritizes PCM already queued in the host ring before further upstream pulling. The owner reported MDX playback without the earlier perceptible stutter on a physical Tab5. **The project owner supplied R6 M5Burner Share Code `8i9Cp1C6ufGpGC5J`.** The uploaded M5Burner image has not been independently hash-matched to the physically tested R6 app binary. See the [scope and verification notes](RELEASE_NOTES_2026-10-28.md).
 
 The current Production build runs the **68000 guest CPU at 12 MHz, with the X68000 peripheral time domain at exact 10 MHz**.
 
@@ -127,11 +127,12 @@ Enter the Share Code in **Share Burn** in M5Burner.
 
 | Version | Share Code | Description |
 | --- | --- | --- |
-| **2026.10.25 — Latest M5Burner release** | `wOuCl6ZAtFxUpdy6` | **YM2151 KEY ON and note-on phase reset fix, smoke-tested on Tab5** |
+| **2026.10.28 — Latest R6 Share Code** | `8i9Cp1C6ufGpGC5J` | **Unified/GFX upgrade and improved MDX playback on tested Tab5 (owner-provided code)** |
+| 2026.10.25 — Previous M5Burner release | `wOuCl6ZAtFxUpdy6` | YM2151 KEY ON and note-on phase reset fix, smoke-tested on Tab5 |
 | 2026.10.25 — Previous release | `2cODB4oLECo97g0u` | YM2151 R61 fidelity improvements + FIR optimization |
 | **2026-10-09 — Previous M5Burner release** | `tLkdgjcPoEoGbGEt` | **PDX / ADPCM half-speed fix + Tab5 LCD + MidMod / SAM2695 MIDI** |
 
-**Use `wOuCl6ZAtFxUpdy6` for the latest build.** Older Share Codes are listed below.
+**Use `8i9Cp1C6ufGpGC5J` for the R6 M5Burner share provided by the project owner.** The hosted image has not been independently verified against the GitHub Actions binary hash. Older Share Codes are listed below.
 
 ---
 
