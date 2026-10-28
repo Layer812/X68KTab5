@@ -1,8 +1,5 @@
 # X68K Tab
 
-> [!NOTE]
-> **最新GitHubソース: 2026.10.28 R6 — M5Unified 0.2.28 / M5GFX 0.2.35へ更新し、MDX音声のモタツキを実機で改善確認。** 詳しくは[2026.10.28更新履歴](RELEASE_NOTES_2026-10-28.md)をご覧ください。**R6のM5Burner Share Codeは `8i9Cp1C6ufGpGC5J` です（開発者提供）。**
-
 [**English README → README_en.md**](README_en.md)
 
 <p align="center">

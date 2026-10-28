@@ -1,8 +1,5 @@
 # X68K Tab
 
-> [!NOTE]
-> **Latest GitHub source: 2026.10.28 R6 — M5Unified 0.2.28 / M5GFX 0.2.35 and a physically confirmed reduction in MDX playback stutter.** See the [R6 release notes](RELEASE_NOTES_2026-10-28.md). **R6 M5Burner Share Code: `8i9Cp1C6ufGpGC5J` (provided by the project owner).**
-
 [**日本語 README → README.md**](README.md)
 
 <p align="center">
