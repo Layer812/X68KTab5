@@ -9,10 +9,10 @@ ROOT = Path(__file__).resolve().parent
 M5ROOT = ROOT / "components" / "M5GFX"
 M5GFX_CPP = M5ROOT / "src" / "M5GFX.cpp"
 PANEL_HPP = M5ROOT / "src" / "lgfx" / "v1" / "platforms" / "esp32p4" / "Panel_DSI.hpp"
-PANEL_CPP = M5ROOT / "src" / "lgfx" / "v1" / "platforms" / "esp32p4" / "Panel_DSI.cpp"
+PANEL_CPP = M5ROOT / "src" / "lgfx" / "v1" / "platforms" / "esp32p4" / "Panel_DSI.inl"
 
-EXPECTED_COMMIT = "729297d6e3d657ddc1ec5189bac2f2ea68828085"
-MARK = "X68KTAB_PANEL_COMPAT_R2"
+EXPECTED_COMMIT = "65c816a38386062d2c3dc47d41237a9083acbc75"
+MARK = "X68KTAB_PANEL_COMPAT_R3"
 
 
 def die(msg: str) -> None:
@@ -55,26 +55,12 @@ def patch_between(src: str, start: str, end: str, old: str, new: str, label: str
 
 
 def patch_m5gfx(src: str) -> str:
-    src = replace_once(
-        src,
-        "            bool read_st_touch_fw = false;\n            for (int i = 0; i < 3; ++i) {\n",
-        "            bool read_st_touch_fw = false;\n"
-        f"            // {MARK}: tolerate a late ST touch FW response.\n"
-        "            for (int i = 0; i < 20; ++i) {\n",
-        "touch FW retry count",
-    )
-
-    start = "            bool read_st_touch_fw = false;\n"
-    end = "            if (!read_st_touch_fw) {"
-    i = src.find(start)
-    j = src.find(end, i)
-    require(i >= 0 and j >= 0, "touch FW retry block not found")
-    block = src[i:j]
-    require(block.count("              lgfx::delay(10);\n") == 1,
-            "touch FW retry block: expected exactly one delay(10)")
-    block = block.replace("              lgfx::delay(10);\n",
-                          "              lgfx::delay(50);\n", 1)
-    src = src[:i] + block + src[j:]
+    # Upstream 0.2.35 already retries ST7121/ST7123 and GT911 detection.
+    # Keep official panel probing; only preserve device-tested DSI timing.
+    require(src.count("for (int i = 0; i < 60; ++i)") == 1,
+            "official ST touch probe has changed")
+    require("bool found_gt911 = false;" in src,
+            "official GT911 probe missing")
 
     src = replace_once(
         src,
@@ -139,22 +125,18 @@ def patch_panel_hpp(src: str) -> str:
     return src
 
 
-def patch_panel_cpp(src: str) -> str:
+def patch_panel_inl(src: str) -> str:
     src = replace_once(
         src,
         "#include <esp_lcd_panel_io.h>\n",
         "#include <esp_lcd_panel_io.h>\n"
         '#include "hal/mipi_dsi_host_ll.h"\n'
         '#include "soc/mipi_dsi_host_struct.h"\n',
-        "Panel_DSI.cpp LL includes",
+        "Panel_DSI.inl LL includes",
     )
-    src = replace_once(
-        src,
-        "    dpi_config.num_fbs = 1;\n",
-        f"    // {MARK}: keep the existing X68K Tab DoubleFB presenter.\n"
-        "    dpi_config.num_fbs = 2;\n",
-        "Panel_DSI.cpp num_fbs",
-    )
+    # Upstream already allocates two DPI framebuffers.
+    require(src.count("    dpi_config.num_fbs = 2;") == 1,
+            "upstream double framebuffer allocation has changed")
     src = replace_once(
         src,
         "    auto ret = esp_lcd_new_panel_dpi(mipi_dsi_bus, &dpi_config, &_disp_panel_handle);\n",
@@ -173,7 +155,7 @@ def patch_panel_cpp(src: str) -> str:
         "          &MIPI_DSI_HOST, MIPI_DSI_LL_VIDEO_BURST_WITH_SYNC_PULSES);\n"
         "      mipi_dsi_host_ll_dpi_enable_frame_ack(&MIPI_DSI_HOST, false);\n"
         "    }\n",
-        "Panel_DSI.cpp ACK policy",
+        "Panel_DSI.inl ACK policy",
     )
 
     old = (
@@ -217,7 +199,7 @@ def patch_panel_cpp(src: str) -> str:
         "      }\n"
         "    }\n"
     )
-    src = replace_once(src, old, new, "Panel_DSI.cpp init/DoubleFB block")
+    src = replace_once(src, old, new, "Panel_DSI.inl init/DoubleFB block")
     return src
 
 
@@ -230,9 +212,10 @@ def branch(src: str, start: str, end: str) -> str:
 
 def audit(m5: str, hpp: str, cpp: str) -> None:
     require(MARK in m5 and MARK in hpp and MARK in cpp, "patch marker missing")
-    require(m5.count("for (int i = 0; i < 20; ++i)") == 1, "touch retry count is not 20")
-    retry = branch(m5, "bool read_st_touch_fw = false;", "if (!read_st_touch_fw) {")
-    require(retry.count("lgfx::delay(50);") == 1, "touch retry delay is not 50 ms")
+    require(m5.count("for (int i = 0; i < 60; ++i)") == 1,
+            "upstream touch retry must remain")
+    require("bool found_gt911 = false;" in m5,
+            "upstream GT911 detection must remain")
     require(m5.count("bus_cfg.lane_mbps = hit_st7121 ? 965 : (hit_st7123 ? 1040 : 730);") == 1,
             "panel-specific DSI lane selector missing")
 
@@ -308,7 +291,7 @@ def main() -> int:
 
     new_m5 = patch_m5gfx(m5)
     new_hpp = patch_panel_hpp(hpp)
-    new_cpp = patch_panel_cpp(cpp)
+    new_cpp = patch_panel_inl(cpp)
     audit(new_m5, new_hpp, new_cpp)
 
     # All guards and audits pass in memory before touching the submodule.

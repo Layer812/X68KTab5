@@ -1,7 +1,7 @@
 # X68K Tab
 
 > [!NOTE]
-> **最新ソース: 2026.10.25 — YM2151のKEY ON対応と位相リセットを改善。** 詳しくは[更新履歴と検証結果](RELEASE_NOTES_2026-10-25.md)を参照してください。**M5Burner Share Codeは `wOuCl6ZAtFxUpdy6`** です。
+> **最新GitHubソース: 2026.10.28 R6 — M5Unified 0.2.28 / M5GFX 0.2.35へ更新し、MDX音声のモタツキを実機で改善確認。** 詳しくは[2026.10.28更新履歴](RELEASE_NOTES_2026-10-28.md)をご覧ください。**M5Burnerの公開済み版は従来の `wOuCl6ZAtFxUpdy6` のままで、R6ではありません。**
 
 [**English README → README_en.md**](README_en.md)
 
@@ -27,6 +27,12 @@ PANIC を再生するために必要な X68000 環境を少しずつ実装して
 ---
 
 ## Current Production
+
+### 2026-10-28 — R6：M5Unified / M5GFX更新とMDX音声安定化
+
+M5Unified 0.2.28 / M5GFX 0.2.35に更新し、Tab5パネル互換性・DoubleFB・既存ゲスト動作を維持しています。ES8388のMCLK/LRCKを256fsに調整し、Speakerバッファ解放通知を利用。R6では、準備済みPCMをSpeakerへ先に送ることで、実機で問題になっていたMDX再生のモタツキが聞こえなくなったと報告されています。**R6はGitHubソースと実機確認済みアプリの更新であり、M5Burnerの新しいShare Codeを示すものではありません。**
+
+[変更点・テスト範囲・制約](RELEASE_NOTES_2026-10-28.md)
 
 ### 2026-10-25 — YM2151 KEY ON・位相リセット修正（実機初期確認済み）
 
@@ -84,11 +90,11 @@ M5Burner の **Share Burn** で Share Code を入力してください。
 
 | バージョン | Share Code | 用途 |
 | --- | --- | --- |
-| **2026.10.25 — 最新M5Burner版** | `wOuCl6ZAtFxUpdy6` | **YM2151 KEY ON・位相リセット修正（実機初期確認済み）** |
+| **2026.10.25 — M5Burner公開済み最新版（R6ではありません）** | `wOuCl6ZAtFxUpdy6` | **YM2151 KEY ON・位相リセット修正（実機初期確認済み）** |
 | 2026.10.25 — 従来版 | `2cODB4oLECo97g0u` | YM2151 R61音質改善 + FIR高速化 |
 | **2026-10-09 — 従来M5Burner公開版** | `tLkdgjcPoEoGbGEt` | **PDX / ADPCM 半速修正 + Tab5 LCD互換 + MidMod / SAM2695 MIDI** |
 
-**最新版は `wOuCl6ZAtFxUpdy6` を使用してください。** その他は従来版のコードです。
+**M5Burnerで公開済みの最新版は `wOuCl6ZAtFxUpdy6` です（R6ではありません）。** R6はGitHubソース更新として扱います。その他は従来版のコードです。
 
 ---
 

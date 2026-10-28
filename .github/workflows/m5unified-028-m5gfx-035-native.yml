@@ -1,0 +1,232 @@
+name: X68KTab5 M5Unified 0.2.28 M5GFX 0.2.35 Tab5 migration (NO FLASH)
+
+on:
+  push:
+    branches:
+      - work/m5unified-028-m5gfx-035-tab5-safe-20261025
+      - work/x68ktab-r6-deadline-first-refill-20261028
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tab5-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 85
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Lock official dependencies and preserved firmware semantics
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C components/M5GFX rev-parse HEAD)" = "65c816a38386062d2c3dc47d41237a9083acbc75"
+          test "$(git -C components/M5Unified rev-parse HEAD)" = "368ad60807161625aa65baad37a4a3af2a7eccea"
+          test "$(git show 01615055e19eb950d62df5ac847952b290ca7b86:components/px68k/fmgen/vgmm5_ym2151.cpp | git hash-object --stdin)" = "$(git hash-object components/px68k/fmgen/vgmm5_ym2151.cpp)"
+          python3 - <<'PY'
+          from pathlib import Path
+          import subprocess
+          stable=subprocess.check_output(["git","show","01615055e19eb950d62df5ac847952b290ca7b86:src/tab5_audio.cpp"],text=True)
+          actual=Path("src/tab5_audio.cpp").read_text()
+          o1 = "static void audio_source_ready_cb(void)\n{\n    TaskHandle_t task = s_task;\n    if (task)\n        xTaskNotifyGive(task);\n}\n\n"
+          n1 = "static void audio_source_ready_cb(void)\n{\n    TaskHandle_t task = s_task;\n    if (task)\n        xTaskNotifyGive(task);\n}\n\n/* M5Unified 0.2.28: the actual Speaker playback task reports when its\n * previously queued PCM buffer is no longer referenced. Wake the existing\n * CPU0 feeder then, rather than relying on the 100Hz tick alone. This runs\n * in the Speaker task, not an ISR, and never touches the audio ring. */\nstatic void audio_speaker_buffer_released_cb(void *, const void *, uint8_t channel)\n{\n    if (channel != kSpeakerChannel)\n        return;\n    TaskHandle_t task = s_task;\n    if (task)\n        xTaskNotifyGive(task);\n}\n\n"
+          assert stable.count(o1)==1 and actual.count(n1)==1
+          stable=stable.replace(o1,n1)
+          o2 = "        if (speaker_queue >= 2)\n        {\n            /*\n             * Build 5.66: this must be a real blocked wait, not a millisecond\n             * conversion that may round down to zero when configTICK_RATE_HZ\n             * is low.  A zero-tick delay turns the feeder into a priority-3\n             * busy poll of M5.Speaker.isPlaying(), starving IDLE0 and tripping\n             * the task watchdog once guest PCM production reaches real time.\n             *\n             * One FreeRTOS tick is intentionally used here.  While two 1024\n             * frame speaker slots are queued we already have about 46 ms of\n             * PCM committed at 44.1 kHz, so a single tick cannot starve audio\n             * on the current target and guarantees an IDLE scheduling window.\n             */\n            vTaskDelay(1);\n            continue;\n        }\n\n"
+          n2 = "        if (speaker_queue >= 2)\n        {\n            /*\n             * Build 5.66: this must be a real blocked wait, not a millisecond\n             * conversion that may round down to zero when configTICK_RATE_HZ\n             * is low.  A zero-tick delay turns the feeder into a priority-3\n             * busy poll of M5.Speaker.isPlaying(), starving IDLE0 and tripping\n             * the task watchdog once guest PCM production reaches real time.\n             *\n             * One FreeRTOS tick is intentionally used here.  While two 1024\n             * frame speaker slots are queued we already have about 46 ms of\n             * PCM committed at 44.1 kHz, so a single tick cannot starve audio\n             * on the current target and guarantees an IDLE scheduling window.\n             */\n            /* 100Hz ticks are ~10ms while a 512-frame PCM block lasts\n             * only ~11.6ms. Release callback wakes us promptly on slot\n             * turnover; the one-tick bound remains the safe fallback. */\n            ulTaskNotifyTake(pdTRUE, 1);\n            continue;\n        }\n\n"
+          assert stable.count(o2)==1 and actual.count(n2)==1
+          stable=stable.replace(o2,n2)
+          o3 = "    if (!M5.Speaker.begin())\n    {\n        ESP_LOGE(TAG, \"M5Unified speaker begin failed after cold recovery\");\n        return 0;\n    }\n\n"
+          n3 = "    if (!M5.Speaker.begin())\n    {\n        ESP_LOGE(TAG, \"M5Unified speaker begin failed after cold recovery\");\n        return 0;\n    }\n\n    /* M5Unified 0.2.28 guarantees this callback is issued after a PCM\n     * buffer is no longer referenced. Register before our first playRaw.\n     * Never request/play audio from the Speaker callback itself. */\n    M5.Speaker.setBufferReleaseCallback(nullptr, audio_speaker_buffer_released_cb);\n\n"
+          assert stable.count(o3)==1 and actual.count(n3)==1
+          stable=stable.replace(o3,n3)
+          # R6 adds precisely one deadline-first handoff before an otherwise
+          # unchanged bounded eight-pull loop. All prior R4/R5 sources remain.
+          o4 = "        /* CPU0 owns final extraction + FM saturation mix from this point. */\n        pump_host_source();"
+          n4 = "        /* R6 deadline-first handoff: once primed, a complete PCM chunk\n         * already resident in the host ring must reach an available Speaker\n         * slot BEFORE another potentially long FM/ADPCM source-pull batch.\n         * Preserve the eight-batch drain when the Speaker queue is full or\n         * when startup/recovery still needs more samples. */\n        bool submit_ready_first = false;\n        if (primed)\n        {\n            const uint32_t early_profile =\n                __atomic_load_n(&s_audio_profile, __ATOMIC_ACQUIRE);\n            portENTER_CRITICAL(&s_mux);\n            const bool reserve_ready = (s_reset_seq == seen_reset_seq) &&\n                (s_count >= p12r6a4_profile_chunk(early_profile));\n            portEXIT_CRITICAL(&s_mux);\n            if (reserve_ready)\n                submit_ready_first = (M5.Speaker.isPlaying(kSpeakerChannel) < 2);\n        }\n        if (!submit_ready_first)\n            pump_host_source();"
+          assert stable.count(o4)==1 and actual.count(n4)==1
+          stable=stable.replace(o4,n4)
+          assert stable==actual, "Unexpected audio producer/speaker changes"
+          speaker=Path("components/M5Unified/src/utility/Speaker_Class.hpp").read_text()
+          assert "setBufferReleaseCallback" in speaker
+          speaker_impl=Path("components/M5Unified/src/utility/Speaker_Class.inl").read_text()
+          assert "self->_cb_buffer_release(self->_cb_buffer_release_args, released, ch)" in speaker_impl
+          assert "ch_info->wavinfo[!flip].state.store(wav_phase_empty" in speaker_impl
+          print("PASS exact 3-site feeder release notification integration; PCM, guest, rates, and priorities untouched")
+          PY
+          test "$(git show 01615055e19eb950d62df5ac847952b290ca7b86:src/tab5_video.cpp | git hash-object --stdin)" = "$(git hash-object src/tab5_video.cpp)"
+          test "$(git show 01615055e19eb950d62df5ac847952b290ca7b86:partitions.csv | git hash-object --stdin)" = "$(git hash-object partitions.csv)"
+          python3 -m py_compile patch_m5gfx_x68ktab.py patch_m5unified_x68ktab_es8388.py patch_m5unified_x68ktab_speaker_idle.py
+          grep -q 'patch_m5unified_x68ktab_es8388.py' CMakeLists.txt
+          grep -q 'patch_m5unified_x68ktab_speaker_idle.py' CMakeLists.txt
+
+      - name: Validate official Tab5 probe and retained ST7121/ST7123/ILI9881C/DoubleFB overlay
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 patch_m5gfx_x68ktab.py
+          python3 patch_m5gfx_x68ktab.py
+          grep -q 'X68KTAB_PANEL_COMPAT_R3' components/M5GFX/src/M5GFX.cpp
+          grep -q 'X68KTAB_PANEL_COMPAT_R3' components/M5GFX/src/lgfx/v1/platforms/esp32p4/Panel_DSI.inl
+          grep -q 'num_fbs = 2;' components/M5GFX/src/lgfx/v1/platforms/esp32p4/Panel_DSI.inl
+          test -f components/M5GFX/src/lgfx/v1/platforms/esp32p4/Panel_DSI.inl
+
+      - name: Verify M5GFX 0.2.35 native capabilities and Tab5 adoption
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          gfx=Path("components/M5GFX/src")
+          dsi=(gfx/"lgfx/v1/platforms/esp32p4/Panel_DSI.inl").read_text()
+          hpp=(gfx/"lgfx/v1/platforms/esp32p4/Panel_DSI.hpp").read_text()
+          bus=(gfx/"lgfx/v1/platforms/esp32p4/Bus_DSI.inl").read_text()
+          det=(gfx/"M5GFX.cpp").read_text()
+          fb=(gfx/"lgfx/v1/panel/Panel_FrameBufferBase.hpp").read_text()
+          video=Path("src/tab5_video.cpp").read_text()
+
+          # 0.2.35 upstream owns two actual driver framebuffers. The project
+          # overlay exposes both pointers and native panel handle without
+          # introducing an additional driver allocation or losing DSI fencing.
+          assert dsi.count("dpi_config.num_fbs = 2;")==1
+          assert "dpi_config.num_fbs = 1;" not in dsi
+          assert "dpi_config.flags.use_dma2d = true;" in dsi
+          assert "esp_lcd_dpi_panel_enable_dma2d(_disp_panel_handle)" in dsi
+          assert "_config_detail.buffer2" in dsi
+          assert "_config_detail.px68k_dpi_panel = _disp_panel_handle;" in dsi
+          assert "void* buffer2 = nullptr;" in hpp
+          assert "esp_lcd_panel_handle_t px68k_dpi_panel = nullptr;" in hpp
+          assert "getResetDelayBeforeDpi" in hpp and "initInCommandMode" in hpp
+          assert "esp_lcd_dsi_bus_config_t bus_config = {};" in bus
+          assert "for (int i = 0; i < 60; ++i)" in det
+          assert "bool found_gt911 = false;" in det
+          assert "bool dmaBusy(void) override { return false; }" in fb
+
+          # Do not silently fall back to full-frame M5GFX drawImage while
+          # claiming that the managed sparse native path is active.
+          for token in (
+              "r84_managed_direct_native_present(",
+              "req.managed_dirty_tiles",
+              "r35_swrot_tile8_packed(",
+              "esp_cache_msync(",
+              "s_dsi_double_live = buffers_ok && callbacks_ok;",
+              "dbfb615h17_wait_refresh()",
+              "esp_lcd_dpi_panel_register_event_callbacks(",
+              "s_dsi_fb[0] = reinterpret_cast<uint16_t *>(dsi_cfg.buffer);",
+              "s_dsi_fb[1] = reinterpret_cast<uint16_t *>(dsi_cfg.buffer2);",
+              "s_dsi_dpi_panel = dsi_cfg.px68k_dpi_panel;",
+          ):
+              assert token in video, f"Missing Tab5 display contract: {token}"
+          assert Path("docs/M5GFX_0235_FEATURE_ADOPTION_AUDIT.md").is_file()
+          print("PASS 0.2.35 native DoubleFB, DMA2D, panel probe and Tab5 sparse present contracts")
+          print("NOTE DMA2D DPI flag was already available in old M5GFX; no new speedup asserted")
+          PY
+
+      - name: Verify exact ES8388 MCLK/LRCK 256fs correction and idempotence
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 patch_m5unified_x68ktab_es8388.py
+          python3 patch_m5unified_x68ktab_es8388.py
+          python3 - <<'PY'
+          from pathlib import Path
+          import subprocess
+          root=Path("components/M5Unified")
+          before=subprocess.check_output(
+              ["git","-C",str(root),"show","HEAD:src/M5Unified.inl"]
+          )
+          after=(root/"src/M5Unified.inl").read_bytes()
+          old=b"      2,   24, 0x00, //I2S MCLK ratio (128)"
+          new=b"      2,   24, 0x02, //X68KTAB_ES8388_MCLK256_R1: P4 I2S driver MCLK=256fs"
+          assert before.count(old)==after.count(new)==1
+          assert before.replace(old,new)==after, "Only the Tab5 DACCONTROL2 setting may differ"
+          assert old not in after
+          spk=(root/"src/utility/Speaker_Class.inl").read_bytes()
+          assert b"i2s_mclk_multiple_t::I2S_MCLK_MULTIPLE_256" in spk
+          assert b"i2s_config.clk_cfg.sample_rate_hz = _cfg.sample_rate;" in spk
+          print("PASS one-line Tab5 ES8388 DACCONTROL2 128fs -> 256fs, no other M5Unified changes")
+          PY
+
+      - name: Validate only Tab5 Speaker skip-ready idle padding changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 patch_m5unified_x68ktab_speaker_idle.py
+          python3 patch_m5unified_x68ktab_speaker_idle.py
+          python3 - <<'PY'
+          import ast, subprocess
+          from pathlib import Path
+          tree=ast.parse(Path("patch_m5unified_x68ktab_speaker_idle.py").read_text())
+          patch={}
+          for node in tree.body:
+              if isinstance(node, ast.Assign):
+                  for target in node.targets:
+                      if isinstance(target, ast.Name) and target.id in ("BEFORE", "AFTER"):
+                          patch[target.id]=ast.literal_eval(node.value)
+          before,after=patch["BEFORE"],patch["AFTER"]
+          upstream=subprocess.check_output(["git","-C","components/M5Unified",
+                     "show","HEAD:src/utility/Speaker_Class.inl"])
+          current=Path("components/M5Unified/src/utility/Speaker_Class.inl").read_bytes()
+          assert upstream.count(before)==1 and current.count(after)==1
+          assert upstream.replace(before,after)==current, "Unexpected modification to Speaker engine"
+          assert b"#if defined(CONFIG_IDF_TARGET_ESP32P4)" in after
+          assert b"self->_cfg.pin_data_out == GPIO_NUM_26" in after
+          assert b"ulTaskNotifyTake(pdFALSE, 0)" in after
+          assert b"fill_dac(words, dac_hold);" in after
+          assert b"_spk_i2s_write(i2s_port, sound_buf32, words * sizeof(int32_t), &write_bytes, portMAX_DELAY);" in after
+          # Source guards above ensure other hardware and no-notify cases still pad the DMA.
+          print("PASS single guarded Tab5 ready-notification bypass; original hold DMA preserved")
+          PY
+
+      - name: Existing bit-identical R61 FIR host regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          g++ -std=c++17 -O2 tests/ym2151_r61_fir_parity_host.cpp -o /tmp/x68ktab_fir_parity
+          /tmp/x68ktab_fir_parity
+
+      - name: Current stable YM2151 KON and phase-edge host regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          g++ -std=c++17 -O2 -Wno-attributes tests/ym2151_kon_phase_host.cpp -o /tmp/x68ktab_kon_phase -lm
+          /tmp/x68ktab_kon_phase
+
+      - name: Native ESP-IDF 5.5.4 ESP32-P4 build (NO FLASH)
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.5.4
+          target: esp32p4
+          path: '.'
+          command: idf.py build
+
+      - name: Validate application image (NO FLASH)
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s build/px68k_tab5.bin
+          test -s build/px68k_tab5.elf
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib, json
+          p=Path("build/px68k_tab5.bin")
+          b=p.read_bytes()
+          assert b[:1]==b"\xe9" and 100000 < len(b) < 0x800000
+          print(json.dumps({"app":str(p),"size":len(b),"sha256":hashlib.sha256(b).hexdigest(),"flash":False},indent=2))
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: x68ktab-M5Unified-028-M5GFX-035-no-flash
+          if-no-files-found: error
+          path: |
+            build/px68k_tab5.bin
+            build/px68k_tab5.elf
+            build/partition_table/partition-table.bin
+          retention-days: 7

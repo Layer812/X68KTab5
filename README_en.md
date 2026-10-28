@@ -1,7 +1,7 @@
 # X68K Tab
 
 > [!NOTE]
-> **Latest source: 2026.10.25 — YM2151 KEY ON mapping and note-on phase reset updated.** Physical smoke tests report stable sound and several applications booting, but not exhaustive compatibility, long-term endurance or a measured overall speedup. See [release notes and evidence](RELEASE_NOTES_2026-10-25.md). **M5Burner Share Code: `wOuCl6ZAtFxUpdy6`**. The old code is for the previous firmware.
+> **Latest GitHub source: 2026.10.28 R6 — M5Unified 0.2.28 / M5GFX 0.2.35 and a physically confirmed reduction in MDX playback stutter.** See the [R6 release notes](RELEASE_NOTES_2026-10-28.md). **The latest published M5Burner Share Code remains `wOuCl6ZAtFxUpdy6` (older firmware, NOT R6).**
 
 [**日本語 README → README.md**](README.md)
 
@@ -36,9 +36,13 @@ GS MIDI data is also converted using MidMod's GS → SAM2695 mapping so that it 
 
 ## Current Production
 
+### 2026-10-28 — R6 library upgrade and MDX playback stabilization
+
+Upgraded to M5Unified 0.2.28 and M5GFX 0.2.35 while retaining the existing LCD panel profiles, DoubleFB, and guest timing. ES8388 uses 256fs MCLK/LRCK, with Speaker buffer-release notifications. R6 prioritizes PCM already queued in the host ring before further upstream pulling. The owner reported MDX playback without the earlier perceptible stutter on a physical Tab5. **R6 is the updated source/device-tested candidate; it is NOT the image associated with the existing M5Burner Share Code.** See the [scope and verification notes](RELEASE_NOTES_2026-10-28.md).
+
 The current Production build runs the **68000 guest CPU at 12 MHz, with the X68000 peripheral time domain at exact 10 MHz**.
 
-Source release **2026.10.25** adds the **R61-based YM2151 synthesis and FIR speed optimization** while preserving the **PDX/ADPCM playback fix, Tab5 LCD compatibility, and MidMod/SAM2695 MIDI support**.
+Earlier source release **2026.10.25** added the **R61-based YM2151 synthesis and FIR speed optimization** while preserving the **PDX/ADPCM playback fix, Tab5 LCD compatibility, and MidMod/SAM2695 MIDI support**.
 
 ### 2026-10-25 — YM2151 KEY ON and phase reset fix (Tab5 smoke-tested)
 
