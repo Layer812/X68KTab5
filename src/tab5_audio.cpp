@@ -213,8 +213,25 @@ static void audio_task(void *)
             continue;
         }
 
-        /* CPU0 owns final extraction + FM saturation mix from this point. */
-        pump_host_source();
+        /* R6 deadline-first handoff: once primed, a complete PCM chunk
+         * already resident in the host ring must reach an available Speaker
+         * slot BEFORE another potentially long FM/ADPCM source-pull batch.
+         * Preserve the eight-batch drain when the Speaker queue is full or
+         * when startup/recovery still needs more samples. */
+        bool submit_ready_first = false;
+        if (primed)
+        {
+            const uint32_t early_profile =
+                __atomic_load_n(&s_audio_profile, __ATOMIC_ACQUIRE);
+            portENTER_CRITICAL(&s_mux);
+            const bool reserve_ready = (s_reset_seq == seen_reset_seq) &&
+                (s_count >= p12r6a4_profile_chunk(early_profile));
+            portEXIT_CRITICAL(&s_mux);
+            if (reserve_ready)
+                submit_ready_first = (M5.Speaker.isPlaying(kSpeakerChannel) < 2);
+        }
+        if (!submit_ready_first)
+            pump_host_source();
 
         uint32_t reset_seq;
         size_t available;
