@@ -4,7 +4,7 @@
 **Source build verified:** `802a10bf915d221ae91c950029d5e812ad4d085a`  
 **Native CI:** [GitHub Actions #40661572999](https://github.com/Layer812/X68KTab5/actions/runs/40661572999) — all steps PASS  
 **Physical confirmation:** Owner reported, on 2026-10-28, that MDX playback no longer exhibited the previously audible stutter after installing the R6 app-only image.  
-**M5Burner:** No new R6 share code is available. The previously published `wOuCl6ZAtFxUpdy6` is the older firmware and must not be labeled R6.
+**M5Burner R6 Share Code:** `8i9Cp1C6ufGpGC5J` (provided by the project owner on 2026-10-28; hosted-image SHA-256 not independently verified against tested R6 app BIN). Previous share: `wOuCl6ZAtFxUpdy6`.
 
 ## 日本語
 
@@ -21,6 +21,7 @@
 
 - **Native CI PASS:** ESP-IDF 5.5.4 / ESP32-P4ビルド、既存YM2151回帰、FIR一致検査、DSI/ライブラリ固定版検査。
 - **実機:** MDX音声のモタツキ解消を所有者が確認。複数の他ソフト・各種ディスプレイ個体・長時間連続再生までを再度網羅した検証ではありません。
+- **M5Burner:** R6 Share Code `8i9Cp1C6ufGpGC5J` を開発者から受領。コードの掲載は配布BINの独立ハッシュ照合を意味しません。
 - 今回のリポジトリ文書更新は、上記**実機確認済みR6ソースのファームウェア処理を変更しません**。文書・VERSION更新後のコミットは、確認済みの実機BINと完全に同一のビルド成果物であるとは主張しません。
 - R5のDMA idle-padding省略経路は比較の再現性のため残っていますが、**R5単独で残留モタツキを改善した事実はありません**。
 - 連続音声監査・プロファイル機構はRelease設定で無効。画面起動時セルフチェックと64KiBのCPUプリデコードSRAMは正常動作のため維持。
@@ -30,4 +31,4 @@
 
 The R6 source keeps the pinned M5Unified 0.2.28 / M5GFX 0.2.35 Tab5 migration, panel-compatibility overlays, ES8388 256fs correction, and Speaker buffer-release notification. **R6 sends a ready PCM chunk to an available Speaker slot before doing another potentially expensive upstream pull.** After R5 did not resolve the remaining playback stutter, the owner reported stutter-free MDX playback with the R6 app-only image on a physical Tab5. No measured performance percentage or universal compatibility is claimed.
 
-All GitHub Actions native and regression checks passed on the precise R6 source commit linked above. Documentation-only release commits are not represented as a separately re-flashed build. The previous M5Burner share code still points to an older public firmware, not R6. No copyrighted ROM, Human68k image, or commercial disk/game data is distributed.
+All GitHub Actions native and regression checks passed on the precise R6 source commit linked above. Documentation-only release commits are not represented as a separately re-flashed build. The project owner supplied R6 M5Burner Share Code `8i9Cp1C6ufGpGC5J` after the source release. The hosted image has not been independently SHA-256 matched to the physically tested R6 application BIN; the previous code `wOuCl6ZAtFxUpdy6` remains a separate older build. No copyrighted ROM, Human68k image, or commercial disk/game data is distributed.
