@@ -30,8 +30,6 @@ PANIC を再生するために必要な X68000 環境を少しずつ実装して
 
 ### 2026-10-28 — R6：M5Unified / M5GFX更新とMDX音声安定化
 
-M5Unified 0.2.28 / M5GFX 0.2.35に更新し、Tab5パネル互換性・DoubleFB・既存ゲスト動作を維持しています。ES8388のMCLK/LRCKを256fsに調整し、Speakerバッファ解放通知を利用。R6では、準備済みPCMをSpeakerへ先に送ることで、実機で問題になっていたMDX再生のモタツキが聞こえなくなったと報告されています。**R6のM5Burner Share Codeは `8i9Cp1C6ufGpGC5J` です。** 配布BINと実機確認済みアプリBINのSHA-256同一性は独立検証していません。
-
 [変更点・テスト範囲・制約](RELEASE_NOTES_2026-10-28.md)
 
 ### 2026-10-25 — YM2151 KEY ON・位相リセット修正（実機初期確認済み）
