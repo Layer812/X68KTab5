@@ -38,7 +38,7 @@ GS MIDI data is also converted using MidMod's GS → SAM2695 mapping so that it 
 
 ### 2026-10-28 — R6 library upgrade and MDX playback stabilization
 
-Upgraded to M5Unified 0.2.28 and M5GFX 0.2.35 while retaining the existing LCD panel profiles, DoubleFB, and guest timing. ES8388 uses 256fs MCLK/LRCK, with Speaker buffer-release notifications. R6 prioritizes PCM already queued in the host ring before further upstream pulling. The owner reported MDX playback without the earlier perceptible stutter on a physical Tab5. **The project owner supplied R6 M5Burner Share Code `8i9Cp1C6ufGpGC5J`.** The uploaded M5Burner image has not been independently hash-matched to the physically tested R6 app binary. See the [scope and verification notes](RELEASE_NOTES_2026-10-28.md).
+[R6 release notes](RELEASE_NOTES_2026-10-28.md)
 
 The current Production build runs the **68000 guest CPU at 12 MHz, with the X68000 peripheral time domain at exact 10 MHz**.
 
