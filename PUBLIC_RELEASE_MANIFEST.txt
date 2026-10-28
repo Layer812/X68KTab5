@@ -1,5 +1,11 @@
 X68K Tab — public source release manifest
-Source version: 2026.10.25
+Source version: 2026.10.28
+Current verified source-only R6 code commit: 802a10bf915d221ae91c950029d5e812ad4d085a
+R6 CI: https://github.com/Layer812/X68KTab5/actions/runs/40661572999 (all checks and ESP-IDF 5.5.4 native build PASS)
+R6 device observation: on physical Tab5, MDX playback no longer exhibited the earlier perceptible stutter (owner report, 2026-10-28)
+R6 scope: M5Unified 0.2.28, M5GFX 0.2.35, ES8388 256fs, Speaker buffer-release notification, deadline-first PCM handoff
+R6 release notes: RELEASE_NOTES_2026-10-28.md
+M5Burner Share Code below still refers to the 2026-10-25 firmware; no R6 M5Burner image/share code has been published or verified.
 Target: M5Stack Tab5 / ESP32-P4
 GitHub source: https://github.com/Layer812/X68KTab5
 Original 2026.10.25 tested firmware source commit: 5704225d65cfd94d5f0d951253a359db6cda6aed
