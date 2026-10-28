@@ -85,12 +85,12 @@ M5Burner の **Share Burn** で Share Code を入力してください。
 
 | バージョン | Share Code | 用途 |
 | --- | --- | --- |
-| **2026.10.28 — R6 最新Share Code** | `8i9Cp1C6ufGpGC5J` | **M5Unified / M5GFX更新、MDX再生モタツキ改善（R6実機確認済み・コードは開発者提供）** |
+| **2026.10.28 — R6 最新Share Code** | `8i9Cp1C6ufGpGC5J` | **M5Unified / M5GFX更新、MDX再生モタツキ改善（R6実機確認済み）** |
 | 2026.10.25 — 従来版 | `wOuCl6ZAtFxUpdy6` | YM2151 KEY ON・位相リセット修正（実機初期確認済み） |
 | 2026.10.25 — 従来版 | `2cODB4oLECo97g0u` | YM2151 R61音質改善 + FIR高速化 |
 | **2026-10-09 — 従来M5Burner公開版** | `tLkdgjcPoEoGbGEt` | **PDX / ADPCM 半速修正 + Tab5 LCD互換 + MidMod / SAM2695 MIDI** |
 
-**R6のShare Codeは `8i9Cp1C6ufGpGC5J` です。** 開発者から提供された値であり、M5Burner上の配布BINとGitHub ActionsのR6 BINとのハッシュ一致は独立検証していません。その他は従来版のコードです。
+**R6のShare Codeは `8i9Cp1C6ufGpGC5J` です。** M5Burner上の配布BINとGitHub ActionsのR6 BINとのSHA-256一致は未照合です。表のほかの項目は従来版のShare Codeです。
 
 ---
 
