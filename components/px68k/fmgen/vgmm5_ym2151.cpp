@@ -22,6 +22,13 @@
 
 /* Preview-only opt-in. Production main does not define or use this path.
  * This experimental native engine needs a native Tab5 performance/audio test. */
+/* Isolated Cardputer R4/R5 algorithm-zero routing study. This branch
+ * can be built with -DX68KTAB_YM2151_R5_ALGO0_PREVIEW=0 for exact
+ * R61 production PCM comparison. Guest timers and audio mix unaffected. */
+#ifndef X68KTAB_YM2151_R5_ALGO0_PREVIEW
+#define X68KTAB_YM2151_R5_ALGO0_PREVIEW 1
+#endif
+
 #ifndef X68KTAB_YM2151_R61_NATIVE_FIR_PREVIEW
 #define X68KTAB_YM2151_R61_NATIVE_FIR_PREVIEW 1
 #endif
@@ -360,10 +367,19 @@ static __attribute__((noinline,optimize("O3"))) int32_t synth_channel_modulated_
     int32_t o1,o2,o3,out;
     switch(algo) {
     case 0:
+#if X68KTAB_YM2151_R5_ALGO0_PREVIEW
+        /* YM2151 OPM algorithm 0: physical slots 0->2->1->3.
+         * The Cardputer R5 graph uses a four-operator serial chain. */
+        o2=calc_op_modulated_cold(e,&p[2],o0,pm,am,0);
+        o1=calc_op_modulated_cold(e,&p[1],o2,pm,am,0);
+        o3=calc_op_modulated_cold(e,&p[3],o1,pm,am,noise);
+        e->mem_value[ch]=0; out=o3; break;
+#else
         o1=calc_op_modulated_cold(e,&p[1],mem,pm,am,0);
         o2=calc_op_modulated_cold(e,&p[2],o0,pm,am,0);
         o3=calc_op_modulated_cold(e,&p[3],o1,pm,am,noise);
         e->mem_value[ch]=o2; out=o3; break;
+#endif
     case 1:
         o1=calc_op_modulated_cold(e,&p[1],mem,pm,am,0);
         o2=calc_op_modulated_cold(e,&p[2],0,pm,am,0);
@@ -420,10 +436,17 @@ static IRAM_ATTR __attribute__((always_inline,optimize("O3"))) inline int32_t sy
     int32_t o1,o2,o3,out;
     switch(algo) {
     case 0:
+#if X68KTAB_YM2151_R5_ALGO0_PREVIEW
+        o2=calc_op_zero_mod(e,&p[2],o0,0);
+        o1=calc_op_zero_mod(e,&p[1],o2,0);
+        o3=calc_op_zero_mod(e,&p[3],o1,noise);
+        e->mem_value[ch]=0; out=o3; break;
+#else
         o1=calc_op_zero_mod(e,&p[1],mem,0);
         o2=calc_op_zero_mod(e,&p[2],o0,0);
         o3=calc_op_zero_mod(e,&p[3],o1,noise);
         e->mem_value[ch]=o2; out=o3; break;
+#endif
     case 1:
         o1=calc_op_zero_mod(e,&p[1],mem,0);
         o2=calc_op_zero_mod(e,&p[2],0,0);
