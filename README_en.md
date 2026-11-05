@@ -115,7 +115,15 @@ On X68K Tab, you can also place `/sdcard/midimap.csv` to replace the mapping pro
 
 ---
 
-## Quick Start — M5Burner
+## Quick Start — Web Burner / M5Burner
+
+### Web Burner (flash from your browser)
+
+[X68KTab5 — Web Burner](https://burner.m5stack.com/6494GS)
+
+Connect the Tab5 via USB and follow the on-screen instructions in Web Burner to flash it.
+
+### M5Burner (desktop app)
 
 - [M5Burner official page](https://docs.m5stack.com/en/uiflow/m5burner/intro)
 - [M5Stack downloads](https://docs.m5stack.com/en/download)
@@ -124,12 +132,12 @@ Enter the Share Code in **Share Burn** in M5Burner.
 
 | Version | Share Code | Description |
 | --- | --- | --- |
-| **2026.10.28 — Latest R6 Share Code** | `8i9Cp1C6ufGpGC5J` | **Unified/GFX upgrade and improved MDX playback on tested Tab5 (owner-provided code)** |
+| **2026.10.28 — Latest R6 Share Code** | `8i9Cp1C6ufGpGC5J` | **Unified/GFX upgrade and improved MDX playback on tested Tab5** |
 | 2026.10.25 — Previous M5Burner release | `wOuCl6ZAtFxUpdy6` | YM2151 KEY ON and note-on phase reset fix, smoke-tested on Tab5 |
 | 2026.10.25 — Previous release | `2cODB4oLECo97g0u` | YM2151 R61 fidelity improvements + FIR optimization |
 | **2026-10-09 — Previous M5Burner release** | `tLkdgjcPoEoGbGEt` | **PDX / ADPCM half-speed fix + Tab5 LCD + MidMod / SAM2695 MIDI** |
 
-**Use `8i9Cp1C6ufGpGC5J` for the R6 M5Burner share provided by the project owner.** The hosted image has not been independently verified against the GitHub Actions binary hash. Older Share Codes are listed below.
+**Use `8i9Cp1C6ufGpGC5J` for the R6 M5Burner Share Code.** The Web Burner and M5Burner binaries have not been independently verified as SHA-256-identical to the GitHub Actions R6 binary. Other entries in the table are older Share Codes.
 
 ---
 
