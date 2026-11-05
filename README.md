@@ -76,7 +76,15 @@ X68K Tab 側では `/sdcard/midimap.csv` を置くことで、マッピングプ
 
 ---
 
-## まず試す — M5Burner
+## まず試す — Web Burner / M5Burner
+
+### Web Burner（ブラウザから書き込み）
+
+[X68KTab5 — Web Burner](https://burner.m5stack.com/6494GS)
+
+Tab5をUSB接続し、Web Burnerの画面の案内に従って書き込んでください。
+
+### M5Burner（デスクトップアプリ）
 
 - [M5Burner 公式ページ](https://docs.m5stack.com/en/uiflow/m5burner/intro)
 - [M5Stack ダウンロード](https://docs.m5stack.com/en/download)
@@ -90,7 +98,7 @@ M5Burner の **Share Burn** で Share Code を入力してください。
 | 2026.10.25 — 従来版 | `2cODB4oLECo97g0u` | YM2151 R61音質改善 + FIR高速化 |
 | **2026-10-09 — 従来M5Burner公開版** | `tLkdgjcPoEoGbGEt` | **PDX / ADPCM 半速修正 + Tab5 LCD互換 + MidMod / SAM2695 MIDI** |
 
-**R6のShare Codeは `8i9Cp1C6ufGpGC5J` です。** M5Burner上の配布BINとGitHub ActionsのR6 BINとのSHA-256一致は未照合です。表のほかの項目は従来版のShare Codeです。
+**R6のShare Codeは `8i9Cp1C6ufGpGC5J` です。** Web Burner／M5Burnerで配布されるBINとGitHub ActionsのR6 BINとのSHA-256一致は未照合です。表のほかの項目は従来版のShare Codeです。
 
 ---
 
