@@ -5,9 +5,11 @@ on:
     branches:
       - tab5-ym2151-r61-preview
       - work/ym2151-r61-fir-speed-20261025
+      - work/ym2151-r5-algo0-feedback-20261025
     paths:
       - 'components/px68k/fmgen/**'
       - 'tests/ym2151_r61_fir_parity_host.cpp'
+      - 'tests/ym2151_r5_algo0_feedback_host.cpp'
       - '.github/workflows/r61-tab5-native-build.yml'
       - 'components/px68k/CMakeLists.txt'
       - 'src/**'
@@ -59,6 +61,33 @@ jobs:
           /tmp/x68ktab_fir_parity
           g++ -std=c++17 -O1 -g -fsanitize=undefined tests/ym2151_r61_fir_parity_host.cpp -o /tmp/x68ktab_fir_ubsan
           UBSAN_OPTIONS=halt_on_error=1 /tmp/x68ktab_fir_ubsan
+
+      - name: Check R5 algorithm-0 change and all non-target PCM hashes
+        shell: bash
+        run: |
+          set -euo pipefail
+          for preview in 0 1; do
+            g++ -std=c++17 -O2 -Wno-attributes -DX68KTAB_YM2151_R5_ALGO0_PREVIEW=$preview tests/ym2151_r5_algo0_feedback_host.cpp -o /tmp/ym2151_r5_$preview -lm
+            /tmp/ym2151_r5_$preview > /tmp/ym2151_r5_$preview.hashes
+          done
+          python3 - <<'PY'
+          from pathlib import Path
+          original = Path('/tmp/ym2151_r5_0.hashes').read_text().splitlines()
+          candidate = Path('/tmp/ym2151_r5_1.hashes').read_text().splitlines()
+          assert len(original)==len(candidate)==24, 'Expected 8 algorithms x 3 modes'
+          changed=[]
+          for old,new in zip(original,candidate):
+              a,m,_ = old.split(',')
+              assert old.split(',')[:2]==new.split(',')[:2]
+              if a=='0':
+                  if old != new: changed.append(int(m))
+              else:
+                  assert old==new, 'Non-target algorithm changed: ' + a + ':' + m
+          assert changed, 'Algorithm 0 must have a meaningful PCM difference'
+          print('PASS: non-target algorithms 1..7 bitwise PCM identical in all modes; algorithm 0 differs in modes',changed)
+          PY
+          g++ -std=c++17 -O2 -Wno-attributes tests/ym2151_r61_native_host.cpp -o /tmp/ym2151_r61_native -lm
+          /tmp/ym2151_r61_native
 
       - name: ESP-IDF 5.5.4 real project build (no flash)
         uses: espressif/esp-idf-ci-action@v1
