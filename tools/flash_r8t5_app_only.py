@@ -48,7 +48,7 @@ def load_image():
         or manifest.get("partition_readback_required") is not True
         or manifest.get("app_sha256") != digest
         or manifest.get("app_size") != len(image)
-        or image[:1] != b"\\xe9"
+        or image[0] != 0xE9
         or not (100000 < len(image) < EXPECTED["factory"][3])
     ):
         fail("Application/header/manifest validation failed. Refusing to flash.")
@@ -91,7 +91,7 @@ def parse_partitions(data):
             break
         if magic != 0x50AA:
             fail("Unexpected partition table entry magic at 0x%X." % i)
-        name = label.split(b"\\x00", 1)[0].decode("ascii", "replace")
+        name = label.split(bytes([0]), 1)[0].decode("ascii", "replace")
         if name in entries or size == 0 or offset + size > 0x1000000:
             fail("Invalid or duplicate device partition: " + name)
         entries[name] = (typ, subtype, offset, size)
