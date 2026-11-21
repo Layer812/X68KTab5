@@ -2164,7 +2164,8 @@ static uint32_t dbfb615h17r9_merge_bands(const dbfb_dirty_band_t *current,
     return m;
 }
 
-static bool dbfb615h17r9_clear_game_window(uint16_t *back)
+static bool dbfb615h17r9_clear_game_window(uint16_t *back,
+                                              bool complete_ppa_overwrite = false)
 {
     if (!back)
         return false;
@@ -2174,6 +2175,21 @@ static bool dbfb615h17r9_clear_game_window(uint16_t *back)
     const size_t game_bytes = (size_t)kAspectViewportWidth *
                               (size_t)kDsiPhysWidth * sizeof(uint16_t);
     uint16_t *game = back + (size_t)game_native_row0 * kDsiPhysStridePixels;
+
+    /* R8T5 PPA Direct lesson: SRM writes into the driver-owned DSI framebuffer.
+     * A complete 960x720 RGB565 overwrite makes zero-filling that same 1.38 MiB
+     * game viewport redundant, and the extra PSRAM traffic competes with audio.
+     * Invalidate the DMA destination first to avoid stale CPU cache lines.
+     * A failed invalidate uses the original zero-fill/C2M path unchanged.
+     * The host UI sidebars are outside this native rectangle. */
+    if (complete_ppa_overwrite &&
+        (reinterpret_cast<uintptr_t>(game) & 127u) == 0u &&
+        (game_bytes & 127u) == 0u &&
+        esp_cache_msync(game, game_bytes,
+                        ESP_CACHE_MSYNC_FLAG_DIR_M2C |
+                        ESP_CACHE_MSYNC_FLAG_TYPE_DATA) == ESP_OK)
+        return true;
+
     std::memset(game, 0, game_bytes);
     return dbfb615h17r6_c2m_aligned(game, game_bytes);
 }
@@ -2745,17 +2761,26 @@ static bool dbfb615h17r9_ppa_present(const uint16_t *stage,
             return false;
         }
     }
-    if (full && !dbfb615h17r9_clear_game_window(back))
-    {
-        ESP_LOGW(TAG, "PX68K_DBFB615H17R11: central game-window clear C2M failed; swap suppressed");
-        return false;
-    }
-
     dbfb_dirty_band_t merged[kDbfbDirtyBandCap * 2] = {};
     const uint32_t merged_count = dbfb615h17r9_merge_bands(
         current_bands, current_band_count, pic_h, merged, full);
     if (merged_count == 0u)
         return false;
+
+    /* Only the exact full viewport is eligible.  In this case the single
+     * blocking PPA SRM 1:1 rotation replaces all game pixels; sparse dirty
+     * bands and unusual geometry retain the old framebuffer clearing path. */
+    const bool complete_ppa_overwrite =
+        full && merged_count == 1u &&
+        merged[0].y0 == 0u && merged[0].y1 == pic_h &&
+        pic_w == kAspectViewportWidth && pic_h == kAspectViewportHeight &&
+        logical_x == (kDsiPhysHeight - kAspectViewportWidth) / 2u &&
+        logical_y == 0u;
+    if (full && !dbfb615h17r9_clear_game_window(back, complete_ppa_overwrite))
+    {
+        ESP_LOGW(TAG, "PX68K_DBFB615H17R11: game-window DMA preparation failed; swap suppressed");
+        return false;
+    }
 
     const size_t native_bytes = (size_t)kDsiPhysWidth *
                                 (size_t)kDsiPhysHeight * sizeof(uint16_t);
