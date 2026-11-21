@@ -37,6 +37,7 @@ jobs:
               "docs/R8T5_PPA_DIRECT_ADOPTION.md",
               ".github/workflows/r8t5-ppa-direct-app-only.yml",
               "tools/flash_r8t5_app_only.py",
+              "tools/flash_r8t5_boot_part_app.py",
               "FLASH_R8T5_COM9.cmd",
           }
           assert changed <= allowed and "src/tab5_video.cpp" in changed, changed
@@ -91,11 +92,14 @@ jobs:
           import hashlib,json,os
           app=Path("build/px68k_tab5.bin")
           boot=Path("build/bootloader/bootloader.bin")
-          assert app.is_file() and boot.is_file()
+          part=Path("build/partition_table/partition-table.bin")
+          assert app.is_file() and boot.is_file() and part.is_file()
           a=app.read_bytes()
           b=boot.read_bytes()
+          pt=part.read_bytes()
           assert a[0]==0xe9 and 100000<len(a)<0x800000
           assert b[0]==0xe9 and 4096<len(b)<=0x6000, "bootloader overlaps partition-table sector"
+          assert 128<len(pt)<=0x1000 and pt[:2]==bytes.fromhex("aa50"), "partition table output invalid"
           flash_files=json.loads(Path("build/flasher_args.json").read_text())["flash_files"]
           assert flash_files.get("0x2000")=="bootloader/bootloader.bin",flash_files
           assert flash_files.get("0x8000")=="partition_table/partition-table.bin",flash_files
@@ -113,9 +117,12 @@ jobs:
               "bootloader_size":len(b),
               "bootloader_offset":"0x2000",
               "partition_table_offset":"0x8000",
+              "partition_table_file":"build/partition_table/partition-table.bin",
+              "partition_table_sha256":hashlib.sha256(pt).hexdigest(),
+              "partition_table_size":len(pt),
               "partition_readback_required":True,
-              "flash_scope":"app+bootloader",
-              "partition_table_write":False,
+              "flash_scope":"bootloader+partition-table+app",
+              "partition_table_write":True,
               "humanxdf_write":False
           }
           Path("build_manifest.json").write_text(json.dumps(manifest,indent=2)+"\n")
@@ -126,11 +133,12 @@ jobs:
         uses: actions/upload-artifact@v4
         if: success()
         with:
-          name: x68ktab-r8t5-ppa-direct-boot-app
+          name: x68ktab-r8t5-ppa-direct-boot-part-app
           if-no-files-found: error
           path: |
             build/px68k_tab5.bin
             build/bootloader/bootloader.bin
+            build/partition_table/partition-table.bin
             build/flasher_args.json
             build_manifest.json
           retention-days: 14
