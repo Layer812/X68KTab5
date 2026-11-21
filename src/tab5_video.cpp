@@ -2177,7 +2177,7 @@ static bool dbfb615h17r9_clear_game_window(uint16_t *back,
     uint16_t *game = back + (size_t)game_native_row0 * kDsiPhysStridePixels;
 
     /* R8T5 PPA Direct lesson: SRM writes into the driver-owned DSI framebuffer.
-     * A complete 960x720 RGB565 overwrite makes zero-filling that same 1.38 MiB
+     * A complete 960x720 RGB565 overwrite makes zero-filling that same 1.32 MiB
      * game viewport redundant, and the extra PSRAM traffic competes with audio.
      * Invalidate the DMA destination first to avoid stale CPU cache lines.
      * A failed invalidate uses the original zero-fill/C2M path unchanged.
