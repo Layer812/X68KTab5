@@ -1,0 +1,144 @@
+name: X68KTab5 R8T5 PPA Direct experimental APP-only build (NO FLASH)
+
+on:
+  push:
+    branches:
+      - work/r8t5-ppa-direct-full-overwrite-20261122
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-app:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 85
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Guard R6 production, pinned libraries, and scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C components/M5GFX rev-parse HEAD)" = "65c816a38386062d2c3dc47d41237a9083acbc75"
+          test "$(git -C components/M5Unified rev-parse HEAD)" = "368ad60807161625aa65baad37a4a3af2a7eccea"
+          python3 - <<'PY'
+          from pathlib import Path
+          import subprocess
+          baseline="b4371e7863f9727547668ffe50aba6ceb02008c5"
+          changed=set(subprocess.check_output(
+              ["git","diff","--name-only",baseline,"HEAD"],text=True).splitlines())
+          allowed={
+              "src/tab5_video.cpp",
+              "docs/R8T5_PPA_DIRECT_ADOPTION.md",
+              ".github/workflows/r8t5-ppa-direct-app-only.yml",
+              "tools/flash_r8t5_app_only.py",
+              "tools/flash_r8t5_boot_part_app.py",
+              "FLASH_R8T5_COM9.cmd",
+          }
+          assert changed <= allowed and "src/tab5_video.cpp" in changed, changed
+          source=Path("src/tab5_video.cpp").read_text()
+          base=subprocess.check_output(
+              ["git","show",baseline+":src/tab5_video.cpp"],text=True)
+          start=source.index("static bool dbfb615h17r9_clear_game_window(")
+          stop=source.index("\n#if defined(__riscv)",start)
+          old_start=base.index("static bool dbfb615h17r9_clear_game_window(")
+          old_stop=base.index("\n#if defined(__riscv)",old_start)
+          target="    if (full && !dbfb615h17r9_clear_game_window(back))"
+          assert base.count(target)==1
+          new_start=source.index("    dbfb_dirty_band_t merged[kDbfbDirtyBandCap * 2] = {};",source.index("static bool dbfb615h17r9_ppa_present("))
+          old_start2=base.index(target)
+          old_end2=base.index("    const size_t native_bytes =",old_start2)
+          new_end2=source.index("    const size_t native_bytes =",new_start)
+          restored=source[:start]+base[old_start:old_stop]+source[stop:]
+          new_start_in_restored=restored.index("    dbfb_dirty_band_t merged[kDbfbDirtyBandCap * 2] = {};",restored.index("static bool dbfb615h17r9_ppa_present("))
+          new_end_in_restored=restored.index("    const size_t native_bytes =",new_start_in_restored)
+          restored=restored[:new_start_in_restored]+base[old_start2:old_end2]+restored[new_end_in_restored:]
+          assert restored==base,"Unexpected differences outside the intended LCD optimization"
+          assert "ESP_CACHE_MSYNC_FLAG_DIR_M2C" in source
+          assert "complete_ppa_overwrite" in source
+          assert "r84_managed_direct_native_present(" in source
+          assert "dbfb615h17_wait_refresh()" in source
+          print("PASS: exact R6 source retention outside two PPA/Back-FB edits")
+          PY
+
+      - name: Retain YM2151 FIR and KEY ON host regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          g++ -std=c++17 -O2 tests/ym2151_r61_fir_parity_host.cpp -o /tmp/x68ktab_fir
+          /tmp/x68ktab_fir
+          g++ -std=c++17 -O2 -Wno-attributes tests/ym2151_kon_phase_host.cpp -o /tmp/x68ktab_kon -lm
+          /tmp/x68ktab_kon
+
+      - name: Native ESP-IDF 5.5.4 ESP32-P4 application build (NO FLASH)
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.5.4
+          target: esp32p4
+          path: '.'
+          command: idf.py build
+
+      - name: Build SHA256-locked APP and bootloader manifest (NO PARTITION FLASH)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib,json,os
+          app=Path("build/px68k_tab5.bin")
+          boot=Path("build/bootloader/bootloader.bin")
+          part=Path("build/partition_table/partition-table.bin")
+          assert app.is_file() and boot.is_file() and part.is_file()
+          a=app.read_bytes()
+          b=boot.read_bytes()
+          pt=part.read_bytes()
+          assert a[0]==0xe9 and 100000<len(a)<0x800000
+          assert b[0]==0xe9 and 4096<len(b)<=0x6000, "bootloader overlaps partition-table sector"
+          assert 128<len(pt)<=0x1000 and pt[:2]==bytes.fromhex("aa50"), "partition table output invalid"
+          flash_files=json.loads(Path("build/flasher_args.json").read_text())["flash_files"]
+          assert flash_files.get("0x2000")=="bootloader/bootloader.bin",flash_files
+          assert flash_files.get("0x8000")=="partition_table/partition-table.bin",flash_files
+          assert flash_files.get("0x10000")=="px68k_tab5.bin",flash_files
+          manifest={
+              "repository":"Layer812/X68KTab5",
+              "git_sha":os.environ["GITHUB_SHA"],
+              "target":"esp32p4",
+              "app_file":"build/px68k_tab5.bin",
+              "app_sha256":hashlib.sha256(a).hexdigest(),
+              "app_size":len(a),
+              "app_offset":"0x10000",
+              "bootloader_file":"build/bootloader/bootloader.bin",
+              "bootloader_sha256":hashlib.sha256(b).hexdigest(),
+              "bootloader_size":len(b),
+              "bootloader_offset":"0x2000",
+              "partition_table_offset":"0x8000",
+              "partition_table_file":"build/partition_table/partition-table.bin",
+              "partition_table_sha256":hashlib.sha256(pt).hexdigest(),
+              "partition_table_size":len(pt),
+              "partition_readback_required":True,
+              "flash_scope":"bootloader+partition-table+app",
+              "partition_table_write":True,
+              "humanxdf_write":False
+          }
+          Path("build_manifest.json").write_text(json.dumps(manifest,indent=2)+"\n")
+          print(json.dumps(manifest,indent=2))
+          PY
+
+      - name: Package APP and bootloader for guarded local flash (CI DOES NOT FLASH)
+        uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: x68ktab-r8t5-ppa-direct-boot-part-app
+          if-no-files-found: error
+          path: |
+            build/px68k_tab5.bin
+            build/bootloader/bootloader.bin
+            build/partition_table/partition-table.bin
+            build/flasher_args.json
+            build_manifest.json
+          retention-days: 14
